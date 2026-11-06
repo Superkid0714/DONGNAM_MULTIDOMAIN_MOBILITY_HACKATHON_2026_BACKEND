@@ -85,6 +85,10 @@ def date_range_errors(
     return errors
 
 
+def source_label(source: str) -> str:
+    return source.split(":", 1)[0].strip()
+
+
 def _match(query: str, candidates: list[tuple[str, list[str]]]) -> list[str]:
     q = query.strip().lower()
     exact = {key for key, names in candidates if any(q == n.lower() for n in names if n)}
@@ -231,9 +235,11 @@ def preview_lot(
     sell_by = body.sell_by_date
     if sell_by is None:
         sell_by = body.ready_date + timedelta(days=product.shelf_life_days)
+        label = source_label(product.source)
         defaults.append(
             f"sell_by_date = 출하 가능일 + {product.name} 신선 유지 기간 "
-            f"{product.shelf_life_days}일 = {sell_by.isoformat()} (출처: {product.source})"
+            f"{product.shelf_life_days}일 = {sell_by.isoformat()}"
+            + (f" (출처: {label})" if label else "")
         )
     if ignore_client_lot_id or body.lot_id is None:
         lot_id = _lot_id(taken | (reserved_ids or set()), resolved)
