@@ -38,6 +38,7 @@ ANALYSIS_ORG_RATE = RateRule(per_client=240, window_seconds=60)
 COMPUTE_SLOTS = 2
 ANALYSIS_SLOTS = 2
 COMPUTE_WAIT_SECONDS = 2.0
+ANALYSIS_WAIT_SECONDS = 10.0
 PREVIEW_DEADLINE_SECONDS = 15.0
 PREVIEW_CACHE_SECONDS = 30.0
 PREVIEW_CACHE_SIZE = 128
@@ -109,7 +110,7 @@ class ComputeGate:
 
 
 gate = ComputeGate()
-analysis_gate = ComputeGate(slots=ANALYSIS_SLOTS)
+analysis_gate = ComputeGate(slots=ANALYSIS_SLOTS, wait_seconds=ANALYSIS_WAIT_SECONDS)
 
 
 @contextmanager
