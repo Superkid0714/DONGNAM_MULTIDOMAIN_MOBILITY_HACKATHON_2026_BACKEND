@@ -2,28 +2,64 @@ import argparse
 import asyncio
 import json
 import os
+import secrets
 import sys
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from datetime import time as clock_time
 from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
 from openai import APIConnectionError
+from sqlalchemy import Text, cast, delete, func, or_, select
 
 from freshswitch_backend.config import Settings
-from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.explain import ExplainContext, explain
 from freshswitch_backend.observability import logger as audit
+from freshswitch_backend.persistence import database
+from freshswitch_backend.persistence.tables import (
+    AlertRow,
+    BindingRow,
+    ChangeRequestRow,
+    ContainerRow,
+    DeviceRow,
+    ForwarderResourceRow,
+    LotRow,
+    MembershipRow,
+    ObservationRow,
+    OrganizationRow,
+    PackhouseRow,
+    PlanConfirmationRow,
+    PlanForwarderRow,
+    PlanRow,
+    RunRow,
+    ShipperProfileRow,
+    UserRow,
+)
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8000/api"
 BASE_URL_ENV = "BASE_URL"
 CSRF = {"X-Requested-With": "freshswitch"}
-ROLES = ("platform", "shipper", "forwarder")
+ROLES = ("shipper", "forwarder")
+EMAIL_DOMAIN = "readiness.freshswitch.invalid"
 SENTENCE_LIMIT = 120
+KST = timezone(timedelta(hours=9))
+LEAD_DAYS = 7
+PRODUCT = "strawberry"
+DESTINATION = "HKHKG"
+PALLETS = 16
+PACKHOUSE = {
+    "name": "점검용 선과장",
+    "region": "경남 진주",
+    "lat": 35.18,
+    "lon": 128.11,
+    "product_ids": [PRODUCT],
+}
 
 
 class StepFailed(Exception):
@@ -53,6 +89,136 @@ class StepResult:
 
 
 @dataclass
+class Purged:
+    users: int = 0
+    orgs: int = 0
+    plans: int = 0
+    lots: int = 0
+    resources: int = 0
+    packhouses: int = 0
+    held_orgs: list[str] = field(default_factory=list)
+    foreign_plans: list[str] = field(default_factory=list)
+
+    def detail(self) -> str:
+        counts = " ".join(
+            f"{name}={value}" for name, value in self.__dict__.items() if isinstance(value, int)
+        )
+        if not self.held_orgs:
+            return counts
+        return f"{counts} held_orgs={','.join(self.held_orgs)} foreign_plans={','.join(self.foreign_plans)}"
+
+
+def _emails_filter(emails: Iterable[str]):
+    return func.lower(UserRow.email).in_([email.lower() for email in emails])
+
+
+def purge_accounts(emails: Iterable[str]) -> Purged:
+    emails = list(emails)
+    if not emails:
+        return Purged()
+    with database.begin() as db:
+        user_ids = list(db.scalars(select(UserRow.id).where(_emails_filter(emails))))
+        if not user_ids:
+            return Purged()
+        candidates = set(
+            db.scalars(select(MembershipRow.org_id).where(MembershipRow.user_id.in_(user_ids)))
+        )
+        outsiders = set(
+            db.scalars(
+                select(MembershipRow.org_id).where(
+                    MembershipRow.org_id.in_(candidates), MembershipRow.user_id.not_in(user_ids)
+                )
+            )
+        )
+        org_ids = sorted(
+            db.scalars(
+                select(OrganizationRow.id).where(
+                    OrganizationRow.id.in_(candidates - outsiders),
+                    OrganizationRow.sandbox.is_(False),
+                )
+            )
+        )
+        held = _foreign_holds(db, org_ids)
+        org_ids = [org_id for org_id in org_ids if org_id not in held]
+        if held:
+            held_members = set(
+                db.scalars(select(MembershipRow.user_id).where(MembershipRow.org_id.in_(held)))
+            )
+            user_ids = [user_id for user_id in user_ids if user_id not in held_members]
+        plan_ids = list(db.scalars(select(PlanRow.plan_id).where(PlanRow.org_id.in_(org_ids))))
+        lot_ids = list(db.scalars(select(LotRow.id).where(LotRow.shipper_org_id.in_(org_ids))))
+        if plan_ids or lot_ids:
+            db.execute(
+                delete(ObservationRow).where(
+                    or_(ObservationRow.plan_id.in_(plan_ids), ObservationRow.lot_id.in_(lot_ids))
+                )
+            )
+        db.execute(delete(PlanRow).where(PlanRow.plan_id.in_(plan_ids)))
+        for table in (AlertRow, ContainerRow, BindingRow, RunRow, DeviceRow):
+            db.execute(delete(table).where(table.org_id.in_(org_ids)))
+        db.execute(delete(LotRow).where(LotRow.id.in_(lot_ids)))
+        resources = db.execute(
+            delete(ForwarderResourceRow).where(ForwarderResourceRow.org_id.in_(org_ids))
+        ).rowcount
+        db.execute(delete(ShipperProfileRow).where(ShipperProfileRow.org_id.in_(org_ids)))
+        packhouses = db.execute(
+            delete(PackhouseRow).where(PackhouseRow.org_id.in_(org_ids))
+        ).rowcount
+        users = db.execute(delete(UserRow).where(UserRow.id.in_(user_ids))).rowcount
+        orgs = db.execute(delete(OrganizationRow).where(OrganizationRow.id.in_(org_ids))).rowcount
+    return Purged(
+        users=users or 0,
+        orgs=orgs or 0,
+        plans=len(plan_ids),
+        lots=len(lot_ids),
+        resources=resources or 0,
+        packhouses=packhouses or 0,
+        held_orgs=sorted(held),
+        foreign_plans=sorted({plan for plans in held.values() for plan in plans}),
+    )
+
+
+def _foreign_holds(db, org_ids: list[str]) -> dict[str, set[str]]:
+    own = select(PlanRow.plan_id).where(PlanRow.org_id.in_(org_ids))
+    held: dict[str, set[str]] = {}
+    links = (
+        (PlanConfirmationRow.shipper_org_id, PlanConfirmationRow.plan_id),
+        (PlanForwarderRow.forwarder_org_id, PlanForwarderRow.plan_id),
+        (ChangeRequestRow.shipper_org_id, ChangeRequestRow.plan_id),
+    )
+    for org_column, plan_column in links:
+        rows = db.execute(
+            select(org_column, plan_column).where(org_column.in_(org_ids), plan_column.not_in(own))
+        )
+        for org_id, plan_id in rows:
+            held.setdefault(org_id, set()).add(plan_id)
+    lots = list(
+        db.execute(
+            select(LotRow.id, LotRow.shipper_org_id).where(LotRow.shipper_org_id.in_(org_ids))
+        )
+    )
+    for lot_id, org_id in lots:
+        mentions = or_(
+            cast(PlanRow.payload, Text).contains(lot_id, autoescape=True),
+            cast(PlanRow.committed, Text).contains(lot_id, autoescape=True),
+        )
+        foreign = db.scalars(
+            select(PlanRow.plan_id).where(PlanRow.org_id.not_in(org_ids), mentions)
+        )
+        for plan_id in foreign:
+            held.setdefault(org_id, set()).add(plan_id)
+    return held
+
+
+def leftover_accounts(emails: Iterable[str]) -> int:
+    emails = list(emails)
+    if not emails:
+        return 0
+    with database.begin() as db:
+        return db.scalar(select(func.count()).select_from(UserRow).where(_emails_filter(emails)))
+
+
+@dataclass
 class Readiness:
     base_url: str
     make_client: Callable[[], httpx.Client]
@@ -61,7 +227,10 @@ class Readiness:
     results: list[StepResult] = field(default_factory=list)
     clients: dict[str, httpx.Client] = field(default_factory=dict)
     state: dict[str, Any] = field(default_factory=dict)
+    emails: dict[str, str] = field(default_factory=dict)
     anonymous: httpx.Client | None = None
+    tag: str = field(default_factory=lambda: uuid.uuid4().hex[:10])
+    password: str = field(default_factory=lambda: secrets.token_urlsafe(18))
 
     def url(self, path: str) -> str:
         return self.base_url.rstrip("/") + path
@@ -76,8 +245,6 @@ class Readiness:
         params: dict[str, Any] | None = None,
     ) -> Any:
         client = self.clients[role] if role else self.anonymous
-        if role and f"{role}_org" in self.state:
-            self._activate(client, self.state[f"{role}_org"])
         response = client.request(method, self.url(path), json=body, params=params)
         if response.status_code != expect:
             raise StepFailed(f"{method} {path} -> {response.status_code} {response.text[:200]}")
@@ -97,38 +264,59 @@ class Readiness:
         self.out(f"[{mark}] {name:<28} {ms:>9.1f} ms  {detail}".rstrip())
         return passed
 
-    def _activate(self, client: httpx.Client, org_id: str) -> None:
-        response = client.request("PUT", self.url("/auth/active-org"), json={"org_id": org_id})
-        if response.status_code != 200:
-            raise StepFailed(f"active-org {org_id} -> {response.status_code} {response.text[:200]}")
+    def _session_client(self, response: httpx.Response) -> httpx.Client:
+        cookies = list(response.cookies.jar)
+        if not cookies:
+            raise StepFailed("no session cookie")
+        base_path = urlsplit(self.url("/")).path
+        for cookie in cookies:
+            if not base_path.startswith(cookie.path.rstrip("/") + "/"):
+                raise StepFailed(f"cookie path {cookie.path} does not cover {base_path}")
+        client = self.make_client()
+        client.headers.update(CSRF)
+        client.cookies.clear()
+        client.headers["Cookie"] = "; ".join(f"{c.name}={c.value}" for c in cookies)
+        return client
+
+    def signup(self, role: str) -> str:
+        email = f"{role}-{self.tag}@{EMAIL_DOMAIN}"
+        self.emails[role] = email
+        body = {
+            "email": email,
+            "password": self.password,
+            "name": "배포 점검",
+            "org_name": f"배포 점검 {role} {self.tag}",
+            "org_type": role,
+        }
+        response = self.anonymous.post(self.url("/auth/signup"), json=body, headers=CSRF)
+        if response.status_code != 201:
+            raise StepFailed(f"signup -> {response.status_code} {response.text[:200]}")
+        me = response.json()
+        if me["active_org"]["org_type"] != role:
+            raise StepFailed(f"signup org_type {me['active_org']['org_type']} != {role}")
+        self.state[f"{role}_user"] = me["user"]["id"]
+        self.state[f"{role}_org"] = me["active_org"]["org_id"]
+        return f"org={me['active_org']['org_id']}"
 
     def login(self, role: str) -> str:
-        if "shared" not in self.clients:
-            client = self.make_client()
-            client.headers.update(CSRF)
-            response = client.post(self.url("/auth/demo-login"), json={"new_world": True})
-            if response.status_code != 200:
-                raise StepFailed(f"demo-login -> {response.status_code} {response.text[:200]}")
-            me = response.json()
-            cookies = list(response.cookies.jar)
-            if not cookies:
-                raise StepFailed("demo-login: no session cookie")
-            base_path = urlsplit(self.url("/")).path
-            for cookie in cookies:
-                if not base_path.startswith(cookie.path.rstrip("/") + "/"):
-                    raise StepFailed(f"cookie path {cookie.path} does not cover {base_path}")
-            client.cookies.clear()
-            client.headers["Cookie"] = "; ".join(f"{c.name}={c.value}" for c in cookies)
-            for kind in ROLES:
-                match = next(item for item in me["memberships"] if item["org_type"] == kind)
-                self.state[f"{kind}_org"] = match["org_id"]
-                self.clients[kind] = client
-            self.clients["shared"] = client
-        else:
-            client = self.clients["shared"]
-        org_id = self.state[f"{role}_org"]
-        self._activate(client, org_id)
-        return f"org={org_id} cookie_path={client.headers.get('Cookie', '').split('=', 1)[0]}"
+        login = self.make_client()
+        try:
+            body = {"email": self.emails[role], "password": self.password}
+            response = login.post(self.url("/auth/login"), json=body, headers=CSRF)
+        finally:
+            login.close()
+        if response.status_code != 200:
+            raise StepFailed(f"login -> {response.status_code} {response.text[:200]}")
+        client = self._session_client(response)
+        self.clients[role] = client
+        me = self.call(role, "GET", "/me")
+        if me["active_org"]["org_id"] != self.state[f"{role}_org"]:
+            raise StepFailed("logged in to a different org")
+        cookie = client.headers["Cookie"].split("=", 1)[0]
+        return f"login=ok cookie={cookie}"
+
+    def account(self, role: str) -> str:
+        return f"{self.signup(role)} {self.login(role)}"
 
     def health(self) -> str:
         body = self.call(None, "GET", "/health")
@@ -144,79 +332,99 @@ class Readiness:
             f"offline={body.get('offline_mode')} llm={body.get('explain_use_llm')}"
         )
 
+    def ready_date(self):
+        return datetime.now(KST).date() + timedelta(days=LEAD_DAYS)
+
+    def packhouse(self) -> str:
+        created = self.call("shipper", "POST", "/saas/shipper/packhouses", PACKHOUSE, expect=201)
+        profile = self.call("shipper", "GET", "/saas/shipper/profile")
+        if not profile["ready"]:
+            raise StepFailed("shipper profile not ready after packhouse")
+        self.state["shipper_id"] = profile["profile"]["shipper_id"]
+        return f"packhouse={created['packhouse_id']} shipper={self.state['shipper_id']}"
+
     def register(self) -> str:
-        catalog = self.call("shipper", "GET", "/saas/catalog")
-        self.state["shipper_ids"] = [s["id"] for s in catalog["shippers"]]
-        shipper_id = self.state["shipper_ids"][0]
-        scenario = get_scenario("default")
-        mark = shipper_id.rfind("-sh-")
-        bare = shipper_id[mark + 1 :] if mark >= 0 else shipper_id
-        lot = next(
-            (x for x in scenario.lots if x.shipper_id in {shipper_id, bare}), scenario.lots[0]
-        )
-        lot_id = f"readiness-{uuid.uuid4().hex[:10]}"
         body = {
-            "product": lot.product_id,
-            "pallets": lot.pallets,
-            "ready_date": lot.ready_date.isoformat(),
-            "destination": lot.destination,
-            "sell_by_date": lot.sell_by_date.isoformat(),
-            "sell_window": lot.sell_window,
-            "lot_id": lot_id,
+            "product": PRODUCT,
+            "pallets": PALLETS,
+            "ready_date": self.ready_date().isoformat(),
+            "destination": DESTINATION,
         }
         created = self.call("shipper", "POST", "/saas/shipper/lots", body, expect=201)
         registered = created["registered"]
         self.state.update(lot_id=registered["id"], pallets=registered["pallets"])
         return f"lot={registered['id']} pallets={registered['pallets']}"
 
+    def resource(self) -> str:
+        ready = self.ready_date()
+        cutoff = datetime.combine(ready, clock_time(16), KST)
+        body = {
+            "name": f"점검 냉장 컨테이너 {self.tag}",
+            "kind": "40RH-CA",
+            "capacity_pallets": 20,
+            "temp_min_c": -1,
+            "temp_max_c": 4,
+            "vessel_name": "점검 선박",
+            "terminal": "점검 터미널",
+            "origin": "KRPUS",
+            "destination": DESTINATION,
+            "etd": (cutoff + timedelta(days=1, hours=2)).isoformat(),
+            "cy_cutoff": cutoff.isoformat(),
+            "transit_days": 3.5,
+            "enabled": True,
+        }
+        created = self.call("forwarder", "POST", "/saas/forwarder/resources", body, expect=201)
+        return f"resource={created['id']}"
+
     def create_plan(self) -> str:
+        pool = self.call("forwarder", "GET", "/saas/forwarder/lots")
+        if self.state["lot_id"] not in {lot["id"] for lot in pool}:
+            raise StepFailed("registered lot is not in the forwarder pool")
         body = {"lot_ids": [self.state["lot_id"]]}
-        session = self.call("platform", "POST", "/saas/platform/plans", body, expect=201)
+        session = self.call("forwarder", "POST", "/saas/forwarder/plans", body, expect=201)
+        modes = {a["lot_id"]: a["mode"] for a in session["plan"]["assignments"]}
+        if modes.get(self.state["lot_id"]) != "sea":
+            raise StepFailed(f"registered lot assignment mode {modes.get(self.state['lot_id'])}")
         self.state["plan_id"] = session["plan_id"]
         return f"plan={session['plan_id']} status={session['status']}"
 
     def shipper_view(self) -> str:
+        plan_id = self.state["plan_id"]
         plans = self.call("shipper", "GET", "/saas/shipper/plans")
-        if self.state["plan_id"] not in {p["plan_id"] for p in plans}:
+        if plan_id not in {p["plan_id"] for p in plans}:
             raise StepFailed("shipper cannot see its plan")
-        detail = self.call("shipper", "GET", f"/saas/shipper/plans/{self.state['plan_id']}")
+        detail = self.call("shipper", "GET", f"/saas/shipper/plans/{plan_id}")
         rows = {s["shipper_id"] for s in detail["plan"]["settlements"]}
-        if not rows <= set(self.state["shipper_ids"]):
+        if not rows <= {self.state["shipper_id"]}:
             raise StepFailed("shipper sees other shippers' settlement rows")
         return f"settlement_rows={len(rows)}"
 
-    def assign_forwarder(self) -> str:
-        forwarder = self.state["forwarder_org"]
-        path = f"/saas/platform/plans/{self.state['plan_id']}/forwarder"
-        body = self.call("platform", "PUT", path, {"forwarder_org_id": forwarder})
+    def accept_plan(self) -> str:
+        plan_id = self.state["plan_id"]
+        path = f"/saas/shipper/plans/{plan_id}/confirmation"
+        self.call("shipper", "POST", path, {"accept": True})
         visible = self.call("forwarder", "GET", "/saas/forwarder/plans")
-        if self.state["plan_id"] not in {p["plan_id"] for p in visible}:
-            raise StepFailed("assigned forwarder cannot see the plan")
-        return f"forwarder={body['forwarder']['org_id']}"
+        row = next((p for p in visible if p["plan_id"] == plan_id), None)
+        if row is None:
+            raise StepFailed("forwarder cannot see its plan")
+        state = self.call("forwarder", "GET", f"/saas/forwarder/plans/{plan_id}/confirmation")
+        if state["status"] != "committed":
+            raise StepFailed(f"plan status {state['status']} after shipper accepted")
+        return f"status={state['status']}"
 
     def change_event(self) -> str:
         plan_id = self.state["plan_id"]
-        session = self.call("platform", "GET", f"/plans/{plan_id}")
-        lots = session.get("scenario", {}).get("lots", [])
-        target = next(
-            (
-                item["id"]
-                for item in lots
-                if item["id"] == "lot-sancheong-sb-1" or str(item["id"]).endswith("-lot-sancheong-sb-1")
-            ),
-            self.state["lot_id"],
+        session = self.call("forwarder", "GET", f"/saas/forwarder/plans/{plan_id}")
+        containers = {c["id"]: c for c in session["scenario"]["containers"]}
+        assignment = next(
+            a for a in session["plan"]["assignments"] if a["lot_id"] == self.state["lot_id"]
         )
-        pallets = next(
-            (item.get("pallets", self.state["pallets"]) for item in lots if item["id"] == target),
-            self.state["pallets"],
-        )
-        event = {
-            "type": "reduce",
-            "lot_id": target,
-            "new_pallets": max(1, pallets - 1),
-        }
+        voyage_id = containers[assignment["container_id"]]["voyage_id"]
+        voyage = next(v for v in session["scenario"]["voyages"] if v["id"] == voyage_id)
+        new_etd = datetime.fromisoformat(voyage["etd"]) + timedelta(hours=6)
+        event = {"type": "delay", "voyage_id": voyage_id, "new_etd": new_etd.isoformat()}
         body = {"event": event, "idempotency_key": f"readiness-{plan_id}"}
-        result = self.call("platform", "POST", f"/plans/{plan_id}/events", body)
+        result = self.call("forwarder", "POST", f"/plans/{plan_id}/events", body)
         if not result["recommended_id"]:
             raise StepFailed("no recommended alternative")
         self.state.update(
@@ -224,7 +432,7 @@ class Readiness:
             alternative_id=result["recommended_id"],
             explanation=result.get("explanation"),
         )
-        return f"recommended={result['recommended_id']}"
+        return f"voyage={voyage_id} recommended={result['recommended_id']}"
 
     def apply(self) -> str:
         plan_id = self.state["plan_id"]
@@ -232,7 +440,7 @@ class Readiness:
             "alternative_id": self.state["alternative_id"],
             "replan_id": self.state["replan_id"],
         }
-        session = self.call("platform", "POST", f"/plans/{plan_id}/apply", body)
+        session = self.call("forwarder", "POST", f"/plans/{plan_id}/apply", body)
         if not session.get("active_order_id"):
             raise StepFailed(f"no execution order (status {session['status']})")
         self.state["order_id"] = session["active_order_id"]
@@ -275,10 +483,7 @@ class Readiness:
         mine = [r for r in rows if r["plan_id"] == plan_id]
         if not mine:
             raise StepFailed("shipper settlement row missing")
-        platform = self.call("platform", "GET", "/saas/platform/settlements")
-        if plan_id not in {r["plan_id"] for r in platform}:
-            raise StepFailed("platform settlement missing")
-        self.call("platform", "GET", f"/plans/{plan_id}/settlement")
+        self.call("forwarder", "GET", f"/plans/{plan_id}/settlement")
         return f"shipper_rows={len(mine)}"
 
     def explanation(self) -> str:
@@ -295,21 +500,34 @@ class Readiness:
         return f"source={source} fallback={reason} sentence={sentence!r}"
 
     def cleanup(self) -> str:
-        self.call("platform", "POST", "/saas/sandbox/reset")
-        return "reset world"
+        purged = purge_accounts(self.emails.values())
+        if purged.held_orgs:
+            raise StepFailed(
+                f"다른 조직의 계획 {', '.join(purged.foreign_plans)}이 점검용 조직 "
+                f"{', '.join(purged.held_orgs)}을 참조해 그 조직은 지우지 않았습니다 ({purged.detail()})"
+            )
+        signed_up = sum(f"{role}_user" in self.state for role in ROLES)
+        if purged.users < signed_up:
+            raise StepFailed(f"purged {purged.users} of {signed_up} accounts ({purged.detail()})")
+        left = leftover_accounts(self.emails.values())
+        if left:
+            raise StepFailed(f"{left} readiness accounts left after cleanup")
+        return purged.detail()
 
     def flow(self) -> bool:
         if not self.step("health", self.health):
             return False
-        if not self.step("demo-login", lambda: self.login("platform")):
-            return False
         steps = [
+            ("shipper signs up", lambda: self.account("shipper")),
+            ("shipper registers packhouse", self.packhouse),
+            ("forwarder signs up", lambda: self.account("forwarder")),
+            ("forwarder registers resource", self.resource),
             ("shipper registers lot", self.register),
-            ("platform generates plan", self.create_plan),
+            ("forwarder generates plan", self.create_plan),
             ("shipper views plan", self.shipper_view),
-            ("forwarder assignment", self.assign_forwarder),
-            ("platform change event", self.change_event),
-            ("platform applies order", self.apply),
+            ("shipper accepts plan", self.accept_plan),
+            ("forwarder change event", self.change_event),
+            ("forwarder applies order", self.apply),
             ("shipper confirms order", self.shipper_confirm),
             ("forwarder confirms order", self.forwarder_confirm),
             ("settlement lookup", self.settlement),
@@ -328,7 +546,7 @@ class Readiness:
         try:
             ok = self.flow()
         finally:
-            if not self.keep and "lot_id" in self.state:
+            if not self.keep and self.emails:
                 ok = self.step("cleanup", self.cleanup) and ok
             closed: set[int] = set()
             for client in [self.anonymous, *self.clients.values()]:
@@ -377,7 +595,10 @@ def summary(results: list[StepResult]) -> dict[str, Any]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="SaaS demo-login end-to-end readiness check")
+    parser = argparse.ArgumentParser(
+        description="SaaS 배포 점검: 점검용 화주·포워더 계정으로 가입부터 정산까지 확인하고, "
+        "만든 계정·조직·계획을 DB에서 지운다. 대상 서버와 같은 DB에 붙는 API 컨테이너 안에서 실행한다"
+    )
     parser.add_argument("--base-url", default=os.environ.get(BASE_URL_ENV, DEFAULT_BASE_URL))
     parser.add_argument("--timeout", type=float, default=30)
     parser.add_argument("--keep", action="store_true")
