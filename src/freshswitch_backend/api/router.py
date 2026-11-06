@@ -41,7 +41,7 @@ from freshswitch_backend.api import (
 )
 from freshswitch_backend.api.saas_roles import platform_operational_guard
 
-ROUTERS = (
+DEMO_ROUTERS = (
     health.router,
     scenarios.router,
     plans.router,
@@ -56,6 +56,9 @@ ROUTERS = (
     coldchain.router,
     quality.router,
     provenance.router,
+)
+
+SAAS_ROUTERS = (
     auth.router,
     auth.invitation_router,
     me.router,
@@ -79,6 +82,26 @@ ROUTERS = (
     ops.router,
 )
 
+SAAS_ONLY_ENDPOINTS = frozenset(
+    {
+        coldchain.accept_action,
+        coldchain.complete_action,
+        coldchain.export_readings,
+        coldchain.export_outages,
+        coldchain.read_power_plan,
+    }
+)
+
+RETIRED_IN_SAAS = frozenset(
+    {
+        auth.demo_login,
+        saas_sandbox.reset_world,
+        saas_plan_confirm.auto_accept_confirmation,
+        saas_operations.auto_accept,
+        *(route.endpoint for route in demo.router.routes),
+    }
+)
+
 
 def router_for(*, saas_mode: bool) -> APIRouter:
     router = APIRouter(
@@ -88,16 +111,10 @@ def router_for(*, saas_mode: bool) -> APIRouter:
             Depends(platform_operational_guard),
         ]
     )
-    retired = {
-        auth.demo_login,
-        saas_sandbox.reset_world,
-        saas_plan_confirm.auto_accept_confirmation,
-        saas_operations.auto_accept,
-        *(route.endpoint for route in demo.router.routes),
-    }
-    for source in ROUTERS:
+    sources = DEMO_ROUTERS + SAAS_ROUTERS if saas_mode else DEMO_ROUTERS
+    excluded = RETIRED_IN_SAAS if saas_mode else SAAS_ONLY_ENDPOINTS
+    for source in sources:
         included = copy(source)
-        if saas_mode:
-            included.routes = [route for route in source.routes if route.endpoint not in retired]
+        included.routes = [route for route in source.routes if route.endpoint not in excluded]
         router.include_router(included)
     return router

@@ -10,6 +10,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-freshswitch}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-freshswitch}
       POSTGRES_DB: ${POSTGRES_DB:-freshswitch}
+      SESSION_COOKIE_NAME: ${SESSION_COOKIE_NAME:-fs_demo_session}
     restart: unless-stopped
     depends_on:
       db:

@@ -533,7 +533,8 @@ def load_me(principal: Principal) -> Me:
 def csrf_guard(request: Request) -> None:
     if request.method not in UNSAFE_METHODS:
         return
-    if not request.cookies.get(app_settings(request).session_cookie_name):
+    settings = app_settings(request)
+    if not settings.saas_mode or not request.cookies.get(settings.session_cookie_name):
         return
     if request.headers.get(CSRF_HEADER) != CSRF_VALUE:
         raise HTTPException(status_code=403, detail="요청 출처를 확인할 수 없습니다")
@@ -550,6 +551,8 @@ def _session_required(settings: Settings, *, stale_cookie: bool) -> HTTPExceptio
 
 def current_principal(request: Request) -> Principal | None:
     settings = app_settings(request)
+    if not settings.saas_mode:
+        return None
     token = request.cookies.get(settings.session_cookie_name)
     requested = request.headers.get(ORG_HEADER) or None
     if not token:
@@ -562,7 +565,7 @@ def current_principal(request: Request) -> Principal | None:
         if session is None or session.expires_at <= now:
             raise _session_required(settings, stale_cookie=True)
         user = db.get(UserRow, session.user_id)
-        if user is None or (settings.saas_mode and (user.is_demo or is_demo_email(user.email))):
+        if user is None or user.is_demo or is_demo_email(user.email):
             raise _session_required(settings, stale_cookie=True)
         active = _choose(_memberships(db, session.user_id), requested, session.active_org_id)
         if requested is None and session.active_org_id != active.org_id:
