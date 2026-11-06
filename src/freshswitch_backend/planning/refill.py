@@ -16,6 +16,7 @@ from freshswitch_backend.persistence.tables import (
     PackhouseRow,
     PendingRow,
     PlanRow,
+    QuantityPolicyRow,
     ShipperProfileRow,
 )
 from freshswitch_backend.planning.service import solve_with_routes
@@ -128,6 +129,10 @@ def join_waitlist(
     voyage = next((v for v in session.scenario.voyages if v.id == voyage_id), None)
     if voyage is None or voyage.destination != lot.destination:
         raise SessionConflict("출항지와 목적지가 맞는 항차가 필요합니다")
+    if lot_id in cancelled_in_plan(db, row.plan_id):
+        raise SessionConflict(
+            "이 계획에서 취소한 출하는 같은 계획의 빈자리를 다시 채울 수 없습니다. 새 계획으로 묶어 주세요"
+        )
     eligible = {candidate.id for candidate in _registered(db, row)}
     if lot_id not in eligible:
         raise SessionConflict("이 계획에 연결할 수 없는 등록 출하입니다")
@@ -150,9 +155,22 @@ def join_waitlist(
     return updated
 
 
+def cancelled_in_plan(db: Session, plan_id: str) -> set[str]:
+    return {
+        lot_id
+        for payload in db.scalars(
+            select(QuantityPolicyRow.payload).where(QuantityPolicyRow.plan_id == plan_id)
+        )
+        for lot_id, reservation in payload.get("reservations", {}).items()
+        if reservation.get("events")
+    }
+
+
 def _registered(db: Session, row: PlanRow) -> list[LotRow]:
-    return list(
-        db.scalars(
+    cancelled = cancelled_in_plan(db, row.plan_id)
+    return [
+        lot
+        for lot in db.scalars(
             select(LotRow)
             .join(OrganizationRow, OrganizationRow.id == LotRow.shipper_org_id)
             .where(
@@ -163,7 +181,8 @@ def _registered(db: Session, row: PlanRow) -> list[LotRow]:
             )
             .order_by(LotRow.created_at, LotRow.id)
         )
-    )
+        if lot.id not in cancelled
+    ]
 
 
 def _matches(lot: LotRow, vacancy: RefillVacancy, session: PlanSession, now: datetime) -> bool:

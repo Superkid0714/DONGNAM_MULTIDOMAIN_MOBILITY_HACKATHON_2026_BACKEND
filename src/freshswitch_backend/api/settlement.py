@@ -3,7 +3,8 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from freshswitch_backend.api.auth import current_org_id
+from freshswitch_backend.api.auth import OptionalPrincipal, current_org_id
+from freshswitch_backend.api.saas_access import plan_for
 from freshswitch_backend.domain.models import ContainerSettlement, TariffSheet
 from freshswitch_backend.execution.quality import (
     ArrivalInspection,
@@ -45,7 +46,9 @@ class SettlementView(BaseModel):
 
 
 @router.get("/{plan_id}/settlement")
-def read_settlement(plan_id: str, org_id: OrgId) -> SettlementView:
+def read_settlement(plan_id: str, org_id: OrgId, principal: OptionalPrincipal) -> SettlementView:
+    if principal is not None and principal.org_type == "platform":
+        org_id = plan_for(plan_id, principal).owner_org_id
     session = store.get(plan_id, org_id=org_id)
     if session is None:
         raise HTTPException(status_code=404, detail="계획을 찾을 수 없습니다")

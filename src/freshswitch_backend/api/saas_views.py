@@ -33,7 +33,12 @@ from freshswitch_backend.execution.models import (
 from freshswitch_backend.execution.orders import genset_instructions, short_name
 from freshswitch_backend.execution.quality import QualitySettlement, adjusted_settlements
 from freshswitch_backend.persistence import database
-from freshswitch_backend.persistence.tables import LotRow, OrganizationRow, PlanForwarderRow
+from freshswitch_backend.persistence.tables import (
+    LotRow,
+    OrganizationRow,
+    PlanForwarderRow,
+    QuantityPolicyRow,
+)
 from freshswitch_backend.planning.store import PlanConfirmationState, PlanSession
 from freshswitch_backend.replan.models import (
     AddLotEvent,
@@ -672,6 +677,22 @@ def _stored_lot_shippers(lot_ids: list[str]) -> dict[str, str]:
         return {lot_id: shipper_id for lot_id, shipper_id in rows}
 
 
+def _reserved_lot_shippers(plan_id: str, lot_ids: list[str]) -> dict[str, str]:
+    if not lot_ids:
+        return {}
+    wanted = set(lot_ids)
+    with database.begin() as db:
+        payloads = db.scalars(
+            select(QuantityPolicyRow.payload).where(QuantityPolicyRow.plan_id == plan_id)
+        )
+        return {
+            lot_id: reservation["shipper_id"]
+            for payload in payloads
+            for lot_id, reservation in payload.get("reservations", {}).items()
+            if lot_id in wanted and reservation.get("shipper_id")
+        }
+
+
 def lot_ledger(
     session: PlanSession,
     orders: Iterable[ExecutionOrder] = (),
@@ -687,6 +708,8 @@ def lot_ledger(
     _collect_lots(session.model_dump(mode="json"), ledger)
     for order in orders:
         _collect_lots(order.model_dump(mode="json"), ledger)
+    unresolved = [lot_id for lot_id, owner in ledger.items() if owner is None]
+    ledger.update(_reserved_lot_shippers(session.plan_id, unresolved))
     unresolved = [lot_id for lot_id, owner in ledger.items() if owner is None]
     for lot_id, owner in _stored_lot_shippers(unresolved).items():
         if owner not in own:

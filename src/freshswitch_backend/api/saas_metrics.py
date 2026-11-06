@@ -31,6 +31,7 @@ from freshswitch_backend.analysis.emissions import EmissionResult, avoided_emiss
 from freshswitch_backend.analysis.models import Assumption, VoyageEconomics
 from freshswitch_backend.api.auth import Principal, require_role
 from freshswitch_backend.api.compute_limits import analysis_rate, analysis_slot
+from freshswitch_backend.api.saas_access import visible_plans
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.domain.models import KST, Plan, Scenario
 from freshswitch_backend.execution.quality import adjusted_settlements
@@ -153,12 +154,11 @@ def plan_month(session: PlanSession) -> str:
     return moment.astimezone(KST).strftime("%Y-%m")
 
 
-def org_sessions(org_id: str) -> list[PlanSession]:
-    store.expire_due(PlanRow.org_id == org_id)
+def org_sessions(principal: Principal) -> list[PlanSession]:
+    visible = visible_plans(principal)
+    store.expire_due(visible)
     with database.begin() as db:
-        rows = db.scalars(
-            select(PlanRow).where(PlanRow.org_id == org_id).order_by(PlanRow.seq)
-        ).all()
+        rows = db.scalars(select(PlanRow).where(visible).order_by(PlanRow.seq)).all()
         return [PlanSession.model_validate(row.payload) for row in rows]
 
 
@@ -297,7 +297,7 @@ def _loss_gap(sessions: list[PlanSession]) -> Metric:
 @router.get("/metrics")
 def platform_metrics(principal: PlatformPrincipal, month: MonthQuery = None) -> PlatformMetrics:
     target = _month(month)
-    every = org_sessions(principal.org_id)
+    every = org_sessions(principal)
     sessions = [s for s in every if plan_month(s) == target]
     rows = [r for s in sessions for r in adjusted_settlements(s.plan, s.arrival_inspections)]
     assignments = [a for s in sessions for a in s.plan.assignments]
@@ -446,7 +446,7 @@ def platform_business(
     variable_cost_per_pallet: int = Query(0, ge=0, le=MAX_VARIABLE_COST_PER_PALLET),
 ) -> PlatformBusiness:
     target = _month(month)
-    sessions = [s for s in org_sessions(principal.org_id) if plan_month(s) == target]
+    sessions = [s for s in org_sessions(principal) if plan_month(s) == target]
     lines = [
         _business_line(
             sessions,

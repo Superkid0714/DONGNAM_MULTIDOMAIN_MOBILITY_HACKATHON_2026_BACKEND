@@ -224,11 +224,16 @@ def _platform_view(
     )
 
 
-def _own_lot(access: PlanAccess, lot_id: str, org_id: str) -> Lot:
-    session = access.session
-    lot = next((x for x in session.scenario.lots if x.id == lot_id), None)
+def _owned_lot(access: PlanAccess, lot_id: str) -> Lot:
+    lot = next((x for x in access.session.scenario.lots if x.id == lot_id), None)
     if lot is None or lot.shipper_id not in access.viewer.shipper_ids:
         raise HTTPException(status_code=404, detail=LOT_NOT_IN_PLAN)
+    return lot
+
+
+def _own_lot(access: PlanAccess, lot_id: str, org_id: str) -> Lot:
+    session = access.session
+    lot = _owned_lot(access, lot_id)
     assigned = next((a for a in session.plan.assignments if a.lot_id == lot_id), None)
     if lot_id not in session.registered_lot_ids or assigned is None:
         raise HTTPException(status_code=409, detail=NOT_PLANNED)
@@ -314,11 +319,12 @@ async def create_change_request(
 ) -> ShipperChangeRequest:
     access = await run_in_threadpool(plan_for, plan_id, principal)
     session = access.session
+    _owned_lot(access, body.lot_id)
     if body.type in {"reduce", "cancel", "increase"}:
-        from freshswitch_backend.planning.quantity_policy import has_policy
+        from freshswitch_backend.planning.quantity_policy import lot_bound
 
         with database.begin() as db:
-            if has_policy(db, plan_id):
+            if lot_bound(db, plan_id, body.lot_id):
                 raise HTTPException(409, "수량 변경 견적을 확인한 뒤 요청해 주세요")
     with _claim(session.plan_id, body.lot_id):
         lot = await run_in_threadpool(_own_lot, access, body.lot_id, principal.org_id)
@@ -538,11 +544,17 @@ def _increase_replan(request: PlatformChangeRequest, principal: Principal) -> Re
 
     with database.begin() as db:
         row = db.get(PlanRow, request.plan_id, with_for_update=True)
-        result = build_quantity_increase(db, row, request.lot_id, request.new_pallets, store.clock())
+        result = build_quantity_increase(
+            db, row, request.lot_id, request.new_pallets, store.clock()
+        )
     session = store.get(request.plan_id, org_id=principal.org_id)
     pending = store.add_pending(session, result, principal.org_id)
-    return ReplanResponse(**result.model_dump(), plan_id=request.plan_id,
-                          replan_id=pending.replan_id, base_version=pending.base_version)
+    return ReplanResponse(
+        **result.model_dump(),
+        plan_id=request.plan_id,
+        replan_id=pending.replan_id,
+        base_version=pending.base_version,
+    )
 
 
 @router.post("/platform/change-requests/{request_id}/apply")

@@ -17,6 +17,7 @@ from freshswitch_backend.execution.quantity_policy import (
     confirm_quantity,
     distribute_credits,
     quote_quantity,
+    vacancy_quantity,
 )
 from freshswitch_backend.persistence.tables import (
     ChangeRequestRow,
@@ -205,6 +206,20 @@ def has_policy(db: Session, plan_id: str) -> bool:
     return (
         db.scalar(
             select(QuantityPolicyRow.plan_id).where(QuantityPolicyRow.plan_id == plan_id).limit(1)
+        )
+        is not None
+    )
+
+
+def lot_bound(db: Session, plan_id: str, lot_id: str) -> bool:
+    return (
+        db.scalar(
+            select(QuantityPolicyRow.plan_id)
+            .where(
+                QuantityPolicyRow.plan_id == plan_id,
+                QuantityPolicyRow.payload["reservations"].has_key(lot_id),
+            )
+            .limit(1)
         )
         is not None
     )
@@ -907,19 +922,43 @@ def record_selected_recommendation(
 
 def guard_bound_lot(lot_id: str, org_id: str) -> None:
     from freshswitch_backend.persistence import database
+    from freshswitch_backend.planning.store import store
 
     with database.begin() as db:
-        found = db.scalar(
-            select(QuantityPolicyRow.plan_id)
-            .where(
+        rows = db.scalars(
+            select(QuantityPolicyRow).where(
                 QuantityPolicyRow.payload["reservations"][lot_id]["shipper_org_id"].astext == org_id
             )
-            .limit(1)
         )
-        if found is not None:
-            raise HTTPException(
-                409, "항차 수량 예약에 연결된 출하는 수량 변경 견적으로 수정해 주세요"
-            )
+        states = {reservation_hold(load_ledger(row), lot_id, store.clock()) for row in rows}
+    if "active" in states:
+        raise HTTPException(409, "항차 수량 예약에 연결된 출하는 수량 변경 견적으로 수정해 주세요")
+    if "refilling" in states:
+        raise HTTPException(
+            409,
+            "취소한 출하의 빈자리를 충원하는 중입니다. 충원이 끝나거나 항차 마감이 지나면 수정·삭제할 수 있습니다",
+        )
+
+
+def reservation_hold(ledger: VoyageLedger, lot_id: str, now: datetime) -> str | None:
+    reservation = ledger.reservations[lot_id]
+    if reservation.current_quantity or any(
+        r.get("lot_id") == lot_id and r.get("status") == "queued" for r in ledger.requests.values()
+    ):
+        return "active"
+    if any(
+        lot_id in {offer.get("lot_id"), offer.get("accepted_lot_id")}
+        and offer.get("status") in {"pending", "pending_execution"}
+        for offer in ledger.refill.get("offers", [])
+    ):
+        return "active"
+    if (
+        ledger.departure_confirmed_at is None
+        and now < ledger.policy.cutoff
+        and vacancy_quantity(reservation)
+    ):
+        return "refilling"
+    return None
 
 
 def guard_policy_deletion(db: Session, plan_id: str) -> None:

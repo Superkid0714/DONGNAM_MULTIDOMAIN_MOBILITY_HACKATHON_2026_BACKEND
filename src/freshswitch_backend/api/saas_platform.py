@@ -40,6 +40,7 @@ from freshswitch_backend.lots import ANY_ORG, LotStatus, LotUnavailable, Registe
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.orgs import same_sandbox
 from freshswitch_backend.persistence.tables import LotRow, OrganizationRow, PlanRow
+from freshswitch_backend.planning.refill import cancelled_in_plan
 from freshswitch_backend.planning.service import VoyagePickup, build_plan
 from freshswitch_backend.planning.store import ContainerBooked, PlanSession, store
 from freshswitch_backend.replan import AddLotEvent
@@ -158,6 +159,13 @@ def _addable(session: PlanSession, body: AddLotRequest, principal: Principal) ->
         raise HTTPException(status_code=404, detail="등록된 출하를 찾을 수 없습니다")
     if any(lot.id == row.id for lot in session.scenario.lots):
         raise HTTPException(status_code=409, detail="이미 이 계획에 들어 있는 출하입니다")
+    with database.begin() as db:
+        cancelled = row.id in cancelled_in_plan(db, session.plan_id)
+    if cancelled:
+        raise HTTPException(
+            status_code=409,
+            detail="이 계획에서 취소한 출하는 같은 계획에 다시 넣을 수 없습니다. 새 계획으로 묶어 주세요",
+        )
     if row.status != "registered":
         raise HTTPException(status_code=409, detail="이미 다른 계획에 들어갔거나 취소된 출하입니다")
     if row.scenario_id != session.scenario_id:
@@ -230,7 +238,7 @@ def preview_plan(
 
 
 def _sessions(principal: Principal, limit: int, offset: int) -> list[PlanSession]:
-    store.expire_due(PlanRow.org_id == principal.org_id)
+    store.expire_due(visible_plans(principal))
     with database.begin() as db:
         rows = db.scalars(
             select(PlanRow)
