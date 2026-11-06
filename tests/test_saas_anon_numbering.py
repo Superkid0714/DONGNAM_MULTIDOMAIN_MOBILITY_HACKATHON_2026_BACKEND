@@ -7,7 +7,7 @@ PARTICIPANTS = ("sh-jinju", "sh-sancheong", "sh-sangju")
 
 
 def test_anonymous_numbers_count_only_plan_participants(
-    platform_client: TestClient, saas_login
+    forwarder_client: TestClient, saas_login
 ) -> None:
     ids = []
     for lot in _scenario().lots:
@@ -17,7 +17,7 @@ def test_anonymous_numbers_count_only_plan_participants(
         response = client.post("/api/saas/shipper/lots", json=_lot_body(lot))
         assert response.status_code == 201, response.text
         ids.append(response.json()["registered"]["id"])
-    created = platform_client.post("/api/saas/platform/plans", json={"lot_ids": ids})
+    created = forwarder_client.post("/api/saas/forwarder/plans", json={"lot_ids": ids})
     assert created.status_code == 201, created.text
     plan_id = created.json()["plan_id"]
 

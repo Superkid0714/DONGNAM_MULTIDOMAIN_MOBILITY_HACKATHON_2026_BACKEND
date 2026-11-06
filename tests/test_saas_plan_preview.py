@@ -1,13 +1,11 @@
 import pytest
 from fastapi.testclient import TestClient
 from saas_fixtures import (
+    FORWARDER_ORG_ID,
     PLATFORM_ORG_ID,
-    REAL_PLATFORM_EMAIL,
-    REAL_PLATFORM_PASSWORD,
+    SAAS_CSRF,
     SHIPPER_ORG_ID,
-    create_real_platform,
     login_client,
-    password_client,
 )
 
 from freshswitch_backend.config import get_settings
@@ -15,7 +13,23 @@ from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.main import create_app
 from freshswitch_backend.persistence.seed import shipper_org_id
 
-PREVIEW = "/api/saas/platform/plans/preview"
+PREVIEW = "/api/saas/forwarder/plans/preview"
+PLATFORM_PREVIEW = "/api/saas/platform/plans/preview"
+RESOURCE = {
+    "name": "실제 냉장 컨테이너",
+    "kind": "40RH-CA",
+    "capacity_pallets": 20,
+    "temp_min_c": -1,
+    "temp_max_c": 4,
+    "vessel_name": "등록 선박",
+    "terminal": "등록 터미널",
+    "origin": "KRPUS",
+    "destination": "HKHKG",
+    "etd": "2026-11-18T18:00:00+09:00",
+    "cy_cutoff": "2026-11-17T16:00:00+09:00",
+    "transit_days": 3.5,
+    "enabled": True,
+}
 TOTALS = ("total_baseline_cost", "total_shared_cost", "total_savings", "total_fee", "objective")
 
 
@@ -35,6 +49,24 @@ def _lot_body(lot) -> dict:
         "shipper": "무시",
         "lot_id": lot.id,
     }
+
+
+def _real_forwarder(app) -> TestClient:
+    client = TestClient(app, base_url="https://testserver", headers=SAAS_CSRF)
+    signup = client.post(
+        "/api/auth/signup",
+        json={
+            "email": "preview-forwarder@example.com",
+            "password": "password-123",
+            "name": "실제 포워더",
+            "org_name": "실제 포워더 회사",
+            "org_type": "forwarder",
+        },
+    )
+    assert signup.status_code == 201, signup.text
+    resource = client.post("/api/saas/forwarder/resources", json=RESOURCE)
+    assert resource.status_code == 201, resource.text
+    return client
 
 
 def _register_all(app) -> list[str]:
@@ -64,7 +96,9 @@ def _shape(plan: dict) -> dict:
 def test_preview_does_not_save_and_matches_create(saas_app) -> None:
     ids = _register_all(saas_app)
     platform = login_client(PLATFORM_ORG_ID, saas_app)
-    preview = platform.post(PREVIEW, json={"lot_ids": ids})
+    forwarder = login_client(FORWARDER_ORG_ID, saas_app)
+    assert platform.post(PLATFORM_PREVIEW, json={"lot_ids": ids}).status_code == 403
+    preview = forwarder.post(PREVIEW, json={"lot_ids": ids})
     assert preview.status_code == 200, preview.text
     body = preview.json()
     assert set(body) == {"scenario", "plan", "routes"}
@@ -74,14 +108,14 @@ def test_preview_does_not_save_and_matches_create(saas_app) -> None:
     lots = platform.get("/api/saas/platform/lots").json()
     assert {lot["status"] for lot in lots} == {"registered"}
 
-    again = platform.post(PREVIEW, json={"lot_ids": ids})
+    again = forwarder.post(PREVIEW, json={"lot_ids": ids})
     assert again.status_code == 200
     assert _shape(again.json()["plan"]) == _shape(body["plan"])
-    reordered = platform.post(PREVIEW, json={"lot_ids": list(reversed(ids))})
+    reordered = forwarder.post(PREVIEW, json={"lot_ids": list(reversed(ids))})
     assert reordered.status_code == 200
     assert _shape(reordered.json()["plan"])["totals"] == _shape(body["plan"])["totals"]
 
-    created = platform.post("/api/saas/platform/plans", json={"lot_ids": ids})
+    created = forwarder.post("/api/saas/forwarder/plans", json={"lot_ids": ids})
     assert created.status_code == 201, created.text
     assert _shape(created.json()["plan"]) == _shape(body["plan"])
 
@@ -92,19 +126,20 @@ def test_preview_validates_lots(saas_app) -> None:
     registered = shipper.post("/api/saas/shipper/lots", json=_lot_body(lot))
     assert registered.status_code == 201, registered.text
     lot_id = registered.json()["registered"]["id"]
-    platform = login_client(PLATFORM_ORG_ID, saas_app)
+    forwarder = login_client(FORWARDER_ORG_ID, saas_app)
 
-    assert platform.post(PREVIEW, json={"lot_ids": []}).status_code == 422
-    assert platform.post(PREVIEW, json={"lot_ids": ["lot-missing"]}).status_code in (404, 422)
+    assert forwarder.post(PREVIEW, json={"lot_ids": []}).status_code == 422
+    assert forwarder.post(PREVIEW, json={"lot_ids": ["lot-missing"]}).status_code in (404, 422)
     assert shipper.post(PREVIEW, json={"lot_ids": [lot_id]}).status_code == 403
 
-    create_real_platform()
-    real = password_client(saas_app, REAL_PLATFORM_EMAIL, REAL_PLATFORM_PASSWORD)
-    assert real.post(PREVIEW, json={"lot_ids": [lot.id]}).status_code == 422
+    real = _real_forwarder(saas_app)
+    foreign = real.post(PREVIEW, json={"lot_ids": [lot.id]})
+    assert foreign.status_code == 422
+    assert foreign.json()["detail"].startswith("등록되지 않은 로트입니다")
 
-    created = platform.post("/api/saas/platform/plans", json={"lot_ids": [lot_id]})
+    created = forwarder.post("/api/saas/forwarder/plans", json={"lot_ids": [lot_id]})
     assert created.status_code == 201
-    assert platform.post(PREVIEW, json={"lot_ids": [lot_id]}).status_code == 409
+    assert forwarder.post(PREVIEW, json={"lot_ids": [lot_id]}).status_code == 409
 
 
 def test_preview_requires_login_in_saas_mode(saas_app) -> None:

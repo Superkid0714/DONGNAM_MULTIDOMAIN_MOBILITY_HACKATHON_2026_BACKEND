@@ -105,7 +105,7 @@ def test_stale_session_401_clears_both_cookie_paths():
     assert not list(http.cookies.jar)
 
 
-@pytest.mark.parametrize(("saas", "path"), [(False, "/"), (False, "/test"), (True, "/test")])
+@pytest.mark.parametrize(("saas", "path"), [(True, "/test")])
 def test_legacy_cleanup_is_limited_to_root_saas_sessions(saas, path):
     http = client(path=path, saas=saas)
     response = signup(http)

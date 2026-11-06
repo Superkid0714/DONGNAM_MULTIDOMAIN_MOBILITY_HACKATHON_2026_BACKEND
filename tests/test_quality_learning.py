@@ -149,7 +149,9 @@ def test_repeated_poor_arrivals_shift_strawberry_to_air(client: TestClient) -> N
     assert shippers["sh-pohang"]["savings_change"] == 0
 
 
-def test_arrival_hook_is_idempotent_and_reads_outage(client: TestClient, reset_admin_headers) -> None:
+def test_arrival_hook_is_idempotent_and_reads_outage(
+    client: TestClient, reset_admin_headers
+) -> None:
     plan_id = client.post("/api/plans", json={}).json()["plan_id"]
     run = client.post(
         "/api/coldchain/simulate",

@@ -2,14 +2,13 @@ from copy import deepcopy
 
 import pytest
 from fastapi.testclient import TestClient
-from saas_fixtures import SHIPPER_ORG_ID
+from saas_fixtures import SHIPPER_ORG_ID, saas_app
 from sqlalchemy import func, select
 from test_onboarding import _lot, _onboarded
 from test_saas_products import PRODUCT, PRODUCTS, _catalog, _create
 from test_saas_resource_invariants import PLANS, _forwarder, _platform, _resource
 
 from freshswitch_backend.data.loader import get_scenario
-from freshswitch_backend.main import app
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.tables import PlanRow, ProductArchiveRow, ProductRow
 
@@ -214,7 +213,7 @@ def test_archive_restore_enforce_tenant_roles_and_csrf(saas_login):
     for blocked in (_platform(), _forwarder()):
         assert blocked.delete(path).status_code == 403
         assert blocked.post(f"{path}/restore").status_code == 403
-    anonymous = TestClient(app)
+    anonymous = TestClient(saas_app)
     assert anonymous.delete(path).status_code == 401
     assert anonymous.post(f"{path}/restore").status_code == 401
     demo = saas_login(SHIPPER_ORG_ID)

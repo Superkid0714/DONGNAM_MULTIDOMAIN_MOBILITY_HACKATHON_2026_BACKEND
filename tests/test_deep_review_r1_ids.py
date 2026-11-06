@@ -41,6 +41,10 @@ def _platform(app) -> TestClient:
     return seed_client("freshswitch", app)
 
 
+def _forwarder(app) -> TestClient:
+    return seed_client("forwarder-dongnam", app)
+
+
 def test_existing_scenario_and_generated_ids_pass_rule() -> None:
     for scenario in load_scenarios().values():
         for lot in scenario.lots:
@@ -128,11 +132,11 @@ def test_coldchain3_rule_breaking_device_id_is_rejected_everywhere(
 ) -> None:
     token = "legacy-token-tk-0001"
     with database.begin() as db:
-        db.add(DeviceRow(device_id=bad, org_id="freshswitch", token_hash=token_hash(token)))
+        db.add(DeviceRow(device_id=bad, org_id="forwarder-dongnam", token_hash=token_hash(token)))
     scenario = load_scenarios()["default"]
-    plan_id = store.create(scenario, org_id="freshswitch").plan_id
-    platform = _platform(saas)
-    bound = platform.post(
+    plan_id = store.create(scenario, org_id="forwarder-dongnam").plan_id
+    forwarder = _forwarder(saas)
+    bound = forwarder.post(
         "/api/coldchain/bindings",
         json={"device_id": bad, "container_id": "CA-01", "plan_id": plan_id},
         headers=CSRF,
@@ -145,7 +149,7 @@ def test_coldchain3_rule_breaking_device_id_is_rejected_everywhere(
         headers={"X-Device-Token": token},
     )
     assert reading.status_code == 422, reading.text
-    simulated = platform.post(
+    simulated = forwarder.post(
         "/api/coldchain/simulate", json={"device_id": bad, "plan_id": plan_id}, headers=CSRF
     )
     assert simulated.status_code == 422, simulated.text

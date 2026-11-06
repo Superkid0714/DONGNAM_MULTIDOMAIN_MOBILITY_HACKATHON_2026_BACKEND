@@ -135,7 +135,7 @@ def test_demo_plan_response_carries_reason_fields(client: TestClient) -> None:
 
 
 def test_shipper_view_anonymizes_other_shipper_reasons(
-    scenario: Scenario, platform_client: TestClient, saas_login
+    scenario: Scenario, forwarder_client: TestClient, saas_login
 ) -> None:
     ids = []
     for lot in scenario.lots:
@@ -148,11 +148,11 @@ def test_shipper_view_anonymizes_other_shipper_reasons(
         response = client.post("/api/saas/shipper/lots", json=body)
         assert response.status_code == 201, response.text
         ids.append(response.json()["registered"]["id"])
-    created = platform_client.post("/api/saas/platform/plans", json={"lot_ids": ids})
+    created = forwarder_client.post("/api/saas/forwarder/plans", json={"lot_ids": ids})
     assert created.status_code == 201, created.text
     plan_id = created.json()["plan_id"]
-    platform_plan = created.json()["plan"]
-    late = next(a for a in platform_plan["assignments"] if a["lot_id"] == LATE_LOT)
+    full_plan = created.json()["plan"]
+    late = next(a for a in full_plan["assignments"] if a["lot_id"] == LATE_LOT)
     assert late["reason"]["code"] == "sea_deadline_miss"
 
     jinju = saas_login(shipper_org_id("sh-jinju"))

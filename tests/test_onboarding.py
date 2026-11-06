@@ -8,9 +8,9 @@ from saas_fixtures import (
     create_real_platform,
     login_client,
     password_client,
+    saas_app,
 )
 
-from freshswitch_backend.main import app
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.tables import LotRow
 
@@ -24,8 +24,25 @@ PACKHOUSE = {
 }
 
 
+RESOURCE = {
+    "name": "실제 냉장 컨테이너",
+    "kind": "40RH-CA",
+    "capacity_pallets": 20,
+    "temp_min_c": -1,
+    "temp_max_c": 4,
+    "vessel_name": "등록 선박",
+    "terminal": "등록 터미널",
+    "origin": "KRPUS",
+    "destination": "HKHKG",
+    "etd": "2026-11-18T18:00:00+09:00",
+    "cy_cutoff": "2026-11-17T16:00:00+09:00",
+    "transit_days": 3.5,
+    "enabled": True,
+}
+
+
 def _signup(email: str, org_name: str, org_type: str = "shipper") -> TestClient:
-    client = TestClient(app, base_url="https://testserver", headers=SAAS_CSRF)
+    client = TestClient(saas_app, base_url="https://testserver", headers=SAAS_CSRF)
     response = client.post(
         "/api/auth/signup",
         json={
@@ -48,6 +65,13 @@ def _lot(product: str = "strawberry", ready: str = "2026-11-17", **extra) -> dic
         "destination": "HKHKG",
         **extra,
     }
+
+
+def _real_forwarder(email: str, org_name: str) -> TestClient:
+    client = _signup(email, org_name, "forwarder")
+    response = client.post("/api/saas/forwarder/resources", json=RESOURCE)
+    assert response.status_code == 201, response.text
+    return client
 
 
 def _onboarded(email: str, org_name: str) -> tuple[TestClient, dict]:
@@ -90,7 +114,7 @@ def test_new_shipper_signup_packhouse_lot_reaches_platform_pool(demo_tenants) ->
     assert registered["packhouse"] == ph["packhouse_id"]
     assert lot.json()["hints"]["season"]["in_season"] is True
 
-    platform = password_client(app, REAL_PLATFORM_EMAIL, REAL_PLATFORM_PASSWORD)
+    platform = password_client(saas_app, REAL_PLATFORM_EMAIL, REAL_PLATFORM_PASSWORD)
     pool = platform.get("/api/saas/platform/lots").json()
     row = next(x for x in pool if x["id"] == registered["id"])
     assert row["shipper_org_name"] == "하동 딸기 농장"
@@ -98,7 +122,10 @@ def test_new_shipper_signup_packhouse_lot_reaches_platform_pool(demo_tenants) ->
     catalog = platform.get("/api/saas/catalog").json()
     assert ph["packhouse_id"] in {p["id"] for p in catalog["packhouses"]}
 
-    plan = platform.post("/api/saas/platform/plans", json={"lot_ids": [registered["id"]]})
+    retired = platform.post("/api/saas/platform/plans", json={"lot_ids": [registered["id"]]})
+    assert retired.status_code == 403
+    forwarder = _real_forwarder("ops@real-forwarder.example.com", "실제 포워더")
+    plan = forwarder.post("/api/saas/forwarder/plans", json={"lot_ids": [registered["id"]]})
     assert plan.status_code == 201, plan.text
     scenario = plan.json()["scenario"]
     injected = next(p for p in scenario["packhouses"] if p["id"] == ph["packhouse_id"])
@@ -254,7 +281,7 @@ def test_other_org_profile_and_packhouses_are_unreachable(demo_tenants) -> None:
     assert forwarder.get("/api/saas/shipper/profile").status_code == 403
     assert forwarder.post("/api/saas/shipper/packhouses", json=PACKHOUSE).status_code == 403
 
-    anonymous = TestClient(app)
+    anonymous = TestClient(saas_app)
     assert anonymous.get("/api/saas/shipper/profile").status_code == 401
     assert owner.get("/api/saas/shipper/profile").json()["profile"]["packhouse_id"] == ph
 

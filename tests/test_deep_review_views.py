@@ -3,21 +3,28 @@ from datetime import UTC, date, datetime
 
 import pytest
 from fastapi.testclient import TestClient
-from saas_fixtures import FORWARDER_ORG_ID, PLATFORM_ORG_ID
+from saas_fixtures import (
+    QUANTITY_WINDOW_NOW,
+    login_client,
+    open_quantity_window,
+    queue_quantity,
+)
 from sqlalchemy import update
-from test_saas_api import _assign, _lot_body, _platform_plan, _scenario
+from test_saas_api import _forwarder_plan, _lot_body, _scenario
 
 from freshswitch_backend.api import saas_views
 from freshswitch_backend.coldchain.models import Alert
 from freshswitch_backend.execution.card import iso6346_check_digit
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.seed import shipper_org_id
-from freshswitch_backend.persistence.tables import ShipperProfileRow
+from freshswitch_backend.persistence.tables import PlanRow, ShipperProfileRow
+from freshswitch_backend.planning.quantity_policy import load_ledger, policy_rows
 from freshswitch_backend.planning.store import PlanSession, store
 from freshswitch_backend.replan.models import RouteChange
 
 CANCELLED = "lot-sancheong-sb-1"
 CANCEL = {"type": "cancel", "lot_id": CANCELLED}
+REQUESTER_CANCEL = {"type": "cancel", "lot_id": "lot-jinju-sb-1"}
 REJECT_NOTE = "부담이 너무 큼, 단가 재협상 요구"
 ACCEPT_NOTE = "산청 측 수락 메모"
 
@@ -33,17 +40,52 @@ def _register(saas_login, **overrides) -> list[str]:
     return ids
 
 
-def _plan(platform_client: TestClient, ids: list[str]) -> str:
-    response = platform_client.post("/api/saas/platform/plans", json={"lot_ids": ids})
+def _plan(forwarder_client: TestClient, ids: list[str]) -> str:
+    response = forwarder_client.post("/api/saas/forwarder/plans", json={"lot_ids": ids})
     assert response.status_code == 201, response.text
     return response.json()["plan_id"]
 
 
-def _apply(platform_client: TestClient, plan_id: str, event: dict) -> str:
-    replanned = platform_client.post(f"/api/plans/{plan_id}/events", json={"event": event})
+def _owner(plan_id: str) -> str:
+    with database.begin() as db:
+        row = db.get(PlanRow, plan_id)
+        assert row is not None
+        return row.org_id
+
+
+def _bound_quote(plan_id: str, lot_id: str, quantity: int) -> tuple[bool, bool]:
+    with database.begin() as db:
+        ledgers = [load_ledger(row) for row in policy_rows(db, plan_id)]
+    bound = [ledger for ledger in ledgers if lot_id in ledger.reservations]
+    queued = any(
+        r.get("lot_id") == lot_id and r.get("status") == "queued" and r.get("quantity") == quantity
+        for ledger in bound
+        for r in ledger.requests.values()
+    )
+    return bool(bound), queued
+
+
+def _queue_event(plan_id: str, event: dict) -> None:
+    if event["type"] not in {"cancel", "reduce", "increase"}:
+        return
+    lot_id = event["lot_id"]
+    quantity = event.get("new_pallets", 0) if event["type"] != "cancel" else 0
+    bound, queued = _bound_quote(plan_id, lot_id, quantity)
+    if not bound or queued:
+        return
+    if store.clock() < QUANTITY_WINDOW_NOW:
+        open_quantity_window()
+    session = _session(plan_id)
+    shipper_id = next(lot.shipper_id for lot in session.scenario.lots if lot.id == lot_id)
+    queue_quantity(login_client(shipper_org_id(shipper_id)), plan_id, lot_id, quantity)
+
+
+def _apply(forwarder_client: TestClient, plan_id: str, event: dict) -> str:
+    _queue_event(plan_id, event)
+    replanned = forwarder_client.post(f"/api/plans/{plan_id}/events", json={"event": event})
     assert replanned.status_code == 200, replanned.text
     alternative = next(a["id"] for a in replanned.json()["alternatives"] if a["feasible"])
-    applied = platform_client.post(
+    applied = forwarder_client.post(
         f"/api/plans/{plan_id}/apply", json={"alternative_id": alternative}
     )
     assert applied.status_code == 200, applied.text
@@ -61,7 +103,7 @@ def _confirm(saas_login, plan_id: str, order_id: str, sid: str, accept: bool, no
 
 
 def _session(plan_id: str) -> PlanSession:
-    session = store.get(plan_id, org_id=PLATFORM_ORG_ID)
+    session = store.get(plan_id, org_id=_owner(plan_id))
     assert session is not None
     return session
 
@@ -78,14 +120,26 @@ def _shape(payload: dict) -> list[tuple]:
     ]
 
 
+def _container(session: PlanSession) -> str:
+    return next(c.container_id for c in session.plan.containers if c.used)
+
+
+def _structural(session: PlanSession, hostile: str) -> str:
+    if hostile == "{container}":
+        return _container(session)
+    if hostile == "{voyage}":
+        return next(a.voyage_id for a in session.plan.assignments if a.voyage_id)
+    return hostile
+
+
 @pytest.mark.parametrize(
-    "hostile", ["sea", "air", "sh-jinju", "CA-01", "strawberry", "V-2611A", "부산신항", "KRPUS"]
+    "hostile",
+    ["sea", "air", "sh-jinju", "{container}", "strawberry", "{voyage}", "부산신항", "KRPUS"],
 )
-def test_hostile_lot_id_is_mapped_only_in_lot_fields(
-    platform_client: TestClient, saas_login, hostile: str
-) -> None:
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
+def test_hostile_lot_id_is_mapped_only_in_lot_fields(saas_login, hostile: str) -> None:
+    plan_id = _forwarder_plan(saas_login)["plan_id"]
     original = _session(plan_id)
+    hostile = _structural(original, hostile)
     session = _renamed(original, CANCELLED, hostile)
     baseline = saas_views.anonymized_session(original, {"sh-jinju"})
     payload = saas_views.anonymized_session(session, {"sh-jinju"})
@@ -108,8 +162,8 @@ def test_hostile_lot_id_is_mapped_only_in_lot_fields(
     assert payload["scenario"]["shippers"] == baseline["scenario"]["shippers"]
 
 
-def test_free_text_replaces_only_whole_lot_tokens(platform_client: TestClient, saas_login) -> None:
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
+def test_free_text_replaces_only_whole_lot_tokens(saas_login) -> None:
+    plan_id = _forwarder_plan(saas_login)["plan_id"]
     session = _renamed(_session(plan_id), CANCELLED, "lot-evil")
     anonymizer = saas_views.shipper_anonymizer(session, {"sh-jinju"})
     anon = anonymizer.lot("lot-evil")
@@ -117,10 +171,11 @@ def test_free_text_replaces_only_whole_lot_tokens(platform_client: TestClient, s
     assert anonymizer.text("lot-evil 5파렛트, lot-evil-2, xlot-evil") == (
         f"{anon} 5파렛트, lot-evil-2, xlot-evil"
     )
-    reserved = _renamed(_session(plan_id), CANCELLED, "CA-01")
+    container = _container(_session(plan_id))
+    reserved = _renamed(_session(plan_id), CANCELLED, container)
     kept = saas_views.shipper_anonymizer(reserved, {"sh-jinju"})
-    assert kept.text("CA-01 적재 17→14파렛트") == "CA-01 적재 17→14파렛트"
-    assert kept.lot("CA-01").startswith("anon-")
+    assert kept.text(f"{container} 적재 17→14파렛트") == f"{container} 적재 17→14파렛트"
+    assert kept.lot(container).startswith("anon-")
 
 
 STRUCTURAL = {"level": "critical", "basis": "operational", "change": "changed", "stage": "vessel"}
@@ -151,10 +206,8 @@ def _route_change(session: PlanSession, hostile: str) -> RouteChange:
 
 
 @pytest.mark.parametrize("hostile", ["critical", "operational", "changed", "warning", "added"])
-def test_enum_literal_lot_id_keeps_structural_values(
-    platform_client: TestClient, saas_login, hostile: str
-) -> None:
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
+def test_enum_literal_lot_id_keeps_structural_values(saas_login, hostile: str) -> None:
+    plan_id = _forwarder_plan(saas_login)["plan_id"]
     original = _session(plan_id)
     session = _renamed(original, CANCELLED, hostile)
     anonymizer = saas_views.shipper_anonymizer(session, {"sh-jinju"})
@@ -199,10 +252,8 @@ def _other_names(session: PlanSession) -> tuple[str, str]:
 @pytest.mark.parametrize(
     "ending", ["에서", "까지", "만 영향", "이며", "님께서", "로부터", "의", "가"]
 )
-def test_full_name_followed_by_any_ending_is_anonymized(
-    platform_client: TestClient, saas_login, ending: str
-) -> None:
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
+def test_full_name_followed_by_any_ending_is_anonymized(saas_login, ending: str) -> None:
+    plan_id = _forwarder_plan(saas_login)["plan_id"]
     session = _session(plan_id)
     name, packhouse = _other_names(session)
     anonymizer = saas_views.shipper_anonymizer(session, {"sh-jinju"})
@@ -214,8 +265,8 @@ def test_full_name_followed_by_any_ending_is_anonymized(
     assert packhouse_text.endswith(f"선과장{ending} 집하")
 
 
-def test_single_word_name_keeps_ordinary_words(platform_client: TestClient, saas_login) -> None:
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
+def test_single_word_name_keeps_ordinary_words(saas_login) -> None:
+    plan_id = _forwarder_plan(saas_login)["plan_id"]
     session = _session(plan_id)
     scenario = session.scenario.model_copy(
         update={
@@ -233,10 +284,8 @@ def test_single_word_name_keeps_ordinary_words(platform_client: TestClient, saas
 
 
 @pytest.mark.parametrize("lot_id", ["20261118-01", "B1"])
-def test_numeric_or_short_lot_id_is_replaced_in_moved_text(
-    platform_client: TestClient, saas_login, lot_id: str
-) -> None:
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
+def test_numeric_or_short_lot_id_is_replaced_in_moved_text(saas_login, lot_id: str) -> None:
+    plan_id = _forwarder_plan(saas_login)["plan_id"]
     session = _renamed(_session(plan_id), CANCELLED, lot_id)
     anonymizer = saas_views.shipper_anonymizer(session, {"sh-jinju"})
     anon = anonymizer.lot(lot_id)
@@ -248,24 +297,23 @@ def test_numeric_or_short_lot_id_is_replaced_in_moved_text(
         assert anonymizer.text(f"{lot_id} 출하 취소") == f"{anon} 출하 취소"
 
 
-def test_container_text_is_not_relabelled_when_lot_collides(
-    platform_client: TestClient, saas_login
-) -> None:
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
-    session = _renamed(_session(plan_id), CANCELLED, "CA-01")
+def test_container_text_is_not_relabelled_when_lot_collides(saas_login) -> None:
+    plan_id = _forwarder_plan(saas_login)["plan_id"]
+    container = _container(_session(plan_id))
+    session = _renamed(_session(plan_id), CANCELLED, container)
     anonymizer = saas_views.shipper_anonymizer(session, {"sh-jinju"})
-    request = "선적 예정 CA-01(40RH-CA, 12파렛트) 반입 즉시 전원 연결"
+    request = f"선적 예정 {container}(40RH-CA, 12파렛트) 반입 즉시 전원 연결"
     assert anonymizer.text(request) == request
-    moved = anonymizer.text("CA-01(산청 5파렛트): CA-02 → 항공")
-    assert (
-        moved
-        == f"{anonymizer.lot('CA-01')}({anonymizer.label('sh-sancheong')} 5파렛트): CA-02 → 항공"
-    )
+    moved = anonymizer.text(f"{container}(산청 5파렛트): CA-02 → 항공")
+    label = anonymizer.label("sh-sancheong")
+    assert moved == f"{anonymizer.lot(container)}({label} 5파렛트): CA-02 → 항공"
 
 
-def _cancel_order(platform_client: TestClient, saas_login) -> tuple[str, str]:
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
-    order_id = _apply(platform_client, plan_id, CANCEL)
+def _cancel_order(
+    platform_client: TestClient, forwarder_client: TestClient, saas_login
+) -> tuple[str, str]:
+    plan_id = _forwarder_plan(saas_login)["plan_id"]
+    order_id = _apply(forwarder_client, plan_id, REQUESTER_CANCEL)
     order = platform_client.get(f"/api/plans/{plan_id}/orders/{order_id}").json()
     assert {c["shipper_id"] for c in order["shipper_confirmations"]} == {
         "sh-miryang",
@@ -281,9 +329,9 @@ def _miryang_order(saas_login, plan_id: str, order_id: str) -> dict:
 
 
 def test_shipper_order_log_hides_other_shipper_rejection(
-    platform_client: TestClient, saas_login
+    platform_client: TestClient, forwarder_client: TestClient, saas_login
 ) -> None:
-    plan_id, order_id = _cancel_order(platform_client, saas_login)
+    plan_id, order_id = _cancel_order(platform_client, forwarder_client, saas_login)
     _confirm(saas_login, plan_id, order_id, "sh-sancheong", False, REJECT_NOTE)
     raw = platform_client.get(f"/api/plans/{plan_id}/orders/{order_id}").json()
     assert any(entry["note"] == REJECT_NOTE for entry in raw["log"])
@@ -305,9 +353,9 @@ def test_shipper_order_log_hides_other_shipper_rejection(
 
 
 def test_shipper_order_log_drops_other_acceptance_and_keeps_own(
-    platform_client: TestClient, saas_login
+    platform_client: TestClient, forwarder_client: TestClient, saas_login
 ) -> None:
-    plan_id, order_id = _cancel_order(platform_client, saas_login)
+    plan_id, order_id = _cancel_order(platform_client, forwarder_client, saas_login)
     _confirm(saas_login, plan_id, order_id, "sh-sancheong", True, ACCEPT_NOTE)
     order = _miryang_order(saas_login, plan_id, order_id)
     assert [e for e in order["log"] if e["actor"] == "shipper"] == []
@@ -336,11 +384,11 @@ def _shipper_view(saas_login, sid: str, plan_id: str) -> tuple[dict, list[dict]]
 
 @pytest.mark.parametrize("name", ["부산 수출농가 F", "CA 수출", "sea farm", "홍콩항 농가"])
 def test_short_name_does_not_rewrite_ordinary_words(
-    platform_client: TestClient, saas_login, name: str
+    platform_client: TestClient, forwarder_client: TestClient, saas_login, name: str
 ) -> None:
     _rename(saas_login, "sh-sancheong", name)
-    plan_id = _plan(platform_client, _register(saas_login))
-    _apply(platform_client, plan_id, CANCEL)
+    plan_id = _plan(forwarder_client, _register(saas_login))
+    _apply(forwarder_client, plan_id, CANCEL)
     full = platform_client.get(f"/api/plans/{plan_id}").json()
     assert name in [s["name"] for s in full["scenario"]["shippers"]]
     plan, orders = _shipper_view(saas_login, "sh-miryang", plan_id)
@@ -368,11 +416,11 @@ def test_short_name_does_not_rewrite_ordinary_words(
 
 
 def test_same_region_other_shipper_is_still_anonymized(
-    platform_client: TestClient, saas_login
+    platform_client: TestClient, forwarder_client: TestClient, saas_login
 ) -> None:
     _rename(saas_login, "sh-sancheong", "밀양 산청 수출농가 B")
-    plan_id = _plan(platform_client, _register(saas_login))
-    _apply(platform_client, plan_id, CANCEL)
+    plan_id = _plan(forwarder_client, _register(saas_login))
+    _apply(forwarder_client, plan_id, CANCEL)
     raw_orders = platform_client.get(f"/api/plans/{plan_id}/orders").json()
     raw_text = json.dumps(raw_orders, ensure_ascii=False)
     assert "밀양 5→0" in raw_text
@@ -424,9 +472,9 @@ LATE_STRAWBERRY = {
 
 
 def test_shipper_list_and_settlements_use_own_voyage(
-    platform_client: TestClient, saas_login
+    platform_client: TestClient, forwarder_client: TestClient, saas_login
 ) -> None:
-    plan_id = _plan(platform_client, _register(saas_login, **LATE_STRAWBERRY))
+    plan_id = _plan(forwarder_client, _register(saas_login, **LATE_STRAWBERRY))
     full = platform_client.get(f"/api/plans/{plan_id}").json()
     voyages = {v["id"]: v for v in full["scenario"]["voyages"]}
     sea = {
@@ -454,8 +502,8 @@ def test_shipper_list_and_settlements_use_own_voyage(
     assert platform_item["vessel"] == earliest["vessel_name"]
 
 
-def test_air_only_shipper_has_no_vessel(platform_client: TestClient, saas_login) -> None:
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
+def test_air_only_shipper_has_no_vessel(saas_login) -> None:
+    plan_id = _forwarder_plan(saas_login)["plan_id"]
     session = _session(plan_id)
     air = session.plan.model_copy(
         update={
@@ -483,8 +531,7 @@ def _number(serial: str, owner: str) -> str:
 def test_shipper_plan_detail_shows_only_own_container_numbers(
     platform_client: TestClient, saas_login, forwarder_client: TestClient
 ) -> None:
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
-    _assign(plan_id, FORWARDER_ORG_ID)
+    plan_id = _forwarder_plan(saas_login)["plan_id"]
     card = forwarder_client.get(f"/api/saas/forwarder/plans/{plan_id}/execution-card").json()
     by_container = {c["container_id"]: c for c in card["containers"]}
     full = platform_client.get(f"/api/plans/{plan_id}").json()

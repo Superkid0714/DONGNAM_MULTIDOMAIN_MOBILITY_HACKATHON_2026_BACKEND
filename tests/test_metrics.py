@@ -4,24 +4,26 @@ from saas_fixtures import (
     PLATFORM_ORG_ID,
     REAL_PLATFORM_EMAIL,
     REAL_PLATFORM_PASSWORD,
+    accept_plan,
     create_real_platform,
     password_client,
+    saas_app,
 )
 from sqlalchemy import select
+from test_deep_review_views import _queue_event
 
 from freshswitch_backend.analysis.emissions import AIR_G_PER_TKM, SEA_G_PER_TKM
 from freshswitch_backend.api.saas_metrics import region_of
 from freshswitch_backend.data.loader import get_scenario
-from freshswitch_backend.main import app
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.seed import shipper_org_id
-from freshswitch_backend.persistence.tables import PlanForwarderRow, PlanRow
+from freshswitch_backend.persistence.tables import PlanRow
 from freshswitch_backend.planning.store import store
 
 MONTH = "2026-11"
 GRAPE = "grape_so2"
 REDUCE = {"type": "reduce", "lot_id": "lot-jinju-sb-1", "new_pallets": 2}
-REDUCE_AGAIN = {"type": "reduce", "lot_id": "lot-jinju-sb-1", "new_pallets": 1}
+REDUCE_AGAIN = {"type": "reduce", "lot_id": "lot-sancheong-sb-1", "new_pallets": 3}
 
 
 def _scenario():
@@ -51,12 +53,12 @@ def _register_all(saas_login) -> list[str]:
     return ids
 
 
-def _platform_plan(platform_client: TestClient, saas_login) -> dict:
-    response = platform_client.post(
-        "/api/saas/platform/plans",
-        json={"lot_ids": _register_all(saas_login), "auto_accept": True},
+def _accepted_plan(saas_login) -> dict:
+    response = saas_login(FORWARDER_ORG_ID).post(
+        "/api/saas/forwarder/plans", json={"lot_ids": _register_all(saas_login)}
     )
     assert response.status_code == 201, response.text
+    accept_plan(saas_login, response.json()["plan_id"])
     return response.json()
 
 
@@ -67,7 +69,7 @@ def _metrics(client: TestClient, month: str = MONTH) -> dict:
 
 
 def test_metrics_match_plan(platform_client: TestClient, saas_login) -> None:
-    session = _platform_plan(platform_client, saas_login)
+    session = _accepted_plan(saas_login)
     plan = session["plan"]
     body = _metrics(platform_client)
     assert body["month"] == MONTH
@@ -111,10 +113,10 @@ def test_metrics_match_plan(platform_client: TestClient, saas_login) -> None:
 
 
 def test_metrics_reuse_and_month(platform_client: TestClient, saas_login) -> None:
-    _platform_plan(platform_client, saas_login)
+    _accepted_plan(saas_login)
     scenario = _scenario()
     subset = scenario.model_copy(update={"lots": scenario.lots[:2]})
-    store.create(subset, org_id=PLATFORM_ORG_ID)
+    store.create(subset, org_id=FORWARDER_ORG_ID)
     body = _metrics(platform_client)
     assert body["plan_count"] == 2
     repeat = {lot.shipper_id for lot in scenario.lots[:2]}
@@ -130,21 +132,21 @@ def test_metrics_reuse_and_month(platform_client: TestClient, saas_login) -> Non
 
 
 def test_metrics_exclude_other_orgs(client: TestClient, platform_client: TestClient, saas_login):
-    _platform_plan(platform_client, saas_login)
+    _accepted_plan(saas_login)
     assert client.post("/api/plans", json={}).status_code == 201
     real = create_real_platform()
     store.create(_scenario(), org_id=real)
     store.create(_scenario(), org_id=real)
     assert _metrics(platform_client)["plan_count"] == 1
-    other = password_client(app, REAL_PLATFORM_EMAIL, REAL_PLATFORM_PASSWORD)
+    other = password_client(saas_app, REAL_PLATFORM_EMAIL, REAL_PLATFORM_PASSWORD)
     assert _metrics(other)["plan_count"] == 2
 
 
 def test_metrics_roles(
-    client: TestClient, shipper_client: TestClient, forwarder_client: TestClient
+    anonymous_saas: TestClient, shipper_client: TestClient, forwarder_client: TestClient
 ) -> None:
     for path in ("metrics", "business", "business/years"):
-        assert client.get(f"/api/saas/platform/{path}").status_code == 401
+        assert anonymous_saas.get(f"/api/saas/platform/{path}").status_code == 401
         assert shipper_client.get(f"/api/saas/platform/{path}").status_code == 403
         assert forwarder_client.get(f"/api/saas/platform/{path}").status_code == 403
 
@@ -157,11 +159,12 @@ def test_metrics_month_validation(platform_client: TestClient) -> None:
     assert default.json()["month"] == MONTH
 
 
-def _apply(platform_client: TestClient, plan_id: str, event: dict) -> dict:
-    computed = platform_client.post(f"/api/plans/{plan_id}/events", json={"event": event})
+def _apply(forwarder_client: TestClient, plan_id: str, event: dict) -> dict:
+    _queue_event(plan_id, event)
+    computed = forwarder_client.post(f"/api/plans/{plan_id}/events", json={"event": event})
     assert computed.status_code == 200, computed.text
     alternative = next(a["id"] for a in computed.json()["alternatives"] if a["feasible"])
-    applied = platform_client.post(
+    applied = forwarder_client.post(
         f"/api/plans/{plan_id}/apply",
         json={"alternative_id": alternative, "replan_id": computed.json()["replan_id"]},
     )
@@ -196,12 +199,10 @@ def _commit(
 def test_metrics_orders_and_replan_time(
     platform_client: TestClient, saas_login, forwarder_client: TestClient
 ) -> None:
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
-    with database.begin() as db:
-        db.add(PlanForwarderRow(plan_id=plan_id, forwarder_org_id=FORWARDER_ORG_ID))
-    first = _apply(platform_client, plan_id, REDUCE)["active_order_id"]
+    plan_id = _accepted_plan(saas_login)["plan_id"]
+    first = _apply(forwarder_client, plan_id, REDUCE)["active_order_id"]
     _commit(platform_client, saas_login, forwarder_client, plan_id, first)
-    _apply(platform_client, plan_id, REDUCE_AGAIN)
+    _apply(forwarder_client, plan_id, REDUCE_AGAIN)
     orders = platform_client.get(f"/api/plans/{plan_id}/orders").json()
     statuses = [o["status"] for o in orders]
     confirmed = sum(1 for s in statuses if s in ("forwarder_confirmed", "executed"))
@@ -222,11 +223,13 @@ def test_metrics_orders_and_replan_time(
     assert replan["reason"] is None
 
 
-def test_metrics_arrival_loss_gap(platform_client: TestClient, saas_login) -> None:
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
+def test_metrics_arrival_loss_gap(
+    platform_client: TestClient, saas_login, forwarder_client: TestClient
+) -> None:
+    plan_id = _accepted_plan(saas_login)["plan_id"]
     gaps = []
     for lot_id, pct in (("lot-sancheong-sb-1", 9), ("lot-jinju-sb-1", 12)):
-        response = platform_client.post(
+        response = forwarder_client.post(
             f"/api/plans/{plan_id}/settlement/arrival",
             json={"lot_id": lot_id, "inspected_loss_pct": pct},
         )
@@ -242,7 +245,7 @@ def test_metrics_arrival_loss_gap(platform_client: TestClient, saas_login) -> No
 
 
 def test_metrics_skip_unknown_destination(platform_client: TestClient, saas_login) -> None:
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
+    plan_id = _accepted_plan(saas_login)["plan_id"]
     before = _metrics(platform_client)["co2"]
     assert before["skipped_pallets"] == 0
     with database.begin() as db:

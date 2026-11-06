@@ -2,7 +2,7 @@ import re
 
 import pytest
 from fastapi.testclient import TestClient
-from saas_fixtures import PLATFORM_ORG_ID, create_real_platform, seed_client
+from saas_fixtures import FORWARDER_ORG_ID, create_real_platform, seed_client
 from sqlalchemy import update
 
 from freshswitch_backend.config import get_settings
@@ -97,8 +97,10 @@ def _sandbox_activity(app) -> None:
         client = seed_client(shipper_org_id(lot.shipper_id), app)
         body = {**_lot_body(lot), "pallets": 1}
         assert client.post("/api/saas/shipper/lots", json=body).status_code == 201
-    platform = seed_client(PLATFORM_ORG_ID, app)
-    created = platform.post("/api/saas/platform/plans", json={"lot_ids": [lot.id for lot in lots]})
+    forwarder = seed_client(FORWARDER_ORG_ID, app)
+    created = forwarder.post(
+        "/api/saas/forwarder/plans", json={"lot_ids": [lot.id for lot in lots]}
+    )
     assert created.status_code == 201, created.text
     with database.begin() as db:
         db.execute(update(PackhouseRow).values(name=SECRET_PACKHOUSE, lat=37.5, lon=127.0))
@@ -146,23 +148,6 @@ def test_showcase_ignores_sandbox_and_real_org_data(saas_app) -> None:
     assert response.status_code == 200
     assert response.json() == before
     _assert_no_identifiers(response.text)
-
-
-def test_demo_mode_showcase_ignores_anonymous_demo_plans(client: TestClient) -> None:
-    base = _default()
-    store.create(
-        base.model_copy(
-            update={
-                "voyages": [
-                    v.model_copy(update={"vessel_name": SECRET_VESSEL}) for v in base.voyages
-                ]
-            }
-        )
-    )
-    response = client.get(SHOWCASE)
-    assert response.status_code == 200
-    _assert_shape(response.json())
-    assert SECRET_VESSEL not in response.text
 
 
 def test_showcase_routes_carry_pallets_per_stop(saas_app) -> None:

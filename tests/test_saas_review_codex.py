@@ -6,6 +6,7 @@ from saas_fixtures import (
     FORWARDER_ORG_ID,
     PLATFORM_ORG_ID,
     SHIPPER_ORG_ID,
+    accept_plan,
     seed_client,
 )
 from sqlalchemy import delete
@@ -17,7 +18,8 @@ from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.main import create_app
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.seed import shipper_org_id
-from freshswitch_backend.persistence.tables import AuthSessionRow, PlanForwarderRow
+from freshswitch_backend.persistence.tables import AuthSessionRow
+from freshswitch_backend.planning.store import store
 from freshswitch_backend.quality import quality_history
 from freshswitch_backend.quality.store import ScopeRef
 
@@ -44,7 +46,7 @@ def _lot_body(lot) -> dict:
     }
 
 
-def _world_plan(client_app) -> tuple[TestClient, str]:
+def _world_plan(client_app) -> tuple[TestClient, TestClient, str]:
     scenario = get_scenario("default")
     assert scenario is not None
     ids = []
@@ -53,21 +55,18 @@ def _world_plan(client_app) -> tuple[TestClient, str]:
         response = shipper.post("/api/saas/shipper/lots", json=_lot_body(lot))
         assert response.status_code == 201, response.text
         ids.append(response.json()["registered"]["id"])
-    platform = seed_client(PLATFORM_ORG_ID, client_app)
-    created = platform.post("/api/saas/platform/plans", json={"lot_ids": ids})
+    forwarder = seed_client(FORWARDER_ORG_ID, client_app)
+    created = forwarder.post("/api/saas/forwarder/plans", json={"lot_ids": ids})
     assert created.status_code == 201, created.text
     plan_id = created.json()["plan_id"]
-    assigned = platform.put(
-        f"/api/saas/platform/plans/{plan_id}/forwarder",
-        json={"forwarder_org_id": FORWARDER_ORG_ID},
-    )
-    assert assigned.status_code == 200, assigned.text
-    return platform, plan_id
+    platform = seed_client(PLATFORM_ORG_ID, client_app)
+    return platform, forwarder, plan_id
 
 
-def _inspect(platform: TestClient, plan_id: str) -> None:
+def _inspect(client_app, forwarder: TestClient, plan_id: str) -> None:
+    accept_plan(lambda org_id: seed_client(org_id, client_app), plan_id)
     for lot_id, note in (("lot-sancheong-sb-1", OTHER_EXCESS_NOTE), ("lot-jinju-sb-1", OWN_NOTE)):
-        response = platform.post(
+        response = forwarder.post(
             f"/api/plans/{plan_id}/settlement/arrival",
             json={"lot_id": lot_id, "inspected_loss_pct": 40, "note": note},
         )
@@ -110,8 +109,8 @@ def test_demo_mode_keeps_anonymous_observation_access(client: TestClient) -> Non
 
 
 def test_codex4_shipper_plan_hides_other_inspections(saas_app) -> None:
-    platform, plan_id = _world_plan(saas_app)
-    _inspect(platform, plan_id)
+    platform, forwarder, plan_id = _world_plan(saas_app)
+    _inspect(saas_app, forwarder, plan_id)
     full = platform.get(f"/api/plans/{plan_id}").json()
     shipper = seed_client(SHIPPER_ORG_ID, saas_app)
     response = shipper.get(f"/api/saas/shipper/plans/{plan_id}")
@@ -132,7 +131,7 @@ def test_codex4_shipper_plan_hides_other_inspections(saas_app) -> None:
 
 
 def test_codex4_shipper_plan_keeps_only_own_product_tariffs(saas_app) -> None:
-    platform, plan_id = _world_plan(saas_app)
+    platform, _, plan_id = _world_plan(saas_app)
     full = platform.get(f"/api/plans/{plan_id}").json()
     assert {t["product_id"] for t in full["plan"]["settlement_tariffs"]} == {"strawberry"}
     strawberry = seed_client(SHIPPER_ORG_ID, saas_app)
@@ -144,9 +143,8 @@ def test_codex4_shipper_plan_keeps_only_own_product_tariffs(saas_app) -> None:
 
 
 def test_codex5_forwarder_plan_hides_inspection_money_and_notes(saas_app) -> None:
-    platform, plan_id = _world_plan(saas_app)
-    _inspect(platform, plan_id)
-    forwarder = seed_client(FORWARDER_ORG_ID, saas_app)
+    _, forwarder, plan_id = _world_plan(saas_app)
+    _inspect(saas_app, forwarder, plan_id)
     response = forwarder.get(f"/api/saas/forwarder/plans/{plan_id}")
     assert response.status_code == 200
     inspections = response.json()["arrival_inspections"]
@@ -159,10 +157,10 @@ def test_codex5_forwarder_plan_hides_inspection_money_and_notes(saas_app) -> Non
     assert OWN_NOTE not in response.text
 
 
-def _registered_device(platform: TestClient, plan_id: str, container_id: str) -> str:
-    created = platform.post("/api/saas/devices", json={"device_id": "demo-codex"})
+def _registered_device(forwarder: TestClient, plan_id: str, container_id: str) -> str:
+    created = forwarder.post("/api/saas/devices", json={"device_id": "demo-codex"})
     assert created.status_code == 201, created.text
-    bound = platform.post(
+    bound = forwarder.post(
         "/api/coldchain/bindings",
         json={"device_id": "demo-codex", "container_id": container_id, "plan_id": plan_id},
     )
@@ -176,9 +174,9 @@ def _used_containers(platform: TestClient, plan_id: str) -> list[str]:
 
 
 def test_codex6_device_token_cannot_target_other_container(saas_app) -> None:
-    platform, plan_id = _world_plan(saas_app)
+    platform, forwarder, plan_id = _world_plan(saas_app)
     bound, other = _used_containers(platform, plan_id)[:2]
-    token = _registered_device(platform, plan_id, bound)
+    token = _registered_device(forwarder, plan_id, bound)
     device = TestClient(saas_app, base_url="https://testserver")
     headers = {"X-Device-Token": token}
     reading = {"device_id": "demo-codex", "temp_c": 40, "power_on": False}
@@ -212,9 +210,9 @@ def test_codex6_device_token_cannot_target_other_container(saas_app) -> None:
 
 
 def test_codex6_unbound_registered_device_is_rejected(saas_app) -> None:
-    platform, plan_id = _world_plan(saas_app)
+    platform, forwarder, plan_id = _world_plan(saas_app)
     container = _used_containers(platform, plan_id)[0]
-    created = platform.post("/api/saas/devices", json={"device_id": "demo-loose"})
+    created = forwarder.post("/api/saas/devices", json={"device_id": "demo-loose"})
     token = created.json()["device_token"]
     device = TestClient(saas_app, base_url="https://testserver")
     sent = device.post(
@@ -253,20 +251,17 @@ def _stream_until_revoked(
     return time.monotonic() - started
 
 
-def test_codex7_stream_closes_after_unassignment(saas_app, monkeypatch) -> None:
-    _, plan_id = _world_plan(saas_app)
-    forwarder = seed_client(FORWARDER_ORG_ID, saas_app)
+def test_codex7_stream_closes_after_plan_deleted(saas_app, monkeypatch) -> None:
+    _, forwarder, plan_id = _world_plan(saas_app)
 
-    def unassign() -> None:
-        with database.begin() as db:
-            db.execute(delete(PlanForwarderRow).where(PlanForwarderRow.plan_id == plan_id))
+    def drop() -> None:
+        assert store.delete(plan_id, org_id=FORWARDER_ORG_ID)
 
-    assert _stream_until_revoked(monkeypatch, forwarder, plan_id, unassign) < 10
+    assert _stream_until_revoked(monkeypatch, forwarder, plan_id, drop) < 10
 
 
 def test_codex7_stream_closes_after_logout(saas_app, monkeypatch) -> None:
-    _, plan_id = _world_plan(saas_app)
-    forwarder = seed_client(FORWARDER_ORG_ID, saas_app)
+    _, forwarder, plan_id = _world_plan(saas_app)
 
     def logout() -> None:
         with database.begin() as db:
@@ -276,7 +271,6 @@ def test_codex7_stream_closes_after_logout(saas_app, monkeypatch) -> None:
 
 
 def test_stream_keeps_running_while_allowed(saas_app, monkeypatch) -> None:
-    _, plan_id = _world_plan(saas_app)
-    forwarder = seed_client(FORWARDER_ORG_ID, saas_app)
+    _, forwarder, plan_id = _world_plan(saas_app)
     elapsed = _stream_until_revoked(monkeypatch, forwarder, plan_id, lambda: None, timeout=2)
     assert elapsed >= 2

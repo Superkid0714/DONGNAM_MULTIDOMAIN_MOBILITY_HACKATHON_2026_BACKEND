@@ -2,9 +2,10 @@ import json
 from datetime import datetime
 
 from fastapi.testclient import TestClient
-from saas_fixtures import FORWARDER_ORG_ID
+from saas_fixtures import accept_plan
 from test_coldchain_power_plan import _with_peak
-from test_saas_api import REDUCE, _assign, _platform_plan
+from test_deep_review_views import _queue_event
+from test_saas_api import REDUCE, _forwarder_plan
 
 from freshswitch_backend.analysis.benchmark import benchmark
 from freshswitch_backend.api.saas_forwarder import _card
@@ -49,6 +50,7 @@ def _delayed(scenario: Scenario) -> Scenario:
 
 
 def _apply(client: TestClient, plan_id: str, event: dict, alternative: str | None = None) -> None:
+    _queue_event(plan_id, event)
     sent = client.post(f"/api/plans/{plan_id}/events", json={"event": event})
     assert sent.status_code == 200, sent.text
     body = sent.json()
@@ -77,13 +79,18 @@ def test_engine4_old_order_text_keeps_creation_schedule(client: TestClient) -> N
 def test_engine4_saas_views_keep_text_after_later_event(
     platform_client: TestClient, saas_login, forwarder_client: TestClient
 ) -> None:
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
-    _assign(plan_id, FORWARDER_ORG_ID)
-    _apply(platform_client, plan_id, REDUCE, "pull_forward")
+    plan_id = _forwarder_plan(saas_login)["plan_id"]
+    accept_plan(saas_login, plan_id)
+    _apply(forwarder_client, plan_id, REDUCE, "pull_forward")
     first = platform_client.get(f"/api/plans/{plan_id}/orders").json()[-1]
     before = next(r for r in first["requests"] if r["kind"] == "booking_amendment")
     assert "ETD 11/18 18:00" in before["text"]
-    _apply(platform_client, plan_id, DELAY)
+    voyage_id = next(
+        a["voyage_id"]
+        for a in platform_client.get(f"/api/plans/{plan_id}").json()["plan"]["assignments"]
+        if a["lot_id"] == REDUCE["lot_id"]
+    )
+    _apply(forwarder_client, plan_id, {**DELAY, "voyage_id": voyage_id})
     orders = platform_client.get(f"/api/plans/{plan_id}/orders").json()
     same = next(o for o in orders if o["order_id"] == first["order_id"])
     after = next(r for r in same["requests"] if r["request_id"] == before["request_id"])
@@ -177,9 +184,9 @@ def test_engine6_entered_booking_number_replaces_mock(client: TestClient) -> Non
 def test_engine6_forwarder_orders_use_saved_booking_number(
     platform_client: TestClient, saas_login, forwarder_client: TestClient
 ) -> None:
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
-    _assign(plan_id, FORWARDER_ORG_ID)
-    _apply(platform_client, plan_id, REDUCE, "pull_forward")
+    plan_id = _forwarder_plan(saas_login)["plan_id"]
+    accept_plan(saas_login, plan_id)
+    _apply(forwarder_client, plan_id, REDUCE, "pull_forward")
     sent = forwarder_client.get(f"/api/saas/forwarder/plans/{plan_id}/orders").json()
     amendment = next(r for r in sent[-1]["requests"] if r["kind"] == "booking_amendment")
     container_id = amendment["container_id"]

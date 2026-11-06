@@ -5,10 +5,19 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
-from saas_fixtures import PLATFORM_ORG_ID, login_client, seed_client
-from sqlalchemy import func, select
+from saas_fixtures import FORWARDER_ORG_ID, PLATFORM_ORG_ID, login_client, seed_client
+from sqlalchemy import delete, func, select
 from test_add_lot import _plan_with_spare
-from test_change_requests import PLATFORM, POHANG_LOT, REDUCE, _open_rows, _plan, _request
+from test_change_requests import (
+    AIR_SWITCH,
+    FORWARDER,
+    POHANG_LOT,
+    REDUCE,
+    _open_rows,
+    _plan,
+    _quantity_request,
+    _request,
+)
 
 from freshswitch_backend.api import compute_limits, saas_change_requests
 from freshswitch_backend.api.auth import Principal, RateRule
@@ -16,9 +25,10 @@ from freshswitch_backend.api.saas_change_requests import ALREADY_OPEN
 from freshswitch_backend.config import get_settings
 from freshswitch_backend.main import create_app
 from freshswitch_backend.persistence import database
-from freshswitch_backend.persistence.tables import ChangeRequestRow
+from freshswitch_backend.persistence.tables import ChangeRequestRow, QuantityPolicyRow
 
 EVENT = {"event": {"type": "reduce", "lot_id": "lot-jinju-sb-1", "new_pallets": 2}}
+PLANS = "/api/saas/forwarder/plans"
 
 
 @pytest.fixture
@@ -51,6 +61,12 @@ def _change_requests() -> int:
         return db.scalar(select(func.count()).select_from(ChangeRequestRow)) or 0
 
 
+def _legacy_plan(plan_id: str) -> str:
+    with database.begin() as db:
+        db.execute(delete(QuantityPolicyRow).where(QuantityPolicyRow.plan_id == plan_id))
+    return plan_id
+
+
 def _demo_plan(client: TestClient) -> str:
     created = client.post("/api/plans", json={"scenario_id": "default"})
     assert created.status_code == 201, created.text
@@ -64,15 +80,17 @@ def test_demo_event_needs_compute_slot(client, gate) -> None:
     assert client.post(f"/api/plans/{plan_id}/events", json=EVENT).status_code == 200
 
 
-def test_platform_event_needs_compute_slot(platform_client, saas_login, gate) -> None:
-    plan_id = _plan(platform_client, saas_login)
+def test_forwarder_event_needs_compute_slot(forwarder_client, saas_login, gate) -> None:
+    plan_id = _plan(forwarder_client, saas_login)
     with gate.slot():
-        _busy(platform_client.post(f"/api/plans/{plan_id}/events", json=EVENT))
-    assert platform_client.post(f"/api/plans/{plan_id}/events", json=EVENT).status_code == 200
+        _busy(forwarder_client.post(f"/api/plans/{plan_id}/events", json=EVENT))
+    assert forwarder_client.post(f"/api/plans/{plan_id}/events", json=EVENT).status_code == 200
 
 
-def test_shipper_change_request_needs_compute_slot(platform_client, saas_login, gate) -> None:
-    plan_id = _plan(platform_client, saas_login)
+def test_legacy_shipper_change_request_needs_compute_slot(
+    forwarder_client, saas_login, gate
+) -> None:
+    plan_id = _legacy_plan(_plan(forwarder_client, saas_login))
     shipper = saas_login("shipper-pohang")
     with gate.slot():
         _busy(_request(shipper, plan_id))
@@ -80,48 +98,46 @@ def test_shipper_change_request_needs_compute_slot(platform_client, saas_login, 
     assert _request(shipper, plan_id).status_code == 201
 
 
-def test_platform_change_request_replan_needs_compute_slot(
-    platform_client, saas_login, gate
+def test_forwarder_change_request_replan_needs_compute_slot(
+    forwarder_client, saas_login, gate
 ) -> None:
-    plan_id = _plan(platform_client, saas_login)
-    created = _request(saas_login("shipper-pohang"), plan_id)
-    assert created.status_code == 201, created.text
-    request_id = created.json()["request_id"]
+    plan_id = _plan(forwarder_client, saas_login)
+    request_id = _quantity_request(saas_login("shipper-pohang"), plan_id, POHANG_LOT, 2)
     with gate.slot():
-        _busy(platform_client.post(f"{PLATFORM}/{request_id}/replan"))
-    assert platform_client.get(f"{PLATFORM}/{request_id}").json()["replan_id"] is None
-    assert platform_client.post(f"{PLATFORM}/{request_id}/replan").status_code == 200
+        _busy(forwarder_client.post(f"{FORWARDER}/{request_id}/replan"))
+    assert forwarder_client.get(f"{FORWARDER}/{request_id}").json()["replan_id"] is None
+    assert forwarder_client.post(f"{FORWARDER}/{request_id}/replan").status_code == 200
 
 
-def test_add_lot_needs_compute_slot(platform_client, saas_login, gate) -> None:
-    plan_id, extra = _plan_with_spare(platform_client, saas_login)
-    path = f"/api/saas/platform/plans/{plan_id}/add-lot"
+def test_add_lot_needs_compute_slot(forwarder_client, saas_login, gate) -> None:
+    plan_id, extra = _plan_with_spare(forwarder_client, saas_login)
+    path = f"{PLANS}/{plan_id}/add-lot"
     with gate.slot():
-        _busy(platform_client.post(path, json={"lot_id": extra}))
-    assert platform_client.post(path, json={"lot_id": extra}).status_code == 200
+        _busy(forwarder_client.post(path, json={"lot_id": extra}))
+    assert forwarder_client.post(path, json={"lot_id": extra}).status_code == 200
 
 
 def test_replan_rate_limit_per_visitor(saas_app, monkeypatch) -> None:
     monkeypatch.setattr(compute_limits, "REPLAN_RATE", RateRule(per_client=2, window_seconds=60))
-    platform = seed_client(PLATFORM_ORG_ID, saas_app)
-    plan_id = _plan(platform, lambda org_id: seed_client(org_id, saas_app))
+    forwarder = seed_client(FORWARDER_ORG_ID, saas_app)
+    plan_id = _plan(forwarder, lambda org_id: seed_client(org_id, saas_app))
     path = f"/api/plans/{plan_id}/events"
-    assert [platform.post(path, json=EVENT).status_code for _ in range(2)] == [200, 200]
-    limited = platform.post(path, json=EVENT)
+    assert [forwarder.post(path, json=EVENT).status_code for _ in range(2)] == [200, 200]
+    limited = forwarder.post(path, json=EVENT)
     assert limited.status_code == 429
     assert int(limited.headers["Retry-After"]) >= 1
-    add_lot = f"/api/saas/platform/plans/{plan_id}/add-lot"
-    assert platform.post(add_lot, json={"lot_id": "lot-x"}).status_code == 429
-    assert platform.post(f"{PLATFORM}/missing/replan").status_code == 429
+    add_lot = f"{PLANS}/{plan_id}/add-lot"
+    assert forwarder.post(add_lot, json={"lot_id": "lot-x"}).status_code == 429
+    assert forwarder.post(f"{FORWARDER}/missing/replan").status_code == 429
 
 
 def test_shipper_change_requests_share_replan_rate(saas_app, monkeypatch) -> None:
     monkeypatch.setattr(compute_limits, "REPLAN_RATE", RateRule(per_client=1, window_seconds=60))
-    platform = seed_client(PLATFORM_ORG_ID, saas_app)
-    plan_id = _plan(platform, lambda org_id: seed_client(org_id, saas_app))
+    forwarder = seed_client(FORWARDER_ORG_ID, saas_app)
+    plan_id = _plan(forwarder, lambda org_id: seed_client(org_id, saas_app))
     shipper = seed_client("shipper-pohang", saas_app)
-    assert _request(shipper, plan_id).status_code == 201
-    limited = _request(shipper, plan_id)
+    assert _request(shipper, plan_id, AIR_SWITCH).status_code == 201
+    limited = _request(shipper, plan_id, AIR_SWITCH)
     assert limited.status_code == 429
     assert _change_requests() == 1
 
@@ -205,12 +221,12 @@ def test_business_years_needs_analysis_slot(platform_client, analysis_gate) -> N
     assert platform_client.get(path).status_code == 200
 
 
-def test_recompute_needs_compute_slot(platform_client, saas_login, gate) -> None:
-    plan_id = _plan(platform_client, saas_login)
-    path = f"/api/saas/platform/plans/{plan_id}/confirmation/recompute"
+def test_recompute_needs_compute_slot(forwarder_client, saas_login, gate) -> None:
+    plan_id = _plan(forwarder_client, saas_login)
+    path = f"{PLANS}/{plan_id}/confirmation/recompute"
     with gate.slot():
-        _busy(platform_client.post(path, json={}))
-    assert platform_client.post(path, json={}).status_code != 503
+        _busy(forwarder_client.post(path, json={}))
+    assert forwarder_client.post(path, json={}).status_code != 503
 
 
 def test_analysis_gate_does_not_block_replans(client, analysis_gate) -> None:
@@ -221,27 +237,29 @@ def test_analysis_gate_does_not_block_replans(client, analysis_gate) -> None:
 
 def test_analysis_rate_limit_per_visitor(saas_app, monkeypatch) -> None:
     monkeypatch.setattr(compute_limits, "ANALYSIS_RATE", RateRule(per_client=1, window_seconds=60))
-    platform = seed_client(PLATFORM_ORG_ID, saas_app)
-    plan_id = _plan(platform, lambda org_id: seed_client(org_id, saas_app))
-    detail = platform.get(f"/api/plans/{plan_id}")
+    forwarder = seed_client(FORWARDER_ORG_ID, saas_app)
+    plan_id = _plan(forwarder, lambda org_id: seed_client(org_id, saas_app))
+    detail = forwarder.get(f"/api/plans/{plan_id}")
     assert detail.status_code == 200, detail.text
     lot_id = detail.json()["scenario"]["lots"][0]["id"]
-    assert platform.get("/api/analysis/business", params={"plan_id": plan_id}).status_code == 200
-    limited = platform.get("/api/analysis/business/matrix", params={"plan_id": plan_id})
+    assert forwarder.get("/api/analysis/business", params={"plan_id": plan_id}).status_code == 200
+    limited = forwarder.get("/api/analysis/business/matrix", params={"plan_id": plan_id})
     assert limited.status_code == 429
     assert int(limited.headers["Retry-After"]) >= 1
-    assert platform.get("/api/quality/impact").status_code == 429
-    assert platform.get("/api/saas/platform/business/years").status_code == 429
+    assert forwarder.get("/api/quality/impact").status_code == 429
     lot = {"lot_id": lot_id, "plan_id": plan_id}
-    assert platform.post("/api/compare/air-vs-sea", json=lot).status_code == 429
+    assert forwarder.post("/api/compare/air-vs-sea", json=lot).status_code == 429
+    platform = seed_client(PLATFORM_ORG_ID, saas_app)
+    assert platform.get("/api/saas/platform/business/years").status_code == 200
+    assert platform.get("/api/saas/platform/business/years").status_code == 429
 
 
 def test_recompute_shares_replan_rate(saas_app, monkeypatch) -> None:
     monkeypatch.setattr(compute_limits, "REPLAN_RATE", RateRule(per_client=1, window_seconds=60))
-    platform = login_client(PLATFORM_ORG_ID, saas_app)
-    path = "/api/saas/platform/plans/missing/confirmation/recompute"
-    assert platform.post(path, json={}).status_code == 404
-    assert platform.post(path, json={}).status_code == 429
+    forwarder = login_client(FORWARDER_ORG_ID, saas_app)
+    path = f"{PLANS}/missing/confirmation/recompute"
+    assert forwarder.post(path, json={}).status_code == 404
+    assert forwarder.post(path, json={}).status_code == 429
 
 
 def test_analysis_rate_is_off_for_anonymous_demo(client, monkeypatch) -> None:
@@ -256,10 +274,10 @@ def test_default_analysis_rates_are_generous() -> None:
     assert compute_limits.ANALYSIS_SLOTS >= 1
 
 
-def test_concurrent_duplicate_change_requests_solve_once(
-    platform_client, saas_login, monkeypatch
+def test_concurrent_duplicate_legacy_change_requests_solve_once(
+    forwarder_client, saas_login, monkeypatch
 ) -> None:
-    plan_id = _plan(platform_client, saas_login)
+    plan_id = _legacy_plan(_plan(forwarder_client, saas_login))
     shipper = saas_login("shipper-pohang")
     calls = []
     lock = threading.Lock()
@@ -278,3 +296,8 @@ def test_concurrent_duplicate_change_requests_solve_once(
     assert all(r.json()["detail"] == ALREADY_OPEN for r in responses if r.status_code == 409)
     assert len(_open_rows(plan_id, POHANG_LOT)) == 1
     assert len(calls) == 1
+
+
+def test_analysis_gate_queues_up_to_ten_seconds() -> None:
+    assert compute_limits.analysis_gate.wait_seconds == compute_limits.ANALYSIS_WAIT_SECONDS == 10.0
+    assert compute_limits.gate.wait_seconds == compute_limits.COMPUTE_WAIT_SECONDS

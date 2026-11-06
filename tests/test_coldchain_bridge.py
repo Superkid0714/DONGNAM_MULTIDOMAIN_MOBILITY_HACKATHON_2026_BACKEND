@@ -71,12 +71,12 @@ def _login(app, org_id: str) -> TestClient:
 def test_fake_reading_with_device_token_reaches_platform_monitor(saas_app) -> None:
     scenario = get_scenario("default")
     assert scenario is not None
-    plan_id = store.create(scenario, org_id="freshswitch").plan_id
-    platform = _login(saas_app, "freshswitch")
-    created = platform.post("/api/saas/devices", json={"device_id": "demo-bridge-01"})
+    plan_id = store.create(scenario, org_id="forwarder-dongnam").plan_id
+    forwarder = _login(saas_app, "forwarder-dongnam")
+    created = forwarder.post("/api/saas/devices", json={"device_id": "demo-bridge-01"})
     assert created.status_code == 201, created.text
     token = created.json()["device_token"]
-    bound = platform.post(
+    bound = forwarder.post(
         "/api/coldchain/bindings",
         json={"device_id": "demo-bridge-01", "container_id": "CA-01", "plan_id": plan_id},
     )
@@ -99,5 +99,6 @@ def test_fake_reading_with_device_token_reaches_platform_monitor(saas_app) -> No
     sent = _send(device, bridge.build_request(args.api, payload, args.device_token))
     assert sent.status_code == 200, sent.text
     assert sent.json()["accepted"] == 1
+    platform = _login(saas_app, "freshswitch")
     monitor = platform.get("/api/coldchain/containers", params={"plan_id": plan_id})
     assert [(c["container_id"], c["reading_count"]) for c in monitor.json()] == [("CA-01", 1)]

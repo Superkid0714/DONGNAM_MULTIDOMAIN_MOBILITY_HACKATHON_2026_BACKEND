@@ -17,7 +17,6 @@ from freshswitch_backend.persistence.tables import (
     BindingRow,
     ContainerRow,
     DeviceRow,
-    PlanForwarderRow,
 )
 from freshswitch_backend.planning.store import store
 
@@ -55,21 +54,19 @@ def plan_id(demo_tenants) -> str:
     lot = next(item for item in scenario.lots if item.id == LOT_ID)
     lot_store.create(lambda _: (lot, scenario.id, None), org_id=SHIPPER)
     session = store.create(
-        scenario, registered_lot_ids=[LOT_ID], org_id=PLATFORM, lot_org_id=ANY_ORG
+        scenario, registered_lot_ids=[LOT_ID], org_id=FORWARDER, lot_org_id=ANY_ORG
     )
-    with database.begin() as db:
-        db.add(PlanForwarderRow(plan_id=session.plan_id, forwarder_org_id=FORWARDER))
     return session.plan_id
 
 
 @pytest.fixture
 def simulated(app, plan_id: str) -> str:
-    platform = _login(app, PLATFORM)
-    registered = platform.post(
+    forwarder = _login(app, FORWARDER)
+    registered = forwarder.post(
         "/api/saas/devices", json={"device_id": "demo-sensor-01"}, headers=CSRF
     )
     assert registered.status_code == 201, registered.text
-    run = platform.post(
+    run = forwarder.post(
         "/api/coldchain/simulate",
         json={
             "preset": "power_cut_restore",
@@ -84,10 +81,10 @@ def simulated(app, plan_id: str) -> str:
     return plan_id
 
 
-def test_platform_simulation_is_stored_under_plan_owner(app, simulated: str) -> None:
+def test_forwarder_simulation_is_stored_under_plan_owner(app, simulated: str) -> None:
     with database.begin() as db:
         rows = db.execute(select(ContainerRow.record_key, ContainerRow.org_id)).all()
-    assert rows == [(f"{simulated}:CA-01", PLATFORM)]
+    assert rows == [(f"{simulated}:CA-01", FORWARDER)]
     anonymous = _anonymous(app)
     assert anonymous.get("/api/coldchain/containers").status_code == 401
     assert anonymous.get("/api/coldchain/alerts").status_code == 401
@@ -180,8 +177,7 @@ def test_simulator_ids_cannot_be_registered(app, plan_id: str) -> None:
     forwarder = _login(app, FORWARDER)
     taken = forwarder.post("/api/saas/devices", json={"device_id": "sim-01"}, headers=CSRF)
     assert taken.status_code == 422
-    platform = _login(app, PLATFORM)
-    run = platform.post(
+    run = forwarder.post(
         "/api/coldchain/simulate",
         json={"plan_id": plan_id, "container_id": "CA-01", "device_id": "sim-01"},
         headers=CSRF,
@@ -190,11 +186,11 @@ def test_simulator_ids_cannot_be_registered(app, plan_id: str) -> None:
 
 
 def test_logged_in_simulation_needs_registered_device(app, plan_id: str) -> None:
-    platform = _login(app, PLATFORM)
+    forwarder = _login(app, FORWARDER)
     body = {"plan_id": plan_id, "container_id": "CA-01", "device_id": "demo-loose-01"}
-    assert platform.post("/api/coldchain/simulate", json=body, headers=CSRF).status_code == 422
-    platform.post("/api/saas/devices", json={"device_id": "demo-loose-01"}, headers=CSRF)
-    assert platform.post("/api/coldchain/simulate", json=body, headers=CSRF).status_code == 200
+    assert forwarder.post("/api/coldchain/simulate", json=body, headers=CSRF).status_code == 422
+    forwarder.post("/api/saas/devices", json={"device_id": "demo-loose-01"}, headers=CSRF)
+    assert forwarder.post("/api/coldchain/simulate", json=body, headers=CSRF).status_code == 200
 
 
 def test_forwarder_does_not_see_money(app, simulated: str) -> None:
@@ -254,30 +250,31 @@ def test_devices_require_login_and_csrf(app) -> None:
     assert platform.post("/api/saas/devices", json={"device_id": "x"}).status_code == 403
 
 
-def test_registration_keeps_another_org_binding(demo_tenants) -> None:
-    app = create_app()
-    anonymous = _anonymous(app)
+def test_registration_keeps_another_org_binding(app) -> None:
+    anonymous = _anonymous(create_app())
     bound = anonymous.post(
-        "/api/coldchain/bindings", json={"device_id": "arduino-01", "container_id": "CA-01"}
+        "/api/coldchain/bindings", json={"device_id": "demo-arduino-01", "container_id": "CA-01"}
     )
     assert bound.status_code == 201
     platform = _login(app, PLATFORM)
-    created = platform.post("/api/saas/devices", json={"device_id": "arduino-01"}, headers=CSRF)
+    created = platform.post(
+        "/api/saas/devices", json={"device_id": "demo-arduino-01"}, headers=CSRF
+    )
     assert created.status_code == 409
     with database.begin() as db:
-        binding = db.get(BindingRow, "arduino-01")
+        binding = db.get(BindingRow, "demo-arduino-01")
         assert binding is not None and binding.org_id == DEMO_ORG
-        assert db.get(DeviceRow, "arduino-01") is None
+        assert db.get(DeviceRow, "demo-arduino-01") is None
     listed = anonymous.get("/api/coldchain/bindings").json()
-    assert [item["device_id"] for item in listed] == ["arduino-01"]
+    assert [item["device_id"] for item in listed] == ["demo-arduino-01"]
 
 
 def test_registered_device_readings_need_token(app, plan_id: str) -> None:
-    platform = _login(app, PLATFORM)
-    token = platform.post("/api/saas/devices", json={"device_id": "demo-p1"}, headers=CSRF).json()[
+    forwarder = _login(app, FORWARDER)
+    token = forwarder.post("/api/saas/devices", json={"device_id": "demo-p1"}, headers=CSRF).json()[
         "device_token"
     ]
-    bound = platform.post(
+    bound = forwarder.post(
         "/api/coldchain/bindings",
         json={"device_id": "demo-p1", "container_id": "CA-01", "plan_id": plan_id},
         headers=CSRF,
@@ -298,9 +295,9 @@ def test_registered_device_readings_need_token(app, plan_id: str) -> None:
     with database.begin() as db:
         assert db.get(DeviceRow, "demo-p1").last_seen_at is not None
         keys = db.scalars(select(ContainerRow.org_id)).all()
-    assert keys == [PLATFORM]
+    assert keys == [FORWARDER]
     assert device.get("/api/coldchain/containers").status_code == 401
-    listed = platform.get("/api/saas/devices").json()
+    listed = forwarder.get("/api/saas/devices").json()
     assert listed[0]["binding"]["container_id"] == "CA-01"
 
 
@@ -333,14 +330,14 @@ def test_device_token_from_other_device_is_rejected(app) -> None:
 
 
 def test_logged_in_org_cannot_use_unregistered_device(app, plan_id: str) -> None:
-    platform = _login(app, PLATFORM)
-    bound = platform.post(
+    forwarder = _login(app, FORWARDER)
+    bound = forwarder.post(
         "/api/coldchain/bindings",
         json={"device_id": "demo-loose-01", "container_id": "CA-01", "plan_id": plan_id},
         headers=CSRF,
     )
     assert bound.status_code == 422
-    sent = platform.post(
+    sent = forwarder.post(
         "/api/coldchain/readings",
         json={
             "device_id": "demo-loose-01",
@@ -354,18 +351,19 @@ def test_logged_in_org_cannot_use_unregistered_device(app, plan_id: str) -> None
 
 
 def test_delete_device_removes_binding(app, plan_id: str) -> None:
-    platform = _login(app, PLATFORM)
-    platform.post("/api/saas/devices", json={"device_id": "demo-p1"}, headers=CSRF)
-    platform.post(
+    forwarder = _login(app, FORWARDER)
+    forwarder.post("/api/saas/devices", json={"device_id": "demo-p1"}, headers=CSRF)
+    bound = forwarder.post(
         "/api/coldchain/bindings",
         json={"device_id": "demo-p1", "container_id": "CA-01", "plan_id": plan_id},
         headers=CSRF,
     )
-    assert platform.delete("/api/saas/devices/demo-p1", headers=CSRF).status_code == 204
+    assert bound.status_code == 201, bound.text
+    assert forwarder.delete("/api/saas/devices/demo-p1", headers=CSRF).status_code == 204
     with database.begin() as db:
         assert db.get(DeviceRow, "demo-p1") is None
         assert db.get(BindingRow, "demo-p1") is None
-    assert platform.get("/api/coldchain/bindings").json() == []
+    assert forwarder.get("/api/coldchain/bindings").json() == []
 
 
 def test_store_rejects_foreign_registered_device(app) -> None:

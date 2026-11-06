@@ -2,11 +2,10 @@ import json
 from typing import get_args
 
 from fastapi.testclient import TestClient
-from saas_fixtures import FORWARDER_ORG_ID, SHIPPER_ORG_ID
-from test_saas_api import _platform_plan
+from saas_fixtures import FORWARDER_ORG_ID, SHIPPER_ORG_ID, saas_app
+from test_saas_api import _forwarder_plan
 
 from freshswitch_backend.data.loader import get_scenario
-from freshswitch_backend.main import app
 from freshswitch_backend.planning.store import SessionStatus
 from freshswitch_backend.quality.disclosure import DEFAULT_BASIS, LEARNED_BASIS, expected_loss
 from freshswitch_backend.quality.params import QualityParams
@@ -51,7 +50,7 @@ def _other_shippers(own: str) -> list[str]:
 
 
 def test_openapi_exposes_status_enum_warnings_and_expected_loss() -> None:
-    schemas = app.openapi()["components"]["schemas"]
+    schemas = saas_app.openapi()["components"]["schemas"]
     for name in ("PlanSession", "PlanSummary", "PlanConfirmationState"):
         assert set(schemas[name]["properties"]["status"]["enum"]) == set(get_args(SessionStatus))
     assert "pending_shipper_confirmation" in schemas["PlanSession"]["properties"]["status"]["enum"]
@@ -69,16 +68,11 @@ def test_pending_shipper_confirmation_plan_status_is_in_response_enum(
     platform_client: TestClient, saas_login
 ) -> None:
     allowed = set(
-        app.openapi()["components"]["schemas"]["PlanSession"]["properties"]["status"]["enum"]
+        saas_app.openapi()["components"]["schemas"]["PlanSession"]["properties"]["status"]["enum"]
     )
-    plan = _platform_plan(platform_client, saas_login)
+    plan = _forwarder_plan(saas_login)
     plan_id = plan["plan_id"]
     assert plan["status"] == "pending_shipper_confirmation"
-    assigned = platform_client.put(
-        f"/api/saas/platform/plans/{plan_id}/forwarder",
-        json={"forwarder_org_id": FORWARDER_ORG_ID},
-    )
-    assert assigned.status_code == 200, assigned.text
     statuses = [
         plan["status"],
         saas_login(FORWARDER_ORG_ID).get(f"/api/saas/forwarder/plans/{plan_id}").json()["status"],

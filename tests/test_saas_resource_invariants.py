@@ -7,7 +7,7 @@ from copy import deepcopy
 import pytest
 from conftest import FROZEN_NOW
 from fastapi.testclient import TestClient
-from saas_fixtures import FORWARDER_ORG_ID, password_client
+from saas_fixtures import FORWARDER_ORG_ID, password_client, saas_app
 from sqlalchemy import func, select
 from test_onboarding import _lot, _onboarded, _signup
 from test_saas_api import _register_all
@@ -15,7 +15,6 @@ from test_saas_api import _register_all
 from freshswitch_backend.api.plans import CreatePlanRequest, tenant_plan_scenario
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.lots import ANY_ORG, lot_store
-from freshswitch_backend.main import app
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.seed import create_platform
 from freshswitch_backend.persistence.tables import (
@@ -59,7 +58,7 @@ def _platform(suffix: str = "one") -> TestClient:
             password=PASSWORD,
             org_id=f"resource-platform-{suffix}",
         )
-    return password_client(app, email, PASSWORD)
+    return password_client(saas_app, email, PASSWORD)
 
 
 def _org(client: TestClient) -> str:
@@ -515,7 +514,7 @@ def test_forwarder_confirmation_and_external_execution_remain_gated_by_shipper_a
     state = owner.get(confirmation_path)
     assert state.status_code == 200, state.text
     assert state.json()["status"] == "pending_shipper_confirmation"
-    assert owner.post(f"{confirmation_path}/auto-accept").status_code == 403
+    assert owner.post(f"{confirmation_path}/auto-accept").status_code == 404
     event_path = f"/api/plans/{plan_id}/events"
     event_body = {"event": {"type": "air_switch", "lot_id": lot_id}}
     proposed = owner.post(event_path, json=event_body)

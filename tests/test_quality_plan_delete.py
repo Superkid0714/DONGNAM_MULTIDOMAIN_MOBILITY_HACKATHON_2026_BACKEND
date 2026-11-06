@@ -1,6 +1,6 @@
 import pytest
 from fastapi.testclient import TestClient
-from saas_fixtures import PLATFORM_ORG_ID, seed_client
+from saas_fixtures import FORWARDER_ORG_ID, PLATFORM_ORG_ID, accept_plan, seed_client
 from sqlalchemy import select
 
 from freshswitch_backend.config import get_settings
@@ -82,7 +82,7 @@ def _lot_body(lot) -> dict:
     }
 
 
-def _sandbox_plan(saas_app) -> tuple[TestClient, str]:
+def _sandbox_plan(saas_app) -> tuple[TestClient, TestClient, str]:
     scenario = get_scenario("default")
     assert scenario is not None
     ids = []
@@ -91,10 +91,12 @@ def _sandbox_plan(saas_app) -> tuple[TestClient, str]:
         response = shipper.post("/api/saas/shipper/lots", json=_lot_body(lot))
         assert response.status_code == 201, response.text
         ids.append(response.json()["registered"]["id"])
-    platform = seed_client(PLATFORM_ORG_ID, saas_app)
-    created = platform.post("/api/saas/platform/plans", json={"lot_ids": ids})
+    forwarder = seed_client(FORWARDER_ORG_ID, saas_app)
+    created = forwarder.post("/api/saas/forwarder/plans", json={"lot_ids": ids})
     assert created.status_code == 201, created.text
-    return platform, created.json()["plan_id"]
+    plan_id = created.json()["plan_id"]
+    accept_plan(lambda org_id: seed_client(org_id, saas_app), plan_id)
+    return seed_client(PLATFORM_ORG_ID, saas_app), forwarder, plan_id
 
 
 def test_demo_plan_delete_drops_its_arrival_observations(client: TestClient) -> None:
@@ -210,31 +212,31 @@ def test_arrival_racing_demo_reset_leaves_no_row(
 
 def test_sandbox_plan_delete_drops_its_arrival_observations(saas_app, client: TestClient) -> None:
     demo_n = _cell_n(client)
-    platform, plan_id = _sandbox_plan(saas_app)
+    platform, forwarder, plan_id = _sandbox_plan(saas_app)
     n_before = _cell_n(platform)
     ids_before = _observation_ids(platform)
-    _arrival(platform, plan_id)
+    _arrival(forwarder, plan_id)
     assert _cell_n(platform) == n_before + 1
     dropped = _arrival_ids("sandbox", plan_id)
     assert len(dropped) == 1 and dropped <= _observation_ids(platform)
 
-    assert platform.delete(f"/api/plans/{plan_id}").status_code == 204
+    assert forwarder.delete(f"/api/plans/{plan_id}").status_code == 204
     assert _cell_n(platform) == n_before
     assert _observation_ids(platform) == ids_before
     assert _cell_n(client) == demo_n
 
 
 def test_other_org_cannot_drop_observations_by_deleting(saas_app, client: TestClient) -> None:
-    platform, plan_id = _sandbox_plan(saas_app)
-    _arrival(platform, plan_id)
+    _, forwarder, plan_id = _sandbox_plan(saas_app)
+    _arrival(forwarder, plan_id)
     assert client.delete(f"/api/plans/{plan_id}").status_code == 404
     assert len(_arrival_ids("sandbox", plan_id)) == 1
 
 
 def test_sandbox_reset_drops_arrival_observations(saas_app) -> None:
-    platform, plan_id = _sandbox_plan(saas_app)
+    platform, forwarder, plan_id = _sandbox_plan(saas_app)
     n_before = _cell_n(platform)
-    _arrival(platform, plan_id)
+    _arrival(forwarder, plan_id)
     assert _cell_n(platform) == n_before + 1
 
     reset_sandbox()

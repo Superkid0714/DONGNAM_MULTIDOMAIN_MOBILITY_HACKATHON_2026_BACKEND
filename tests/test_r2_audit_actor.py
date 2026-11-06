@@ -1,3 +1,4 @@
+import itertools
 import secrets
 from datetime import UTC, datetime, timedelta
 
@@ -8,17 +9,17 @@ from alembic.script import ScriptDirectory
 from fastapi import Request
 from fastapi.testclient import TestClient
 from saas_fixtures import (
+    FORWARDER_ORG_ID,
     PLATFORM_ORG_ID,
-    REAL_PLATFORM_EMAIL,
-    REAL_PLATFORM_PASSWORD,
     SAAS_CSRF,
     SHIPPER_ORG_ID,
-    create_real_platform,
+    accept_plan,
     login_client,
-    password_client,
+    open_quantity_window,
+    queue_quantity,
 )
-from sqlalchemy import func, select, text
-from test_saas_api import _assign, _lot_body, _platform_plan, _scenario
+from sqlalchemy import select, text
+from test_saas_api import _forwarder_plan, _lot_body, _scenario
 
 from freshswitch_backend.api import auth
 from freshswitch_backend.api.auth import RateRule, SlidingWindowLimiter
@@ -35,6 +36,7 @@ from freshswitch_backend.persistence.tables import (
 
 REDUCE = {"type": "reduce", "lot_id": "lot-jinju-sb-1", "new_pallets": 2}
 PROXY_PEER = ("127.0.0.1", 50000)
+SIGNUPS = itertools.count()
 
 
 @pytest.fixture
@@ -50,12 +52,12 @@ class FakeClock:
         return self.now
 
 
-def _apply(platform: TestClient, plan_id: str, event: dict) -> dict:
-    r = platform.post(f"/api/plans/{plan_id}/events", json={"event": event})
+def _apply(planner: TestClient, plan_id: str, event: dict) -> dict:
+    r = planner.post(f"/api/plans/{plan_id}/events", json={"event": event})
     assert r.status_code == 200, r.text
     alt = next(a["id"] for a in r.json()["alternatives"] if a["feasible"])
     body = {"alternative_id": alt, "replan_id": r.json()["replan_id"]}
-    applied = platform.post(f"/api/plans/{plan_id}/apply", json=body)
+    applied = planner.post(f"/api/plans/{plan_id}/apply", json=body)
     assert applied.status_code == 200, applied.text
     return applied.json()
 
@@ -63,8 +65,11 @@ def _apply(platform: TestClient, plan_id: str, event: dict) -> dict:
 def test_platform_cannot_confirm_for_shipper_or_forwarder(
     platform_client, saas_login, forwarder_client
 ) -> None:
-    pid = _platform_plan(platform_client, saas_login)["plan_id"]
-    oid = _apply(platform_client, pid, REDUCE)["active_order_id"]
+    pid = _forwarder_plan(saas_login)["plan_id"]
+    accept_plan(saas_login, pid)
+    open_quantity_window()
+    queue_quantity(saas_login(SHIPPER_ORG_ID), pid, REDUCE["lot_id"], REDUCE["new_pallets"])
+    oid = _apply(forwarder_client, pid, REDUCE)["active_order_id"]
     path = f"/api/plans/{pid}/orders/{oid}/confirm"
     order = platform_client.get(f"/api/plans/{pid}/orders/{oid}").json()
     sids = [c["shipper_id"] for c in order["shipper_confirmations"]]
@@ -79,7 +84,7 @@ def test_platform_cannot_confirm_for_shipper_or_forwarder(
     assert unchanged["status"] == order["status"]
     assert {c["status"] for c in unchanged["shipper_confirmations"]} == {"pending"}
 
-    assert forwarder_client.post(path, json=forwarder_body).status_code in (403, 404)
+    assert forwarder_client.post(path, json=forwarder_body).status_code == 403
     shipper = saas_login(SHIPPER_ORG_ID)
     shipper_body = {"actor": "shipper", "shipper_id": "sh-jinju", "accept": True}
     assert shipper.post(path, json=shipper_body).status_code in (403, 404)
@@ -92,8 +97,8 @@ def test_platform_cannot_confirm_for_shipper_or_forwarder(
         assert confirmed.status_code == 200, confirmed.text
 
     saas_path = f"/api/saas/forwarder/plans/{pid}/orders/{oid}/confirm"
-    assert forwarder_client.post(saas_path, json={"accept": True}).status_code == 404
-    _assign(pid)
+    outsider = saas_login("forwarder-sinhang")
+    assert outsider.post(saas_path, json={"accept": True}).status_code == 404
     done = forwarder_client.post(saas_path, json={"accept": True})
     assert done.status_code == 200, done.text
     assert done.json()["status"] in ("forwarder_confirmed", "executed")
@@ -115,15 +120,29 @@ def test_anonymous_demo_confirm_still_works(client: TestClient) -> None:
 
 
 def test_simulator_is_sandbox_only(saas_app) -> None:
-    create_real_platform()
-    real = password_client(saas_app, REAL_PLATFORM_EMAIL, REAL_PLATFORM_PASSWORD)
+    real = TestClient(saas_app, base_url="https://testserver", headers=SAAS_CSRF)
+    signed = real.post(
+        "/api/auth/signup",
+        json={
+            "email": "simulator-forwarder@example.com",
+            "password": "simulator-forwarder-pass",
+            "name": "실제 포워더",
+            "org_name": "실제 포워더",
+            "org_type": "forwarder",
+        },
+    )
+    assert signed.status_code == 201, signed.text
     body = {"device_id": "sim-x", "reset": True, "preset": "normal"}
     blocked = real.post("/api/coldchain/simulate", json=body)
     assert blocked.status_code == 403
     assert "sandbox" in blocked.json()["detail"]
 
-    sandbox = login_client(PLATFORM_ORG_ID, saas_app)
-    allowed = sandbox.post("/api/coldchain/simulate", json={"preset": "normal"})
+    sandbox = login_client(FORWARDER_ORG_ID, saas_app)
+    device = sandbox.post("/api/saas/devices", json={"device_id": "demo-sim-1"})
+    assert device.status_code == 201, device.text
+    allowed = sandbox.post(
+        "/api/coldchain/simulate", json={"preset": "normal", "device_id": "demo-sim-1"}
+    )
     assert allowed.status_code == 200, allowed.text
 
 
@@ -145,39 +164,60 @@ def _demo_login(app, ip: str | None = None) -> int:
     return client.post("/api/auth/demo-login", json=body).status_code
 
 
-def test_demo_login_is_rate_limited_per_client(saas_app) -> None:
+def _signup_from(app, ip: str | None = None, peer=PROXY_PEER) -> int:
+    forwarded = {"X-Forwarded-For": f"10.9.9.9, {ip}"} if ip else {}
+    client = TestClient(
+        app, base_url="https://testserver", headers={**SAAS_CSRF, **forwarded}, client=peer
+    )
+    n = next(SIGNUPS)
+    body = {
+        "email": f"limited-{n}@example.com",
+        "password": "rate-limit-pass",
+        "name": "속도 제한",
+        "org_name": f"제한 업체 {n}",
+        "org_type": "shipper",
+    }
+    return client.post("/api/auth/signup", json=body).status_code
+
+
+def test_auth_rate_limit_is_per_client(saas_app) -> None:
     rule = RateRule(per_client=2, window_seconds=60)
     clock = _small_limiter(saas_app, {"demo-login": rule, "signup": rule})
-    assert [_demo_login(saas_app, "1.1.1.1") for _ in range(3)] == [200, 200, 429]
+    assert [_signup_from(saas_app, "1.1.1.1") for _ in range(3)] == [201, 201, 429]
     client = TestClient(
         saas_app, base_url="https://testserver", headers=SAAS_CSRF, client=PROXY_PEER
     )
     limited = client.post(
-        "/api/auth/demo-login",
-        json={"org_type": "platform"},
+        "/api/auth/signup",
+        json={
+            "email": "limited-direct@example.com",
+            "password": "rate-limit-pass",
+            "name": "속도 제한",
+            "org_name": "제한 업체",
+            "org_type": "shipper",
+        },
         headers={"X-Forwarded-For": "1.1.1.1"},
     )
     assert limited.status_code == 429
     assert int(limited.headers["retry-after"]) >= 1
-    assert _demo_login(saas_app, "2.2.2.2") == 200
+    assert _signup_from(saas_app, "2.2.2.2") == 201
     clock.now += 61
-    assert _demo_login(saas_app, "1.1.1.1") == 200
+    assert _signup_from(saas_app, "1.1.1.1") == 201
 
 
 def test_full_clients_do_not_block_other_clients(saas_app) -> None:
     rule = RateRule(per_client=1, window_seconds=60)
     _small_limiter(saas_app, {"demo-login": rule, "signup": rule})
-    first = [_demo_login(saas_app, f"3.3.3.{n}") for n in range(20)]
-    again = [_demo_login(saas_app, f"3.3.3.{n}") for n in range(20)]
-    assert first == [200] * 20
+    first = [_signup_from(saas_app, f"3.3.3.{n}") for n in range(20)]
+    again = [_signup_from(saas_app, f"3.3.3.{n}") for n in range(20)]
+    assert first == [201] * 20
     assert again == [429] * 20
-    assert _demo_login(saas_app, "3.3.4.1") == 200
+    assert _signup_from(saas_app, "3.3.4.1") == 201
 
 
 def test_forwarded_headers_are_ignored_from_untrusted_peers(saas_app) -> None:
     rule = RateRule(per_client=1, window_seconds=60)
     _small_limiter(saas_app, {"demo-login": rule, "signup": rule})
-    body = {"org_type": "platform", "org_id": PLATFORM_ORG_ID}
     codes = []
     for n in range(2):
         client = TestClient(
@@ -186,8 +226,15 @@ def test_forwarded_headers_are_ignored_from_untrusted_peers(saas_app) -> None:
             headers={**SAAS_CSRF, "X-Forwarded-For": f"6.6.6.{n}", "X-Real-IP": f"7.7.7.{n}"},
             client=("203.0.113.9", 40000),
         )
-        codes.append(client.post("/api/auth/demo-login", json=body).status_code)
-    assert codes == [200, 429]
+        body = {
+            "email": f"untrusted-{n}@example.com",
+            "password": "rate-limit-pass",
+            "name": "속도 제한",
+            "org_name": f"제한 업체 {n}",
+            "org_type": "shipper",
+        }
+        codes.append(client.post("/api/auth/signup", json=body).status_code)
+    assert codes == [201, 429]
 
 
 def test_client_address_trusts_configured_proxies_only(monkeypatch) -> None:
@@ -235,18 +282,10 @@ def test_signup_is_rate_limited(saas_app) -> None:
 
 
 def test_default_rules_are_installed_lazily(saas_app) -> None:
-    assert _demo_login(saas_app) == 200
+    assert _signup_from(saas_app) == 201
     limiter = saas_app.state.auth_rate_limiter
     assert isinstance(limiter, SlidingWindowLimiter)
-    assert auth.AUTH_RATE_RULES["demo-login"].per_client >= 20
     assert auth.AUTH_RATE_RULES["signup"].per_client >= 30
-
-
-def test_rate_limit_is_off_outside_saas_mode(demo_tenants) -> None:
-    app = create_app(get_settings().model_copy(update={"saas_mode": False}))
-    rule = RateRule(per_client=1, window_seconds=60)
-    _small_limiter(app, {"demo-login": rule, "signup": rule})
-    assert [_demo_login(app) for _ in range(3)] == [200, 200, 200]
 
 
 def _add_session(user_id: str, expires_at: datetime) -> str:
@@ -257,7 +296,7 @@ def _add_session(user_id: str, expires_at: datetime) -> str:
 
 
 def test_purge_expired_sessions(saas_app, capsys) -> None:
-    assert _demo_login(saas_app) == 200
+    assert _signup_from(saas_app) == 201
     with database.begin() as db:
         user_id = db.scalar(select(AuthSessionRow.user_id))
     now = datetime.now(UTC)
@@ -273,68 +312,6 @@ def test_purge_expired_sessions(saas_app, capsys) -> None:
     _add_session(user_id, now - timedelta(minutes=5))
     auth.main(["purge-sessions"])
     assert "purged=1" in capsys.readouterr().out
-
-
-def test_demo_user_sessions_are_capped(saas_app, monkeypatch) -> None:
-    monkeypatch.setattr(auth, "DEMO_SESSION_CAP", 3)
-    app = create_app(get_settings().model_copy(update={"saas_mode": False}))
-    clients = []
-    for _ in range(5):
-        client = TestClient(app, base_url="https://testserver", headers=SAAS_CSRF)
-        body = {"org_type": "platform", "org_id": PLATFORM_ORG_ID}
-        assert client.post("/api/auth/demo-login", json=body).status_code == 200
-        clients.append(client)
-    with database.begin() as db:
-        count = db.scalar(select(func.count()).select_from(AuthSessionRow))
-    assert count == 3
-    assert clients[-1].get("/api/me").status_code == 200
-    assert clients[0].get("/api/me").status_code == 401
-
-
-def test_recently_used_demo_session_survives_the_cap(saas_app, monkeypatch) -> None:
-    monkeypatch.setattr(auth, "DEMO_SESSION_CAP", 3)
-    monkeypatch.setattr(auth, "LAST_SEEN_INTERVAL", timedelta(0))
-    app = create_app(get_settings().model_copy(update={"saas_mode": False}))
-    body = {"org_type": "platform", "org_id": PLATFORM_ORG_ID}
-
-    def login() -> TestClient:
-        client = TestClient(app, base_url="https://testserver", headers=SAAS_CSRF)
-        assert client.post("/api/auth/demo-login", json=body).status_code == 200
-        return client
-
-    oldest = login()
-    middle = login()
-    login()
-    assert oldest.get("/api/me").status_code == 200
-    login()
-    login()
-    assert oldest.get("/api/me").status_code == 200
-    assert middle.get("/api/me").status_code == 401
-
-
-def test_demo_cookie_outlives_the_initial_world_after_a_plan(saas_app, monkeypatch) -> None:
-    from freshswitch_backend.persistence.sandbox_world import INITIAL_TTL
-
-    client = TestClient(saas_app, base_url="https://testserver", headers=SAAS_CSRF)
-    response = client.post("/api/auth/demo-login", json={"new_world": True})
-    assert response.status_code == 200, response.text
-    max_age = int(response.headers["set-cookie"].split("Max-Age=")[1].split(";")[0])
-    assert max_age == int(auth.DEMO_SESSION_TTL.total_seconds())
-    user_id = response.json()["user"]["id"]
-    with database.begin() as db:
-        session = db.scalar(select(AuthSessionRow).where(AuthSessionRow.user_id == user_id))
-    assert session is not None
-    lifetime = session.expires_at - session.created_at
-    assert abs(lifetime - INITIAL_TTL) < timedelta(minutes=1)
-    created = client.post("/api/saas/platform/plans", json={"include_registered": True})
-    assert created.status_code == 201, created.text
-    later = datetime.now(UTC) + INITIAL_TTL + timedelta(minutes=5)
-    monkeypatch.setattr(auth, "_now", lambda: later)
-    assert client.get("/api/me").status_code == 200
-    with database.begin() as db:
-        extended = db.scalar(select(AuthSessionRow).where(AuthSessionRow.user_id == user_id))
-    assert extended is not None
-    assert extended.expires_at > later
 
 
 def test_org_header_does_not_change_stored_active_org(saas_app) -> None:

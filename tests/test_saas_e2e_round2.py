@@ -1,11 +1,11 @@
 from fastapi.testclient import TestClient
-from test_saas_api import _platform_plan
+from test_saas_api import _forwarder_plan
 
 
 def test_shipper_plan_detail_holds_only_own_collection(
     platform_client: TestClient, saas_login
 ) -> None:
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
+    plan_id = _forwarder_plan(saas_login)["plan_id"]
     full = platform_client.get(f"/api/plans/{plan_id}").json()["plan"]
     own_cost = next(c for c in full["shipper_costs"] if c["shipper_id"] == "sh-pohang")
     own_lots = [c for c in full["lot_collections"] if c["shipper_id"] == "sh-pohang"]
@@ -33,7 +33,7 @@ def test_alert_stream_disables_proxy_buffering(client: TestClient) -> None:
 def test_shipper_free_text_scenario_description_is_blank(
     platform_client: TestClient, saas_login
 ) -> None:
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
+    plan_id = _forwarder_plan(saas_login)["plan_id"]
     jinju = saas_login("shipper-jinju")
     catalog = jinju.get("/api/saas/catalog").json()
     assert catalog["description"] == ""
@@ -41,4 +41,5 @@ def test_shipper_free_text_scenario_description_is_blank(
     detail = jinju.get(f"/api/saas/shipper/plans/{plan_id}").json()
     assert detail["scenario"]["description"] == ""
     platform = platform_client.get("/api/saas/catalog").json()
-    assert platform["description"]
+    assert platform["description"] == ""
+    assert len(platform["shippers"]) > 1

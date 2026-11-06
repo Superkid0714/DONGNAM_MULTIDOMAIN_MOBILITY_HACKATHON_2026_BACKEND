@@ -1,13 +1,11 @@
 import pytest
-from test_onboarding import PACKHOUSE, _lot, _onboarded
+from test_onboarding import PACKHOUSE, _lot, _onboarded, _real_forwarder
 
 from freshswitch_backend.api.plans import CreatePlanRequest, tenant_plan_scenario
 from freshswitch_backend.api.saas_views import Anonymizer
 from freshswitch_backend.intake.tenants import load_catalog
 from freshswitch_backend.lots import lot_store
 from freshswitch_backend.optimize.costs import CostModel
-from freshswitch_backend.persistence import database
-from freshswitch_backend.persistence.tables import OrganizationRow
 from freshswitch_backend.routing import build_pickup_request
 
 
@@ -72,16 +70,17 @@ def test_plan_routing_and_cost_use_each_lots_selected_coordinates():
     selected = second_site(client)
     me = client.get("/api/me").json()
     org_id = me["active_org"]["org_id"]
-    with database.begin() as db:
-        db.add(OrganizationRow(id="pickup-platform", type="platform", name="운영 업체"))
+    forwarder = _real_forwarder("pickup-forwarder@example.com", "집하 포워더")
+    forwarder_org_id = forwarder.get("/api/me").json()["active_org"]["org_id"]
     first = client.post("/api/saas/shipper/lots", json=_lot(pallets=1)).json()["registered"]
     second = client.post(
         "/api/saas/shipper/lots", json=_lot(pallets=1, packhouse_id=selected["packhouse_id"])
     ).json()["registered"]
     scenario, ids = tenant_plan_scenario(
-        CreatePlanRequest(lot_ids=[first["id"], second["id"]]), "pickup-platform"
+        CreatePlanRequest(lot_ids=[first["id"], second["id"]]), forwarder_org_id
     )
-    request = build_pickup_request(scenario, ids, "V-2611A")
+    voyage = scenario.voyages[0]
+    request = build_pickup_request(scenario, ids, voyage.id)
     stops = {stop.packhouse_id: stop for stop in request.stops}
     assert set(stops) == {default["packhouse_id"], selected["packhouse_id"]}
     assert stops[selected["packhouse_id"]].lot_ids == [second["id"]]
@@ -90,7 +89,6 @@ def test_plan_routing_and_cost_use_each_lots_selected_coordinates():
         129.05,
     )
     model = CostModel(scenario)
-    voyage = next(v for v in scenario.voyages if v.id == "V-2611A")
     lots = {lot.id: lot for lot in scenario.lots}
     assert model.collection_km(lots[first["id"]], voyage) != model.collection_km(
         lots[second["id"]], voyage

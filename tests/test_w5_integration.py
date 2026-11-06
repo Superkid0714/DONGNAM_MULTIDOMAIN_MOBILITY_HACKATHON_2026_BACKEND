@@ -2,7 +2,8 @@ import json
 from datetime import UTC, datetime
 
 from fastapi.testclient import TestClient
-from saas_fixtures import FORWARDER_ORG_ID, PLATFORM_ORG_ID
+from saas_fixtures import FORWARDER_ORG_ID, accept_plan, open_quantity_window, queue_quantity
+from sqlalchemy import delete
 from test_add_lot import _apply_add, _plan_with_spare, _reject_order, _status
 from test_saas_api import _register_all
 from test_saas_e2e_round1 import _confirm_all
@@ -18,7 +19,7 @@ from freshswitch_backend.coldchain.power_plan import power_plan
 from freshswitch_backend.execution.models import ReplanCandidate
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.seed import shipper_org_id
-from freshswitch_backend.persistence.tables import PlanForwarderRow, PlanRow
+from freshswitch_backend.persistence.tables import PlanRow, QuantityPolicyRow
 from freshswitch_backend.planning.store import (
     PlanConfirmation,
     PlanConfirmationState,
@@ -28,7 +29,7 @@ from freshswitch_backend.planning.store import (
 )
 from freshswitch_backend.quality import quality_history
 
-PLATFORM = "/api/saas/platform/plans"
+FORWARDER = "/api/saas/forwarder/plans"
 LATE = datetime(2026, 11, 17, 0, 0, tzinfo=UTC)
 GRAPE_STEPS = (
     {"type": "reduce", "lot_id": "lot-sangju-gr-1", "new_pallets": 10},
@@ -38,14 +39,18 @@ GRAPE_STEPS = (
 REDUCE = {"type": "reduce", "lot_id": "lot-sancheong-sb-1", "new_pallets": 3}
 
 
-def _saas_plan(platform: TestClient, saas_login, **options) -> str:
-    body = {"lot_ids": _register_all(saas_login), **options}
-    created = platform.post(PLATFORM, json=body)
+def _saas_plan(forwarder: TestClient, saas_login, accept: bool = True) -> str:
+    created = forwarder.post(FORWARDER, json={"lot_ids": _register_all(saas_login)})
     assert created.status_code == 201, created.text
     plan_id = created.json()["plan_id"]
-    with database.begin() as db:
-        db.add(PlanForwarderRow(plan_id=plan_id, forwarder_org_id=FORWARDER_ORG_ID))
+    if accept:
+        accept_plan(saas_login, plan_id)
     return plan_id
+
+
+def _without_quantity_policy(plan_id: str) -> None:
+    with database.begin() as db:
+        db.execute(delete(QuantityPolicyRow).where(QuantityPolicyRow.plan_id == plan_id))
 
 
 def _apply(client: TestClient, plan_id: str, event: dict, alternative_id: str) -> dict:
@@ -95,20 +100,21 @@ def _expected_text(charges: list[dict], shipper_id: str) -> str:
     return ". ".join(parts)
 
 
-def _chained_charges(platform: TestClient, plan_id: str) -> list[dict]:
+def _chained_charges(forwarder: TestClient, plan_id: str) -> list[dict]:
     charges = []
     for step in GRAPE_STEPS:
-        chosen = _apply(platform, plan_id, step, "sail_as_is")
+        chosen = _apply(forwarder, plan_id, step, "sail_as_is")
         assert chosen["diff"]["cancellation"]["fee"] > 0
         charges.append(chosen["diff"]["cancellation"])
     return charges
 
 
-def test_order_keeps_every_cumulative_charge(
+def test_legacy_plan_order_keeps_every_cumulative_charge(
     platform_client: TestClient, saas_login, forwarder_client: TestClient
 ) -> None:
-    plan_id = _saas_plan(platform_client, saas_login, auto_accept=True)
-    charges = _chained_charges(platform_client, plan_id)
+    plan_id = _saas_plan(forwarder_client, saas_login)
+    _without_quantity_policy(plan_id)
+    charges = _chained_charges(forwarder_client, plan_id)
     order = _last_order(platform_client, f"/api/plans/{plan_id}/orders")
     assert order["cancellation_charges"] == charges
     assert order["cancellation"] == charges[-1]
@@ -149,13 +155,14 @@ def test_single_charge_order_lists_it(client: TestClient) -> None:
     assert order["cancellation_charges"] == [chosen["diff"]["cancellation"]]
 
 
-def test_legacy_order_lists_its_single_charge(platform_client: TestClient, saas_login) -> None:
-    plan_id = _saas_plan(platform_client, saas_login, auto_accept=True)
-    chosen = _apply(platform_client, plan_id, GRAPE_STEPS[0], "sail_as_is")
+def test_legacy_order_lists_its_single_charge(forwarder_client: TestClient, saas_login) -> None:
+    plan_id = _saas_plan(forwarder_client, saas_login)
+    _without_quantity_policy(plan_id)
+    chosen = _apply(forwarder_client, plan_id, GRAPE_STEPS[0], "sail_as_is")
     charge = chosen["diff"]["cancellation"]
-    session = store.get(plan_id, org_id=PLATFORM_ORG_ID)
+    session = store.get(plan_id, org_id=FORWARDER_ORG_ID)
     assert session is not None
-    order = store.orders(plan_id, org_id=PLATFORM_ORG_ID)[-1]
+    order = store.orders(plan_id, org_id=FORWARDER_ORG_ID)[-1]
     legacy = order.model_copy(update={"cancellation_charges": []})
 
     payer = shipper_order_view(session, legacy, {charge["payer_shipper_id"]})
@@ -184,14 +191,21 @@ def test_pending_arrival_of_changed_lot_is_conflict(client: TestClient) -> None:
     assert unknown.status_code == 422
 
 
-def test_platform_metrics_expire_due_orders_first(platform_client: TestClient, saas_login) -> None:
-    plan_id = _saas_plan(platform_client, saas_login, auto_accept=True)
-    _apply(platform_client, plan_id, REDUCE, "pull_forward")
+def test_platform_metrics_expire_due_orders_first(
+    platform_client: TestClient, forwarder_client: TestClient, saas_login
+) -> None:
+    plan_id = _saas_plan(forwarder_client, saas_login)
+    open_quantity_window()
+    queue_quantity(
+        saas_login("shipper-sancheong"), plan_id, REDUCE["lot_id"], REDUCE["new_pallets"]
+    )
+    _apply(forwarder_client, plan_id, REDUCE, "pull_forward")
     with database.begin() as db:
         assert db.get(PlanRow, plan_id).status == "pending_confirmation"
     store.clock = lambda: LATE
     for path in ("/api/saas/platform/metrics", "/api/saas/platform/business"):
         assert platform_client.get(path).status_code == 200
+    assert platform_client.get("/api/saas/platform/metrics").json()["plan_count"] == 1
     with database.begin() as db:
         row = db.get(PlanRow, plan_id)
         assert row.status == "committed"
@@ -210,14 +224,14 @@ def _all_peak(session: PlanSession) -> PlanSession:
     return session.model_copy(update={"routes": routes})
 
 
-def test_shipper_plan_detail_has_own_genset_lines(platform_client: TestClient, saas_login) -> None:
-    plan_id = _saas_plan(platform_client, saas_login, auto_accept=True)
+def test_shipper_plan_detail_has_own_genset_lines(forwarder_client: TestClient, saas_login) -> None:
+    plan_id = _saas_plan(forwarder_client, saas_login)
     jinju = saas_login("shipper-jinju")
     plain = jinju.get(f"/api/saas/shipper/plans/{plan_id}")
     assert plain.status_code == 200, plain.text
     assert plain.json()["genset_instructions"] == []
 
-    session = store.get(plan_id, org_id=PLATFORM_ORG_ID)
+    session = store.get(plan_id, org_id=FORWARDER_ORG_ID)
     assert session is not None
     peak = _all_peak(session)
     with database.begin() as db:
@@ -293,9 +307,9 @@ def test_replan_pending_ignores_own_rejection_only() -> None:
 
 
 def test_shipper_sees_replan_pending_without_details(
-    platform_client: TestClient, saas_login
+    forwarder_client: TestClient, saas_login
 ) -> None:
-    plan_id = _saas_plan(platform_client, saas_login)
+    plan_id = _saas_plan(forwarder_client, saas_login, accept=False)
     jinju = saas_login("shipper-jinju")
     pohang = saas_login("shipper-pohang")
 
@@ -338,7 +352,7 @@ def test_shipper_sees_replan_pending_without_details(
     assert accepted.status_code == 200, accepted.text
     assert accepted.json()["replan_pending"] is True
 
-    recomputed = platform_client.post(f"{PLATFORM}/{plan_id}/confirmation/recompute", json={})
+    recomputed = forwarder_client.post(f"{FORWARDER}/{plan_id}/confirmation/recompute", json={})
     assert recomputed.status_code == 200, recomputed.text
     assert all(view["replan_pending"] is False for view in views(jinju))
     listed = jinju.get("/api/saas/shipper/plan-confirmations").json()
@@ -356,34 +370,39 @@ def _registered(plan_id: str) -> tuple[list[str], set[str], set[str]]:
 
 
 def test_lot_committed_through_superseded_add_is_not_released_on_rollback(
-    platform_client: TestClient, saas_login, forwarder_client: TestClient
+    saas_login, forwarder_client: TestClient
 ) -> None:
-    plan_id, extra = _plan_with_spare(platform_client, saas_login)
-    _apply_add(platform_client, plan_id, extra)
-    _apply_best(platform_client, plan_id, REDUCE)
-    orders = platform_client.get(f"/api/plans/{plan_id}/orders").json()
+    plan_id, extra = _plan_with_spare(forwarder_client, saas_login)
+    _apply_add(forwarder_client, plan_id, extra)
+    open_quantity_window()
+    queue_quantity(
+        saas_login("shipper-sancheong"), plan_id, REDUCE["lot_id"], REDUCE["new_pallets"]
+    )
+    _apply_best(forwarder_client, plan_id, REDUCE)
+    orders = forwarder_client.get(f"/api/plans/{plan_id}/orders").json()
     assert [o["status"] for o in orders] == ["expired", "proposed"]
-    _confirm_all(platform_client, saas_login, forwarder_client, plan_id, orders[-1]["order_id"])
+    _confirm_all(forwarder_client, saas_login, forwarder_client, plan_id, orders[-1]["order_id"])
     registered, lots, committed = _registered(plan_id)
     assert extra in registered and extra in lots and extra in committed
     assert _status(saas_login, extra) == "planned"
 
+    queue_quantity(saas_login("shipper-pohang"), plan_id, "lot-pohang-gr-1", 3)
     _apply_best(
-        platform_client, plan_id, {"type": "reduce", "lot_id": "lot-pohang-gr-1", "new_pallets": 3}
+        forwarder_client, plan_id, {"type": "reduce", "lot_id": "lot-pohang-gr-1", "new_pallets": 3}
     )
-    latest = platform_client.get(f"/api/plans/{plan_id}").json()["active_order_id"]
-    _reject_order(platform_client, saas_login, plan_id, latest)
-    session = platform_client.get(f"/api/plans/{plan_id}").json()
+    latest = forwarder_client.get(f"/api/plans/{plan_id}").json()["active_order_id"]
+    _reject_order(forwarder_client, saas_login, plan_id, latest)
+    session = forwarder_client.get(f"/api/plans/{plan_id}").json()
     assert session["status"] == "committed"
     registered, lots, committed = _registered(plan_id)
     assert extra in registered and extra in lots and extra in committed
     assert _status(saas_login, extra) == "planned"
 
 
-def test_rolled_back_add_leaves_plan_and_snapshot(platform_client: TestClient, saas_login) -> None:
-    plan_id, extra = _plan_with_spare(platform_client, saas_login)
-    applied = _apply_add(platform_client, plan_id, extra)
-    _reject_order(platform_client, saas_login, plan_id, applied["active_order_id"])
+def test_rolled_back_add_leaves_plan_and_snapshot(forwarder_client: TestClient, saas_login) -> None:
+    plan_id, extra = _plan_with_spare(forwarder_client, saas_login)
+    applied = _apply_add(forwarder_client, plan_id, extra)
+    _reject_order(forwarder_client, saas_login, plan_id, applied["active_order_id"])
     registered, lots, committed = _registered(plan_id)
     assert extra not in registered and extra not in lots and extra not in committed
     assert _status(saas_login, extra) == "registered"

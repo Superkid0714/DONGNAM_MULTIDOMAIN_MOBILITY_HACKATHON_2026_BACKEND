@@ -7,11 +7,11 @@ from saas_fixtures import (
     REAL_PLATFORM_PASSWORD,
     create_real_platform,
     password_client,
+    saas_app,
 )
-from test_onboarding import _lot, _onboarded, _signup
+from test_onboarding import _lot, _onboarded, _real_forwarder, _signup
 
 from freshswitch_backend.data.loader import get_scenario
-from freshswitch_backend.main import app
 
 PRODUCTS = "/api/saas/shipper/products"
 PRODUCT = {
@@ -90,13 +90,14 @@ def test_edit_replaces_product_and_keeps_existing_lot_conditions() -> None:
 
 def test_custom_product_registers_and_optimizes_without_changing_existing_plan() -> None:
     create_real_platform()
-    platform = password_client(app, REAL_PLATFORM_EMAIL, REAL_PLATFORM_PASSWORD)
+    platform = password_client(saas_app, REAL_PLATFORM_EMAIL, REAL_PLATFORM_PASSWORD)
     owner, _ = _onboarded("products-plan@example.com", "운송 농장")
     product = _create(owner)
     registered = owner.post("/api/saas/shipper/lots", json=_lot(product["id"], pallets=1))
     assert registered.status_code == 201, registered.text
     lot_id = registered.json()["registered"]["id"]
-    planned = platform.post("/api/saas/platform/plans", json={"lot_ids": [lot_id]})
+    forwarder = _real_forwarder("products-forwarder@example.com", "품목 포워더")
+    planned = forwarder.post("/api/saas/forwarder/plans", json={"lot_ids": [lot_id]})
     assert planned.status_code == 201, planned.text
     session = planned.json()
     assert any(
@@ -212,7 +213,7 @@ def test_product_gas_total_and_merged_patch_are_validated() -> None:
 
 
 def test_product_write_requires_shipper_session_and_csrf() -> None:
-    anonymous = TestClient(app)
+    anonymous = TestClient(saas_app)
     assert anonymous.get(PRODUCTS).status_code == 401
     assert anonymous.post(PRODUCTS, json=PRODUCT).status_code == 401
     forwarder = _signup("products-forwarder@example.com", "포워더", "forwarder")

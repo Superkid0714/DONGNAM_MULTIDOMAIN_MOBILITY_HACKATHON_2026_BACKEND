@@ -3,14 +3,12 @@ from urllib.parse import quote
 
 import pytest
 from fastapi.testclient import TestClient
-from saas_fixtures import seed_client
+from saas_fixtures import SCENARIO_DEVICE_ID, forwarder_scenario_plan, seed_client
 
 from freshswitch_backend.config import get_settings
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.lots import ANY_ORG, lot_store
 from freshswitch_backend.main import create_app
-from freshswitch_backend.persistence import database
-from freshswitch_backend.persistence.tables import PlanForwarderRow
 from freshswitch_backend.planning.store import store
 
 CSRF = {"X-Requested-With": "freshswitch"}
@@ -61,9 +59,9 @@ def _keys(feed: dict) -> list[str]:
     return [f"{a['container_id']}:{a['key']}" for a in feed["alerts"]]
 
 
-def test_demo_action_updates_reappear_in_feed_and_stream(client: TestClient) -> None:
-    plan_id = client.post("/api/plans", json={"scenario_id": "default"}).json()["plan_id"]
-    _simulate(client, plan_id)
+def test_forwarder_action_updates_reappear_in_feed_and_stream(demo_tenants) -> None:
+    client, plan_id = forwarder_scenario_plan()
+    _simulate(client, plan_id, device_id=SCENARIO_DEVICE_ID)
     before = _feed(client, plan_id)
     keys = _keys(before)
     assert keys and len(set(keys)) == len(keys)
@@ -121,14 +119,14 @@ def saas_plan(saas_app) -> str:
     lot = next(item for item in scenario.lots if item.id == LOT_ID)
     lot_store.create(lambda _: (lot, scenario.id, None), org_id=SHIPPER)
     session = store.create(
-        scenario, registered_lot_ids=[LOT_ID], org_id=PLATFORM, lot_org_id=ANY_ORG
+        scenario, registered_lot_ids=[LOT_ID], org_id=FORWARDER, lot_org_id=ANY_ORG
     )
-    with database.begin() as db:
-        db.add(PlanForwarderRow(plan_id=session.plan_id, forwarder_org_id=FORWARDER))
-    platform = _login(saas_app, PLATFORM)
-    registered = platform.post("/api/saas/devices", json={"device_id": "demo-sensor-01"}, headers=CSRF)
+    forwarder = _login(saas_app, FORWARDER)
+    registered = forwarder.post(
+        "/api/saas/devices", json={"device_id": "demo-sensor-01"}, headers=CSRF
+    )
     assert registered.status_code == 201, registered.text
-    _simulate(platform, session.plan_id, "demo-sensor-01")
+    _simulate(forwarder, session.plan_id, "demo-sensor-01")
     return session.plan_id
 
 

@@ -3,7 +3,7 @@ import re
 
 from fastapi.testclient import TestClient
 from test_coldchain_power_plan import _with_peak
-from test_forwarder_execution_card import _mixed_plan, _request, _saas_plan, _scenario
+from test_forwarder_execution_card import _mixed_plan, _reduced, _request, _saas_plan, _scenario
 from test_saas_api import REDUCE
 
 from freshswitch_backend.api.saas_forwarder import _card
@@ -87,20 +87,12 @@ def test_plain_text_for_every_request_kind() -> None:
 
 
 def test_shipper_orders_have_plain_text_without_others(
-    platform_client: TestClient,
     saas_login,
     forwarder_client: TestClient,
     shipper_client: TestClient,
 ) -> None:
-    plan_id = _saas_plan(platform_client, saas_login)
-    assert (
-        platform_client.post(f"/api/plans/{plan_id}/events", json={"event": REDUCE}).status_code
-        == 200
-    )
-    applied = platform_client.post(
-        f"/api/plans/{plan_id}/apply", json={"alternative_id": "pull_forward"}
-    )
-    assert applied.status_code == 200, applied.text
+    plan_id = _saas_plan(saas_login)
+    _reduced(saas_login, forwarder_client, plan_id)
     forwarder = forwarder_client.get(f"/api/saas/forwarder/plans/{plan_id}/orders").json()
     sent = next(r for r in forwarder[0]["requests"] if r["kind"] == "booking_amendment")
     assert sent["document_action"] == "si_vgm_correction"
@@ -128,10 +120,8 @@ def test_demo_orders_have_no_saas_fields(client: TestClient) -> None:
         assert request["document_action"] is None and request["plain_text"] is None
 
 
-def test_default_card_has_no_genset_lines(
-    platform_client: TestClient, saas_login, forwarder_client: TestClient
-) -> None:
-    plan_id = _saas_plan(platform_client, saas_login)
+def test_default_card_has_no_genset_lines(saas_login, forwarder_client: TestClient) -> None:
+    plan_id = _saas_plan(saas_login)
     card = forwarder_client.get(f"/api/saas/forwarder/plans/{plan_id}/execution-card").json()
     assert card["genset_instructions"] == []
     detail = forwarder_client.get(f"/api/saas/forwarder/plans/{plan_id}").json()

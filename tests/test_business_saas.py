@@ -1,6 +1,6 @@
 from fastapi.testclient import TestClient
-from saas_fixtures import PLATFORM_ORG_ID
-from test_metrics import _platform_plan, _scenario
+from saas_fixtures import FORWARDER_ORG_ID
+from test_metrics import _accepted_plan, _scenario
 
 from freshswitch_backend.analysis import business_matrix
 from freshswitch_backend.analysis.benchmark import tariff_empty_slot_cost
@@ -107,8 +107,8 @@ def test_years_query_overrides(platform_client: TestClient) -> None:
 
 
 def test_platform_business_uses_org_plans(platform_client: TestClient, saas_login) -> None:
-    session = _platform_plan(platform_client, saas_login)
-    stored = store.get(session["plan_id"], org_id=PLATFORM_ORG_ID)
+    session = _accepted_plan(saas_login)
+    stored = store.get(session["plan_id"], org_id=FORWARDER_ORG_ID)
     assert stored is not None
     response = platform_client.get("/api/saas/platform/business", params={"month": "2026-11"})
     assert response.status_code == 200, response.text
@@ -155,7 +155,7 @@ def _business(client: TestClient, **params) -> dict:
 
 
 def test_platform_business_settlement_gap(platform_client: TestClient, saas_login) -> None:
-    _platform_plan(platform_client, saas_login)
+    _accepted_plan(saas_login)
     body = _business(platform_client)
     for line in body["lines"]:
         gap = sum(p["tariff_operational_gap"] for p in line["plans"])
@@ -172,11 +172,13 @@ def test_platform_business_settlement_gap(platform_client: TestClient, saas_logi
     assert empty["annual_net_with_settlement"] is None
 
 
-def test_platform_business_applies_quality_refund(platform_client: TestClient, saas_login) -> None:
-    session = _platform_plan(platform_client, saas_login)
+def test_platform_business_applies_quality_refund(
+    platform_client: TestClient, saas_login, forwarder_client: TestClient
+) -> None:
+    session = _accepted_plan(saas_login)
     plan_id = session["plan_id"]
     before = _business(platform_client)["lines"][0]
-    arrival = platform_client.post(
+    arrival = forwarder_client.post(
         f"/api/plans/{plan_id}/settlement/arrival",
         json={"lot_id": "lot-sancheong-sb-1", "inspected_loss_pct": 9},
     )
@@ -185,7 +187,7 @@ def test_platform_business_applies_quality_refund(platform_client: TestClient, s
     refund = metrics.json()["quality_refund_krw"]
     assert refund > 0
     after = _business(platform_client)["lines"][0]
-    stored = store.get(plan_id, org_id=PLATFORM_ORG_ID)
+    stored = store.get(plan_id, org_id=FORWARDER_ORG_ID)
     assert stored is not None
     shipper = next(lot.shipper_id for lot in stored.scenario.lots if lot.id == "lot-sancheong-sb-1")
     assert all(a.mode == "sea" for a in stored.plan.assignments if a.shipper_id == shipper)

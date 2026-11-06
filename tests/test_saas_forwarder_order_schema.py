@@ -1,8 +1,8 @@
-from freshswitch_backend.main import create_app
+from saas_fixtures import saas_app
 
 
 def test_saas_openapi_forwarder_orders_typed_with_nullable_money() -> None:
-    spec = create_app().openapi()
+    spec = saas_app.openapi()
     schemas = spec["components"]["schemas"]
     orders = spec["paths"]["/api/saas/forwarder/plans/{plan_id}/orders"]["get"]
     items = orders["responses"]["200"]["content"]["application/json"]["schema"]["items"]

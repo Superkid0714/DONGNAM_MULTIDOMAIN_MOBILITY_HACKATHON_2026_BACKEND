@@ -2,7 +2,7 @@ import json
 
 import pytest
 from fastapi.testclient import TestClient
-from saas_fixtures import FORWARDER_ORG_ID
+from saas_fixtures import FORWARDER_ORG_ID, accept_plan
 
 from freshswitch_backend.analysis.business import (
     DEFAULT_FORWARDER_SHARE,
@@ -14,9 +14,7 @@ from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.domain.models import ContainerShipperSettlement, Scenario, Settlement
 from freshswitch_backend.optimize.costs import CostModel
 from freshswitch_backend.optimize.settlement import tariff_sheet, uses_usage_fee
-from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.seed import shipper_org_id
-from freshswitch_backend.persistence.tables import PlanForwarderRow
 from freshswitch_backend.planning.service import build_plan
 from freshswitch_backend.replan.engine import replan
 from freshswitch_backend.replan.models import ReduceEvent
@@ -194,7 +192,7 @@ def test_demo_settlement_view_carries_billing_fields(client: TestClient) -> None
     assert rows["sh-jinju"]["billing_rule"] == "performance"
 
 
-def _saas_plan(platform_client: TestClient, saas_login) -> tuple[str, dict[str, str]]:
+def _saas_plan(saas_login) -> tuple[str, dict[str, str]]:
     ids = []
     for lot in _scenario().lots:
         shipper = saas_login(shipper_org_id(lot.shipper_id))
@@ -212,8 +210,9 @@ def _saas_plan(platform_client: TestClient, saas_login) -> tuple[str, dict[str, 
         )
         assert response.status_code == 201, response.text
         ids.append(response.json()["registered"]["id"])
-    created = platform_client.post("/api/saas/platform/plans", json={"lot_ids": ids})
+    created = saas_login(FORWARDER_ORG_ID).post("/api/saas/forwarder/plans", json={"lot_ids": ids})
     assert created.status_code == 201, created.text
+    accept_plan(saas_login, created.json()["plan_id"])
     lots = {lot.id: registered for lot, registered in zip(_scenario().lots, ids, strict=True)}
     return created.json()["plan_id"], lots
 
@@ -221,7 +220,7 @@ def _saas_plan(platform_client: TestClient, saas_login) -> tuple[str, dict[str, 
 def test_saas_settlements_carry_billing_rule(
     platform_client: TestClient, saas_login, forwarder_client: TestClient
 ) -> None:
-    plan_id, _ = _saas_plan(platform_client, saas_login)
+    plan_id, _ = _saas_plan(saas_login)
     summary = platform_client.get("/api/saas/platform/settlements").json()
     assert len(summary) == 1
     row = summary[0]
@@ -253,8 +252,6 @@ def test_saas_settlements_carry_billing_rule(
     assert [c["total_fee"] for c in containers] == [100_000]
     assert containers[0]["shippers"][0]["billing_rule"] == "usage_fee"
 
-    with database.begin() as db:
-        db.add(PlanForwarderRow(plan_id=plan_id, forwarder_org_id=FORWARDER_ORG_ID))
     forwarded = forwarder_client.get(f"/api/saas/forwarder/plans/{plan_id}").json()
     text = json.dumps(forwarded["plan"], ensure_ascii=False)
     assert forwarded["plan"]["settlements"] == []
@@ -345,10 +342,10 @@ def test_quality_refund_keeps_fee_parts_reconcilable(client: TestClient) -> None
 
 
 def test_saas_platform_settlement_shows_refund_next_to_fee_parts(
-    platform_client: TestClient, saas_login
+    platform_client: TestClient, saas_login, forwarder_client: TestClient
 ) -> None:
-    plan_id, lots = _saas_plan(platform_client, saas_login)
-    arrival = platform_client.post(
+    plan_id, lots = _saas_plan(saas_login)
+    arrival = forwarder_client.post(
         f"/api/plans/{plan_id}/settlement/arrival",
         json={"lot_id": lots["lot-sancheong-sb-1"], "inspected_loss_pct": 9},
     )

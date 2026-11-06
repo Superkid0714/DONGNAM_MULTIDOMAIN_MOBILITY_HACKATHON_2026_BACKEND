@@ -5,10 +5,10 @@ from alembic import command
 from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
 from fastapi.testclient import TestClient
-from saas_fixtures import PLATFORM_ORG_ID
+from saas_fixtures import FORWARDER_ORG_ID, accept_plan
 from sqlalchemy import text
 from test_deep_review_views import CANCEL, _apply, _renamed, _session
-from test_saas_api import _assign, _platform_plan
+from test_saas_api import _forwarder_plan
 from test_saas_e2e_round1 import _confirm_all
 
 from freshswitch_backend.api import saas_views
@@ -45,11 +45,11 @@ def _reply(request_id: str, accepted: bool, note: str) -> OrderLogEntry:
 
 
 def _order_with_replies(
-    platform_client: TestClient, saas_login
+    forwarder_client: TestClient, saas_login
 ) -> tuple[PlanSession, ExecutionOrder]:
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
-    order_id = _apply(platform_client, plan_id, CANCEL)
-    order = store.order(plan_id, order_id, org_id=PLATFORM_ORG_ID)
+    plan_id = _forwarder_plan(saas_login)["plan_id"]
+    order_id = _apply(forwarder_client, plan_id, CANCEL)
+    order = store.order(plan_id, order_id, org_id=FORWARDER_ORG_ID)
     confirmed = OrderLogEntry(
         at=AT,
         actor="forwarder",
@@ -74,9 +74,9 @@ def _order_with_replies(
 
 
 def test_shipper_order_log_drops_replies_for_other_shippers_requests(
-    platform_client: TestClient, saas_login
+    forwarder_client: TestClient, saas_login
 ) -> None:
-    session, order = _order_with_replies(platform_client, saas_login)
+    session, order = _order_with_replies(forwarder_client, saas_login)
 
     view = saas_views.shipper_order_view(session, order, {"sh-jinju"})
     assert [r["request_id"] for r in view["requests"]] == ["REQ-1"]
@@ -100,13 +100,13 @@ def test_shipper_order_log_drops_replies_for_other_shippers_requests(
 
 
 def test_real_forwarder_replies_for_other_shippers_requests_stay_hidden(
-    platform_client: TestClient, saas_login, forwarder_client: TestClient
+    saas_login, forwarder_client: TestClient
 ) -> None:
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
-    _assign(plan_id)
-    order_id = _apply(platform_client, plan_id, CANCEL)
-    _confirm_all(platform_client, saas_login, forwarder_client, plan_id, order_id)
-    order = store.order(plan_id, order_id, org_id=PLATFORM_ORG_ID)
+    plan_id = _forwarder_plan(saas_login)["plan_id"]
+    accept_plan(saas_login, plan_id)
+    order_id = _apply(forwarder_client, plan_id, CANCEL)
+    _confirm_all(forwarder_client, saas_login, forwarder_client, plan_id, order_id)
+    order = store.order(plan_id, order_id, org_id=FORWARDER_ORG_ID)
     assert order.status == "forwarder_confirmed"
     jinju_lots = {"lot-jinju-sb-1"}
     own = next(r for r in order.requests if jinju_lots & set(r.lot_ids))
@@ -126,7 +126,7 @@ def test_real_forwarder_replies_for_other_shippers_requests_stay_hidden(
         )
         assert response.status_code == 200, response.text
 
-    stored = store.order(plan_id, order_id, org_id=PLATFORM_ORG_ID)
+    stored = store.order(plan_id, order_id, org_id=FORWARDER_ORG_ID)
     replies = [e for e in stored.log if e.note in {OWN_NOTE, *notes.values()}]
     assert len(replies) == len(foreign) + 1
     for entry in replies:
@@ -151,8 +151,8 @@ def test_real_forwarder_replies_for_other_shippers_requests_stay_hidden(
     assert "3,200,000" not in dumped
 
 
-def _short_ids_session(platform_client: TestClient, saas_login, own: str | None = None):
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
+def _short_ids_session(saas_login, own: str | None = None):
+    plan_id = _forwarder_plan(saas_login)["plan_id"]
     session = _renamed(_session(plan_id), "lot-sancheong-sb-1", "20231")
     session = _renamed(session, "lot-miryang-sb-2", "B7")
     if own is not None:
@@ -160,10 +160,8 @@ def _short_ids_session(platform_client: TestClient, saas_login, own: str | None 
     return session
 
 
-def test_short_and_numeric_lot_ids_are_anonymized_in_lot_lists(
-    platform_client: TestClient, saas_login
-) -> None:
-    session = _short_ids_session(platform_client, saas_login)
+def test_short_and_numeric_lot_ids_are_anonymized_in_lot_lists(saas_login) -> None:
+    session = _short_ids_session(saas_login)
     anonymizer = saas_views.shipper_anonymizer(session, {"sh-jinju"})
     numeric, short, long_ = (
         anonymizer.lot("20231"),
@@ -196,10 +194,8 @@ def test_short_and_numeric_lot_ids_are_anonymized_in_lot_lists(
     )
 
 
-def test_list_anonymization_keeps_ordinary_numbers_and_words(
-    platform_client: TestClient, saas_login
-) -> None:
-    session = _short_ids_session(platform_client, saas_login)
+def test_list_anonymization_keeps_ordinary_numbers_and_words(saas_login) -> None:
+    session = _short_ids_session(saas_login)
     anonymizer = saas_views.shipper_anonymizer(session, {"sh-jinju"})
     for ordinary in (
         "화물 총중량 20231kg, VGM 20231 kg 기준",
@@ -212,10 +208,8 @@ def test_list_anonymization_keeps_ordinary_numbers_and_words(
         assert anonymizer.text(ordinary) == ordinary
 
 
-def test_own_lot_sharing_prefix_with_other_short_id_is_kept(
-    platform_client: TestClient, saas_login
-) -> None:
-    session = _short_ids_session(platform_client, saas_login, own="B7.5")
+def test_own_lot_sharing_prefix_with_other_short_id_is_kept(saas_login) -> None:
+    session = _short_ids_session(saas_login, own="B7.5")
     anonymizer = saas_views.shipper_anonymizer(session, {"sh-jinju"})
     short = anonymizer.lot("B7")
     assert anonymizer.lot("B7.5") == "B7.5"
@@ -226,10 +220,8 @@ def _head() -> str | None:
     return ScriptDirectory.from_config(migration_config()).get_current_head()
 
 
-def test_downgrade_0012_converts_shipper_confirmation_status(
-    platform_client: TestClient, saas_login
-) -> None:
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
+def test_downgrade_0012_converts_shipper_confirmation_status(saas_login) -> None:
+    plan_id = _forwarder_plan(saas_login)["plan_id"]
     config = migration_config()
     with database.engine.connect() as conn:
         trans = conn.begin()
@@ -285,4 +277,4 @@ def test_downgrade_0012_converts_shipper_confirmation_status(
             trans.rollback()
     with database.engine.connect() as conn:
         assert MigrationContext.configure(conn).get_current_revision() == _head()
-    assert store.get(plan_id, org_id=PLATFORM_ORG_ID) is not None
+    assert store.get(plan_id, org_id=FORWARDER_ORG_ID) is not None

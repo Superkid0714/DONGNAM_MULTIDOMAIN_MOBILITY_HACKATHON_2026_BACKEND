@@ -3,11 +3,10 @@ from datetime import UTC, datetime, timedelta
 from itertools import pairwise
 
 import pytest
-from fastapi.testclient import TestClient
-from saas_fixtures import SAAS_CSRF
 from sqlalchemy import select
 
-from freshswitch_backend.coldchain import ColdchainParams
+from freshswitch_backend.api.plans import CreatePlanRequest, create_tenant_plan
+from freshswitch_backend.coldchain import ColdchainParams, coldchain_store
 from freshswitch_backend.coldchain.models import Reading
 from freshswitch_backend.coldchain.telemetry import (
     luhn_valid,
@@ -16,7 +15,6 @@ from freshswitch_backend.coldchain.telemetry import (
     setpoint_for,
 )
 from freshswitch_backend.coldchain.twin import TwinContext, build_context, evaluate
-from freshswitch_backend.config import get_settings
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.domain.container_numbers import (
     container_number,
@@ -24,8 +22,8 @@ from freshswitch_backend.domain.container_numbers import (
     iso6346_check_digit,
     printed_container_number,
 )
-from freshswitch_backend.main import create_app
 from freshswitch_backend.persistence import database
+from freshswitch_backend.persistence.sandbox_world import create_visitor_world
 from freshswitch_backend.persistence.tables import BindingRow, DeviceRow, ForwarderResourceRow
 from freshswitch_backend.planning.service import build_plan
 
@@ -165,37 +163,22 @@ def test_point_band_widens_to_reefer_tolerance() -> None:
             assert (ctx.band_min_c, ctx.band_max_c) in {(0.0, 2.0), (-0.5, 0.0)}
 
 
-@pytest.fixture
-def saas_app(demo_tenants):
-    return create_app(get_settings().model_copy(update={"saas_mode": True}))
-
-
-def test_visitor_plan_starts_with_realistic_telemetry(saas_app) -> None:
-    client = TestClient(saas_app, base_url="https://testserver", headers=SAAS_CSRF)
-    me = client.post("/api/auth/demo-login", json={"new_world": True})
-    assert me.status_code == 200, me.text
-    world_id = me.json()["world"]["world_id"]
-    owner = next(
-        item["org_id"]
-        for item in me.json()["memberships"]
-        if item["org_id"].endswith("forwarder-dongnam")
+def test_visitor_plan_starts_with_realistic_telemetry(demo_tenants) -> None:
+    world = create_visitor_world()
+    world_id = world.world_id
+    owner = f"{world_id}-forwarder-dongnam"
+    body = create_tenant_plan(CreatePlanRequest(include_registered=True), owner).model_dump(
+        mode="json"
     )
-    assert client.put("/api/auth/active-org", json={"org_id": owner}).status_code == 200
-    created = client.post("/api/plans", json={"include_registered": True})
-    assert created.status_code == 201, created.text
-    body = created.json()
     plan_id = body["plan_id"]
     used = sorted({a["container_id"] for a in body["plan"]["assignments"] if a["mode"] == "sea"})
     assert used
     assert all(is_iso6346(cid) for cid in used)
-    summaries = client.get("/api/coldchain/containers", params={"plan_id": plan_id})
-    assert summaries.status_code == 200, summaries.text
-    rows = {row["container_id"]: row for row in summaries.json()}
+    summaries = coldchain_store.summaries(plan_id, owner)
+    rows = {row.container_id: row.model_dump(mode="json") for row in summaries}
     assert set(rows) == set(used)
     for container_id in used:
-        state = client.get(
-            f"/api/coldchain/containers/{container_id}", params={"plan_id": plan_id}
-        ).json()
+        state = coldchain_store.state(container_id, plan_id, 720, owner).model_dump(mode="json")
         assert state["has_data"] and state["status"] == "normal"
         assert 26 * 12 <= state["reading_count"] <= 34 * 12 + 1
         assert len(state["device_ids"]) == 1

@@ -1,7 +1,7 @@
 from datetime import UTC, date, datetime
 
 import pytest
-from saas_fixtures import PLATFORM_ORG_ID
+from saas_fixtures import FORWARDER_ORG_ID
 from sqlalchemy import func, select
 
 from freshswitch_backend.data.loader import get_scenario
@@ -165,25 +165,30 @@ def test_seed_lots_cli(demo_tenants, capsys) -> None:
     assert capsys.readouterr().out.strip() == "lots=0"
 
 
-def test_seeded_pool_plans_into_reference_fill(demo_tenants, platform_client) -> None:
+def test_seeded_pool_plans_into_reference_fill(
+    demo_tenants, platform_client, forwarder_client
+) -> None:
     run_lots()
     pool = platform_client.get("/api/saas/platform/lots", params={"status": "registered"})
     assert pool.status_code == 200
     assert len(pool.json()) == 6
 
-    created = platform_client.post("/api/saas/platform/plans", json={"include_registered": True})
+    created = forwarder_client.post("/api/saas/forwarder/plans", json={"include_registered": True})
     assert created.status_code == 201, created.text
     session = created.json()
-    assert _containers(session) == {"CA-01": 17, "CA-02": 18}
-    capacities = {c.id: c.capacity_pallets for c in get_scenario("default").containers}
-    assert capacities["CA-01"] == capacities["CA-02"] == 20
+    used = _containers(session)
+    assert sorted(used.values()) == [17, 18]
+    capacities = {c["id"]: c["capacity_pallets"] for c in session["scenario"]["containers"]}
+    assert {capacities[container_id] for container_id in used} == {20}
     with database.begin() as db:
-        assert db.get(PlanRow, session["plan_id"]).org_id == PLATFORM_ORG_ID
+        assert db.get(PlanRow, session["plan_id"]).org_id == FORWARDER_ORG_ID
         statuses = set(db.scalars(select(LotRow.status)))
     assert statuses == {"planned"}
 
 
-def test_seed_lots_switch_to_fuel_shock_pool(demo_tenants, platform_client) -> None:
+def test_seed_lots_switch_to_fuel_shock_pool(
+    demo_tenants, platform_client, forwarder_client
+) -> None:
     assert run_lots() == 6
     fuel = get_scenario("fuel-shock")
     assert run_lots(scenario_id="fuel-shock") == len(fuel.lots)
@@ -195,8 +200,8 @@ def test_seed_lots_switch_to_fuel_shock_pool(demo_tenants, platform_client) -> N
     pool = platform_client.get("/api/saas/platform/lots", params={"scenario_id": "fuel-shock"})
     assert pool.status_code == 200
     assert len(pool.json()) == len(fuel.lots)
-    created = platform_client.post(
-        "/api/saas/platform/plans",
+    created = forwarder_client.post(
+        "/api/saas/forwarder/plans",
         json={"scenario_id": "fuel-shock", "include_registered": True},
     )
     assert created.status_code == 201, created.text

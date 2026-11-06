@@ -4,12 +4,11 @@ from datetime import datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
-from saas_fixtures import SAAS_CSRF
+from saas_fixtures import SAAS_CSRF, saas_app
 from sqlalchemy import func, select
 from test_onboarding import _lot, _onboarded
 from test_saas_resource_invariants import PLANS, _forwarder, _resource
 
-from freshswitch_backend.main import app
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.tables import ChangeRequestRow, PlanRow
 from freshswitch_backend.planning.store import store
@@ -127,7 +126,9 @@ def test_concurrent_same_nonce_creates_one_change_request(policy_plan):
     context = policy_plan
     context["clock"][0] = context["cutoff"] - timedelta(days=1)
     quote = _quote(context)
-    clients = [TestClient(app, base_url="https://testserver", headers=SAAS_CSRF) for _ in range(2)]
+    clients = [
+        TestClient(saas_app, base_url="https://testserver", headers=SAAS_CSRF) for _ in range(2)
+    ]
     for client in clients:
         client.cookies.update(context["shipper"].cookies)
     barrier = threading.Barrier(2)
@@ -336,7 +337,9 @@ def _prepare_refill_offer(context):
 def test_two_sessions_accept_one_offer_without_duplicate_lot_claim(policy_plan):
     context = policy_plan
     offer = _prepare_refill_offer(context)
-    clients = [TestClient(app, base_url="https://testserver", headers=SAAS_CSRF) for _ in range(2)]
+    clients = [
+        TestClient(saas_app, base_url="https://testserver", headers=SAAS_CSRF) for _ in range(2)
+    ]
     for client in clients:
         client.cookies.update(context["shipper"].cookies)
     barrier = threading.Barrier(2)
@@ -365,7 +368,7 @@ def test_offer_acceptance_exactly_at_expiry_cannot_claim_capacity(policy_plan):
     context = policy_plan
     offer = _prepare_refill_offer(context)
     context["clock"][0] = datetime.fromisoformat(offer["expires_at"])
-    restarted_client = TestClient(app, base_url="https://testserver", headers=SAAS_CSRF)
+    restarted_client = TestClient(saas_app, base_url="https://testserver", headers=SAAS_CSRF)
     restarted_client.cookies.update(context["shipper"].cookies)
     response = restarted_client.post(
         f"/api/saas/shipper/refill-offers/{offer['offer_id']}/accept",

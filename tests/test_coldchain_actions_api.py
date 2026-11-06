@@ -2,14 +2,12 @@ from urllib.parse import quote
 
 import pytest
 from fastapi.testclient import TestClient
-from saas_fixtures import seed_client
+from saas_fixtures import SCENARIO_DEVICE_ID, forwarder_scenario_plan, seed_client
 
 from freshswitch_backend.config import get_settings
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.lots import ANY_ORG, lot_store
 from freshswitch_backend.main import create_app
-from freshswitch_backend.persistence import database
-from freshswitch_backend.persistence.tables import PlanForwarderRow
 from freshswitch_backend.planning.store import store
 
 CSRF = {"X-Requested-With": "freshswitch"}
@@ -50,9 +48,9 @@ def _open_count(client: TestClient, plan_id: str) -> int:
     return next(r["open_actions"] for r in rows if r["container_id"] == "CA-01")
 
 
-def test_demo_action_accept_then_complete(client: TestClient) -> None:
-    plan_id = client.post("/api/plans", json={"scenario_id": "default"}).json()["plan_id"]
-    _simulate(client, plan_id)
+def test_forwarder_action_accept_then_complete(demo_tenants) -> None:
+    client, plan_id = forwarder_scenario_plan()
+    _simulate(client, plan_id, device_id=SCENARIO_DEVICE_ID)
     actions = _state(client, plan_id)["actions"]
     assert actions and all(a["status"] == "open" for a in actions)
     total = _open_count(client, plan_id)
@@ -63,7 +61,7 @@ def test_demo_action_accept_then_complete(client: TestClient) -> None:
     assert accepted.status_code == 200, accepted.text
     body = accepted.json()
     assert body["status"] == "accepted"
-    assert body["accepted_by"]["org_type"] == "platform"
+    assert body["accepted_by"]["org_type"] == "forwarder"
     assert body["accepted_at"] is not None
     assert body["note"] == "접수"
     assert _open_count(client, plan_id) == total
@@ -89,9 +87,9 @@ def test_demo_action_accept_then_complete(client: TestClient) -> None:
     assert unknown.status_code in (404, 422)
 
 
-def test_complete_without_accept_fills_accept_fields(client: TestClient) -> None:
-    plan_id = client.post("/api/plans", json={"scenario_id": "default"}).json()["plan_id"]
-    _simulate(client, plan_id)
+def test_complete_without_accept_fills_accept_fields(demo_tenants) -> None:
+    client, plan_id = forwarder_scenario_plan()
+    _simulate(client, plan_id, device_id=SCENARIO_DEVICE_ID)
     key = _state(client, plan_id)["actions"][-1]["key"]
     done = client.post(_path("CA-01", key, "complete"), params={"plan_id": plan_id})
     assert done.status_code == 200
@@ -114,14 +112,14 @@ def saas_plan(saas_app) -> str:
     lot = next(item for item in scenario.lots if item.id == LOT_ID)
     lot_store.create(lambda _: (lot, scenario.id, None), org_id=SHIPPER)
     session = store.create(
-        scenario, registered_lot_ids=[LOT_ID], org_id=PLATFORM, lot_org_id=ANY_ORG
+        scenario, registered_lot_ids=[LOT_ID], org_id=FORWARDER, lot_org_id=ANY_ORG
     )
-    with database.begin() as db:
-        db.add(PlanForwarderRow(plan_id=session.plan_id, forwarder_org_id=FORWARDER))
-    platform = _login(saas_app, PLATFORM)
-    registered = platform.post("/api/saas/devices", json={"device_id": "demo-sensor-01"}, headers=CSRF)
+    forwarder = _login(saas_app, FORWARDER)
+    registered = forwarder.post(
+        "/api/saas/devices", json={"device_id": "demo-sensor-01"}, headers=CSRF
+    )
     assert registered.status_code == 201, registered.text
-    _simulate(platform, session.plan_id, device_id="demo-sensor-01")
+    _simulate(forwarder, session.plan_id, device_id="demo-sensor-01")
     return session.plan_id
 
 
@@ -134,17 +132,18 @@ def test_saas_roles_for_action_updates(saas_app, saas_plan: str) -> None:
     assert denied.status_code == 403
     outsider = _login(saas_app, OUTSIDER_FORWARDER)
     assert outsider.post(_path("CA-01", keys[0], "accept"), params=params).status_code == 404
-    accepted = platform.post(_path("CA-01", keys[0], "accept"), params=params)
+    assert platform.post(_path("CA-01", keys[0], "accept"), params=params).status_code == 403
+    forwarder = _login(saas_app, FORWARDER)
+    accepted = forwarder.post(_path("CA-01", keys[0], "accept"), params=params)
     assert accepted.status_code == 200
     assert accepted.json()["accepted_by"] == {
-        "org_type": "platform",
-        "org_id": PLATFORM,
+        "org_type": "forwarder",
+        "org_id": FORWARDER,
         "user_id": accepted.json()["accepted_by"]["user_id"],
     }
-    forwarder = _login(saas_app, FORWARDER)
     done = forwarder.post(_path("CA-01", keys[0], "complete"), params=params)
     assert done.status_code == 200, done.text
-    assert done.json()["accepted_by"]["org_type"] == "platform"
+    assert done.json()["accepted_by"]["org_type"] == "forwarder"
     assert done.json()["done_by"]["org_type"] == "forwarder"
     assert done.json()["done_by"]["org_id"] == FORWARDER
     seen = next(a for a in _state(shipper, saas_plan)["actions"] if a["key"] == keys[0])
@@ -176,11 +175,11 @@ def test_saas_container_reset_scope(saas_app, saas_plan: str) -> None:
     assert outsider.delete(path, params=params).status_code == 404
     other_shipper = _login(saas_app, "shipper-sancheong")
     assert other_shipper.delete(path, params=params).status_code == 404
-    forwarder = _login(saas_app, FORWARDER)
-    assert forwarder.delete(path, params=params).status_code == 404
     platform = _login(saas_app, PLATFORM)
     assert _state(platform, saas_plan)["reading_count"] > 0
-    assert platform.delete(path, params=params).status_code == 204
-    assert platform.delete(path, params=params).status_code == 404
+    assert platform.delete(path, params=params).status_code == 403
+    forwarder = _login(saas_app, FORWARDER)
+    assert forwarder.delete(path, params=params).status_code == 204
+    assert forwarder.delete(path, params=params).status_code == 404
     rows = platform.get("/api/coldchain/containers", params=params).json()
     assert all(row["container_id"] != "CA-01" for row in rows)

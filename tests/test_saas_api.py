@@ -1,7 +1,15 @@
 import json
 
 from fastapi.testclient import TestClient
-from saas_fixtures import FORWARDER_ORG_ID, SAAS_CSRF, login_client
+from saas_fixtures import (
+    FORWARDER_ORG_ID,
+    SAAS_CSRF,
+    accept_plan,
+    login_client,
+    open_quantity_window,
+    queue_quantity,
+)
+from sqlalchemy import delete
 
 from freshswitch_backend.config import get_settings
 from freshswitch_backend.data.loader import get_scenario
@@ -55,15 +63,17 @@ def _register_all(saas_login) -> list[str]:
     return ids
 
 
-def _platform_plan(platform_client: TestClient, saas_login) -> dict:
+def _forwarder_plan(saas_login, forwarder_org_id: str = FORWARDER_ORG_ID) -> dict:
     ids = _register_all(saas_login)
-    response = platform_client.post("/api/saas/platform/plans", json={"lot_ids": ids})
+    planner = saas_login(forwarder_org_id)
+    response = planner.post("/api/saas/forwarder/plans", json={"lot_ids": ids})
     assert response.status_code == 201, response.text
     return response.json()
 
 
 def _assign(plan_id: str, forwarder_org_id: str = FORWARDER_ORG_ID) -> None:
     with database.begin() as db:
+        db.execute(delete(PlanForwarderRow).where(PlanForwarderRow.plan_id == plan_id))
         db.add(PlanForwarderRow(plan_id=plan_id, forwarder_org_id=forwarder_org_id))
 
 
@@ -71,13 +81,14 @@ def _shape(plan: dict) -> dict:
     return {
         "totals": {name: plan[name] for name in TOTALS},
         "assignments": sorted(
-            (a["lot_id"], a["mode"], a["container_id"], a["pallets"], a["pull_forward_days"])
+            (a["lot_id"], a["mode"], a["pallets"], a["pull_forward_days"])
             for a in plan["assignments"]
         ),
-        "containers": [
-            (c["container_id"], c["used"], c["pallets"], sorted(c["lot_ids"]), c["container_cost"])
+        "containers": sorted(
+            (c["pallets"], sorted(c["lot_ids"]), c["container_cost"])
             for c in plan["containers"]
-        ],
+            if c["used"]
+        ),
         "settlements": sorted(
             (s["shipper_id"], s["baseline_cost"], s["shared_cost"], s["savings"], s["fee"])
             for s in plan["settlements"]
@@ -86,10 +97,10 @@ def _shape(plan: dict) -> dict:
     }
 
 
-def test_platform_plan_from_seeded_orgs_matches_demo_numbers(
+def test_forwarder_plan_from_seeded_orgs_matches_demo_numbers(
     client: TestClient, platform_client: TestClient, saas_login
 ) -> None:
-    saas = _platform_plan(platform_client, saas_login)
+    saas = _forwarder_plan(saas_login)
     demo = client.post("/api/plans", json={}).json()
     assert _shape(saas["plan"]) == _shape(demo["plan"])
     assert saas["plan"]["total_savings"] > 0
@@ -150,35 +161,35 @@ def test_shipper_cannot_register_for_other_shipper_via_generic_intake(
 
 
 def test_planned_lots_are_locked(
-    platform_client: TestClient, saas_login, shipper_client: TestClient
+    forwarder_client: TestClient, saas_login, shipper_client: TestClient
 ) -> None:
-    _platform_plan(platform_client, saas_login)
+    _forwarder_plan(saas_login)
     patch = shipper_client.patch("/api/saas/shipper/lots/lot-jinju-sb-1", json={"pallets": 2})
     assert patch.status_code == 409
-    assert "변경 요청" in patch.json()["detail"]
+    assert "수량 변경 견적" in patch.json()["detail"]
     removed = shipper_client.delete("/api/saas/shipper/lots/lot-jinju-sb-1")
     assert removed.status_code == 409
     assert removed.json()["detail"] == patch.json()["detail"]
-    again = platform_client.post("/api/saas/platform/plans", json={"lot_ids": ["lot-jinju-sb-1"]})
+    again = forwarder_client.post("/api/saas/forwarder/plans", json={"lot_ids": ["lot-jinju-sb-1"]})
     assert again.status_code == 409
-    empty = platform_client.post("/api/saas/platform/plans", json={"lot_ids": []})
+    empty = forwarder_client.post("/api/saas/forwarder/plans", json={"lot_ids": []})
     assert empty.status_code == 422
 
 
 def test_role_guards(
-    client: TestClient,
+    anonymous_saas: TestClient,
     platform_client: TestClient,
     shipper_client: TestClient,
     forwarder_client: TestClient,
 ) -> None:
-    assert client.get("/api/saas/shipper/lots").status_code == 401
-    assert client.get("/api/saas/catalog").status_code == 401
+    assert anonymous_saas.get("/api/saas/shipper/lots").status_code == 401
+    assert anonymous_saas.get("/api/saas/catalog").status_code == 401
     assert shipper_client.get("/api/saas/platform/lots").status_code == 403
     assert shipper_client.post("/api/saas/platform/plans", json={}).status_code == 403
     assert forwarder_client.get("/api/saas/shipper/plans").status_code == 403
     assert platform_client.get("/api/saas/shipper/lots").status_code == 403
     assert platform_client.get("/api/saas/forwarder/plans").status_code == 403
-    assert forwarder_client.get("/api/saas/catalog").status_code == 403
+    assert forwarder_client.get("/api/saas/catalog").status_code == 200
     assert shipper_client.post("/api/plans", json={}).status_code == 403
     assert forwarder_client.post("/api/intake/lots", json={}).status_code in (403, 422)
 
@@ -201,22 +212,21 @@ def test_plan_access_rules(
     forwarder_client: TestClient,
     other_forwarder_client: TestClient,
 ) -> None:
-    saas = _platform_plan(platform_client, saas_login)
+    saas = _forwarder_plan(saas_login)
     plan_id = saas["plan_id"]
     demo_id = client.post("/api/plans", json={}).json()["plan_id"]
 
     assert platform_client.get(f"/api/plans/{plan_id}").status_code == 200
     assert platform_client.get(f"/api/plans/{plan_id}/settlement").status_code == 200
     assert platform_client.get(f"/api/plans/{demo_id}").status_code == 404
-    assert [p["plan_id"] for p in platform_client.get("/api/plans").json()] == [plan_id]
+    assert platform_client.get("/api/plans").json() == []
     assert client.get(f"/api/plans/{plan_id}").status_code == 404
     assert client.get(f"/api/plans/{plan_id}/settlement").status_code == 404
     assert client.delete(f"/api/plans/{plan_id}").status_code == 404
     assert [p["plan_id"] for p in client.get("/api/plans").json()] == [demo_id]
 
-    assert forwarder_client.get(f"/api/saas/forwarder/plans/{plan_id}").status_code == 404
-    assert forwarder_client.get("/api/saas/forwarder/plans").json() == []
-    _assign(plan_id)
+    assert other_forwarder_client.get(f"/api/saas/forwarder/plans/{plan_id}").status_code == 404
+    assert other_forwarder_client.get("/api/saas/forwarder/plans").json() == []
     listed = forwarder_client.get("/api/saas/forwarder/plans").json()
     assert [p["plan_id"] for p in listed] == [plan_id]
     assert listed[0]["forwarder"] == {
@@ -229,7 +239,8 @@ def test_plan_access_rules(
     assert all(p["lat"] is not None for p in detail["scenario"]["packhouses"])
     assert other_forwarder_client.get(f"/api/saas/forwarder/plans/{plan_id}").status_code == 404
     assert forwarder_client.get(f"/api/saas/forwarder/plans/{demo_id}").status_code == 404
-    assert forwarder_client.get(f"/api/plans/{plan_id}").status_code == 404
+    assert forwarder_client.get(f"/api/plans/{plan_id}").status_code == 200
+    assert other_forwarder_client.get(f"/api/plans/{plan_id}").status_code == 404
 
     shipper = saas_login("shipper-jinju")
     assert shipper.get(f"/api/saas/shipper/plans/{plan_id}").status_code == 200
@@ -247,11 +258,11 @@ def test_plan_access_rules(
 
 
 def test_shipper_without_lots_in_plan_cannot_see_it(
-    platform_client: TestClient, shipper_client: TestClient, other_shipper_client: TestClient
+    forwarder_client: TestClient, shipper_client: TestClient, other_shipper_client: TestClient
 ) -> None:
     lot = _scenario().lots[0]
     assert shipper_client.post("/api/saas/shipper/lots", json=_lot_body(lot)).status_code == 201
-    plan = platform_client.post("/api/saas/platform/plans", json={"lot_ids": [lot.id]}).json()
+    plan = forwarder_client.post("/api/saas/forwarder/plans", json={"lot_ids": [lot.id]}).json()
     plan_id = plan["plan_id"]
     assert shipper_client.get(f"/api/saas/shipper/plans/{plan_id}").status_code == 200
     assert other_shipper_client.get(f"/api/saas/shipper/plans/{plan_id}").status_code == 404
@@ -260,10 +271,8 @@ def test_shipper_without_lots_in_plan_cannot_see_it(
     assert other_shipper_client.get("/api/saas/shipper/settlements").json() == []
 
 
-def test_shipper_view_anonymizes_other_shippers(
-    platform_client: TestClient, saas_login, shipper_client: TestClient
-) -> None:
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
+def test_shipper_view_anonymizes_other_shippers(saas_login, shipper_client: TestClient) -> None:
+    plan_id = _forwarder_plan(saas_login)["plan_id"]
     response = shipper_client.get(f"/api/saas/shipper/plans/{plan_id}")
     assert response.status_code == 200
     body = response.json()
@@ -290,7 +299,7 @@ def test_shipper_view_anonymizes_other_shippers(
 def test_settlement_views(
     client: TestClient, platform_client: TestClient, saas_login, shipper_client: TestClient
 ) -> None:
-    saas = _platform_plan(platform_client, saas_login)
+    saas = _forwarder_plan(saas_login)
     demo = client.post("/api/plans", json={}).json()
     rows = shipper_client.get("/api/saas/shipper/settlements").json()
     assert [(r["plan_id"], r["shipper_id"]) for r in rows] == [(saas["plan_id"], "sh-jinju")]
@@ -310,14 +319,16 @@ def test_settlement_views(
     assert names["sh-jinju"] == "진주 딸기 수출농가 A"
 
 
-def test_order_flow_with_server_decided_actors(
-    platform_client: TestClient, saas_login, forwarder_client: TestClient
-) -> None:
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
-    _assign(plan_id)
-    event = platform_client.post(f"/api/plans/{plan_id}/events", json={"event": REDUCE})
+def test_order_flow_with_server_decided_actors(saas_login, forwarder_client: TestClient) -> None:
+    plan_id = _forwarder_plan(saas_login)["plan_id"]
+    accept_plan(saas_login, plan_id)
+    open_quantity_window()
+    queue_quantity(
+        saas_login("shipper-sancheong"), plan_id, REDUCE["lot_id"], REDUCE["new_pallets"]
+    )
+    event = forwarder_client.post(f"/api/plans/{plan_id}/events", json={"event": REDUCE})
     assert event.status_code == 200, event.text
-    applied = platform_client.post(
+    applied = forwarder_client.post(
         f"/api/plans/{plan_id}/apply", json={"alternative_id": "pull_forward"}
     )
     assert applied.status_code == 200, applied.text
@@ -395,35 +406,38 @@ def test_saas_mode_rejects_inline_lots(client: TestClient, demo_tenants) -> None
     lot = _scenario().lots[0].model_dump(mode="json")
     anonymous = saas.post("/api/plans", json={"lots": [{**lot, "id": "lot-inline-1"}]})
     assert anonymous.status_code == 401
-    login = saas.post("/api/auth/demo-login", json={"org_type": "platform"})
-    assert login.status_code == 200
-    inline = saas.post("/api/plans", json={"lots": [{**lot, "id": "lot-inline-1"}]})
+    forwarder = login_client(FORWARDER_ORG_ID, saas.app)
+    inline = forwarder.post("/api/plans", json={"lots": [{**lot, "id": "lot-inline-1"}]})
     assert inline.status_code == 422
     allowed = client.post("/api/plans", json={"lots": [{**lot, "id": "lot-inline-1"}]})
     assert allowed.status_code == 201
 
 
-def test_platform_uses_generic_routes_with_org_lots(
-    platform_client: TestClient, other_shipper_client: TestClient, client: TestClient
+def test_forwarder_uses_generic_routes_with_org_lots(
+    platform_client: TestClient,
+    forwarder_client: TestClient,
+    other_shipper_client: TestClient,
+    client: TestClient,
 ) -> None:
     lot = _scenario().lots[1]
-    saved = platform_client.post(
-        "/api/intake/lots", json=_lot_body(lot, shipper="sh-sancheong", save=True)
-    )
-    assert saved.status_code == 200, saved.text
+    body = _lot_body(lot, shipper="sh-sancheong", save=True)
+    assert platform_client.post("/api/intake/lots", json=body).status_code == 403
+    saved = other_shipper_client.post("/api/saas/shipper/lots", json=_lot_body(lot))
+    assert saved.status_code == 201, saved.text
     lot_id = saved.json()["registered"]["id"]
-    assert [x["id"] for x in other_shipper_client.get("/api/saas/shipper/lots").json()] == [lot_id]
     rows = platform_client.get("/api/saas/platform/lots", params={"status": "registered"}).json()
     assert [(r["id"], r["shipper_org_id"]) for r in rows] == [(lot_id, "shipper-sancheong")]
     assert rows[0]["shipper_org_name"] == "산청 딸기 수출농가 B"
 
-    inline = platform_client.post("/api/plans", json={"lots": [lot.model_dump(mode="json")]})
+    assert platform_client.post("/api/plans", json={"lot_ids": [lot_id]}).status_code == 403
+    inline = forwarder_client.post("/api/plans", json={"lots": [lot.model_dump(mode="json")]})
     assert inline.status_code == 422
-    created = platform_client.post("/api/plans", json={"lot_ids": [lot_id]})
+    created = forwarder_client.post("/api/plans", json={"lot_ids": [lot_id]})
     assert created.status_code == 201, created.text
     plan_id = created.json()["plan_id"]
     assert [lot["id"] for lot in created.json()["scenario"]["lots"]] == [lot_id]
     assert client.get(f"/api/plans/{plan_id}").status_code == 404
     assert other_shipper_client.get(f"/api/saas/shipper/plans/{plan_id}").status_code == 200
-    assert platform_client.delete(f"/api/plans/{plan_id}").status_code == 204
+    assert platform_client.delete(f"/api/plans/{plan_id}").status_code == 403
+    assert forwarder_client.delete(f"/api/plans/{plan_id}").status_code == 204
     assert other_shipper_client.get("/api/saas/shipper/lots").json()[0]["status"] == "registered"

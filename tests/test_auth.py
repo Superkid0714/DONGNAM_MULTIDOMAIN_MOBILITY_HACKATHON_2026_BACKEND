@@ -4,13 +4,19 @@ from typing import Annotated
 import pytest
 from fastapi import APIRouter, Depends, FastAPI
 from fastapi.testclient import TestClient
+from saas_fixtures import (
+    PLATFORM_ORG_ID,
+    SHIPPER_ORG_ID,
+    login_client,
+    saas_app,
+    saas_settings,
+)
 from sqlalchemy import select, update
 
 from freshswitch_backend.api import auth
 from freshswitch_backend.config import Settings, get_settings
 from freshswitch_backend.main import app, create_app
 from freshswitch_backend.persistence import database
-from freshswitch_backend.persistence.seed import demo_orgs
 from freshswitch_backend.persistence.tables import (
     DEMO_ORG,
     AuthSessionRow,
@@ -46,7 +52,7 @@ def _cookie_attrs(header: str) -> dict[str, str]:
 
 @pytest.fixture
 def https_client() -> TestClient:
-    return TestClient(app, base_url="https://testserver")
+    return TestClient(saas_app, base_url="https://testserver")
 
 
 def test_signup_sets_session_and_me(https_client: TestClient) -> None:
@@ -90,7 +96,7 @@ def test_signup_sets_session_and_me(https_client: TestClient) -> None:
 
 def test_signup_rejections(https_client: TestClient) -> None:
     _signup(https_client)
-    fresh = TestClient(app, base_url="https://testserver")
+    fresh = TestClient(saas_app, base_url="https://testserver")
     duplicate = fresh.post(
         "/api/auth/signup",
         json={
@@ -213,35 +219,15 @@ def test_login_succeeds_with_expired_session_cookie(https_client: TestClient) ->
     assert response.status_code == 200
 
 
-def test_demo_login_requires_seed(https_client: TestClient) -> None:
-    response = https_client.post("/api/auth/demo-login", json={"org_type": "shipper"})
-    assert response.status_code == 404
-
-
-@pytest.mark.parametrize("org_type", ["platform", "shipper", "forwarder"])
-def test_demo_login_each_role(https_client: TestClient, demo_tenants, org_type: str) -> None:
-    response = https_client.post("/api/auth/demo-login", json={"org_type": org_type})
-    assert response.status_code == 200
-    me = response.json()
-    expected = next(o for o in demo_orgs() if o.type == org_type)
-    assert me["active_org"]["org_type"] == org_type
-    assert me["active_org"]["org_id"] == expected.id
-    assert me["user"]["id"] == expected.user_id
-    assert https_client.get("/api/me").json()["active_org"]["org_id"] == expected.id
-
-
-def test_demo_login_rejects_unknown_type(https_client: TestClient) -> None:
-    response = https_client.post("/api/auth/demo-login", json={"org_type": "demo"})
-    assert response.status_code == 422
-
-
-def test_demo_password_login(https_client: TestClient, demo_tenants) -> None:
-    platform = next(o for o in demo_orgs() if o.type == "platform")
-    response = https_client.post(
-        "/api/auth/login", json={"email": platform.email, "password": "test-demo-password"}
-    )
-    assert response.status_code == 200
-    assert response.json()["active_org"]["org_id"] == platform.id
+@pytest.mark.parametrize("target", [app, saas_app], ids=["main", "saas"])
+def test_demo_login_is_not_routed(target, demo_tenants) -> None:
+    http = TestClient(target, base_url="https://testserver", headers=CSRF)
+    for org_type in ("platform", "shipper", "forwarder"):
+        response = http.post("/api/auth/demo-login", json={"org_type": org_type})
+        assert response.status_code == 404
+        assert "set-cookie" not in response.headers
+    with database.begin() as db:
+        assert db.scalars(select(AuthSessionRow)).all() == []
 
 
 def test_csrf_required_for_cookie_session(https_client: TestClient) -> None:
@@ -260,9 +246,10 @@ def test_csrf_required_for_cookie_session(https_client: TestClient) -> None:
 
 def test_anonymous_requests_skip_csrf(client: TestClient) -> None:
     assert client.post("/api/plans", json={"scenario_id": "nope"}).status_code == 404
-    assert client.post("/api/auth/logout").status_code == 204
     assert client.get("/api/scenarios").status_code == 200
-    assert client.get("/api/me").status_code == 401
+    anonymous = TestClient(saas_app, base_url="https://testserver")
+    assert anonymous.post("/api/auth/logout").status_code == 204
+    assert anonymous.get("/api/me").status_code == 401
 
 
 def _add_membership(user_id: str, org_id: str, org_type: str, name: str) -> None:
@@ -327,32 +314,33 @@ def _probe_app() -> FastAPI:
     def carriers(p: Carrier) -> dict:
         return {"org_id": p.org_id}
 
-    built = create_app()
+    built = create_app(saas_settings())
     built.include_router(probe, prefix=get_settings().api_prefix)
     return built
 
 
 def test_principal_dependencies(demo_tenants) -> None:
-    probe = TestClient(_probe_app(), base_url="https://testserver")
-    assert probe.get("/api/probe/org").json() == {"org_id": DEMO_ORG}
-    assert probe.get("/api/probe/principal").status_code == 401
-    assert probe.get("/api/probe/platform").status_code == 401
+    built = _probe_app()
+    anonymous = TestClient(built, base_url="https://testserver")
+    assert anonymous.get("/api/probe/org").json() == {"org_id": DEMO_ORG}
+    assert anonymous.get("/api/probe/principal").status_code == 401
+    assert anonymous.get("/api/probe/platform").status_code == 401
 
-    probe.post("/api/auth/demo-login", json={"org_type": "shipper"})
-    shipper = next(o for o in demo_orgs() if o.type == "shipper")
-    assert probe.get("/api/probe/org").json() == {"org_id": shipper.id}
+    probe = login_client(SHIPPER_ORG_ID, built)
+    me = probe.get("/api/me").json()
+    assert probe.get("/api/probe/org").json() == {"org_id": SHIPPER_ORG_ID}
     assert probe.get("/api/probe/principal").json() == {
-        "user_id": shipper.user_id,
-        "org_id": shipper.id,
+        "user_id": me["user"]["id"],
+        "org_id": SHIPPER_ORG_ID,
         "type": "shipper",
         "role": "admin",
     }
     assert probe.get("/api/probe/platform").status_code == 403
     assert probe.get("/api/probe/carriers").status_code == 200
 
-    probe.post("/api/auth/demo-login", json={"org_type": "platform"}, headers=CSRF)
-    assert probe.get("/api/probe/platform").status_code == 200
-    assert probe.get("/api/probe/carriers").status_code == 403
+    platform = login_client(PLATFORM_ORG_ID, built)
+    assert platform.get("/api/probe/platform").status_code == 200
+    assert platform.get("/api/probe/carriers").status_code == 403
 
 
 def _write_probe_app(calls: list[str]) -> FastAPI:
@@ -363,7 +351,7 @@ def _write_probe_app(calls: list[str]) -> FastAPI:
         calls.append(org_id)
         return {"org_id": org_id}
 
-    built = create_app()
+    built = create_app(saas_settings())
     built.include_router(probe, prefix=get_settings().api_prefix)
     return built
 
@@ -415,15 +403,13 @@ def test_settings_normalize_paths() -> None:
 
 @pytest.fixture
 def saas_client() -> TestClient:
-    settings = get_settings().model_copy(
-        update={"api_prefix": "/test/api", "session_cookie_path": "/test"}
-    )
+    settings = saas_settings(api_prefix="/test/api", session_cookie_path="/test")
     return TestClient(create_app(settings), base_url="https://testserver")
 
 
 def test_saas_prefix_routes(saas_client: TestClient) -> None:
     assert saas_client.get("/test/api/health").status_code == 200
-    assert saas_client.get("/test/api/scenarios").status_code == 200
+    assert saas_client.get("/test/api/scenarios").status_code == 401
     assert saas_client.get("/api/health").status_code == 404
     assert saas_client.get("/test/api/docs").status_code == 200
     assert saas_client.get("/test/api/redoc").status_code == 200
@@ -460,6 +446,8 @@ def test_saas_prefix_session_cookie(saas_client: TestClient) -> None:
 def test_default_prefix_paths_unchanged() -> None:
     paths = app.openapi()["paths"]
     assert all(path.startswith("/api/") for path in paths)
-    assert {"/api/health", "/api/plans", "/api/me", "/api/auth/login"} <= set(paths)
+    assert {"/api/health", "/api/plans", "/api/intake/lots"} <= set(paths)
+    assert not {"/api/me", "/api/auth/login", "/api/auth/signup"} & set(paths)
+    assert not any(path.startswith("/api/saas/") for path in paths)
     assert app.docs_url == "/api/docs"
     assert app.openapi_url == "/api/openapi.json"

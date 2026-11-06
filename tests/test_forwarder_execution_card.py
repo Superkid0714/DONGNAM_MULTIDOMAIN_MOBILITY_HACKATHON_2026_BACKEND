@@ -3,11 +3,11 @@ import re
 from datetime import timedelta
 
 from fastapi.testclient import TestClient
-from saas_fixtures import FORWARDER_ORG_ID
-from test_saas_api import REDUCE, _assign, _platform_plan
+from saas_fixtures import accept_plan, open_quantity_window, queue_quantity
+from test_saas_api import REDUCE, _forwarder_plan
 
 from freshswitch_backend.data.loader import get_scenario
-from freshswitch_backend.domain.models import Assignment, ContainerLoad, Plan
+from freshswitch_backend.domain.models import Assignment, ContainerLoad, Plan, Scenario
 from freshswitch_backend.execution.card import (
     build_execution_card,
     iso6346_check_digit,
@@ -105,24 +105,27 @@ def test_demo_order_text_unchanged(client: TestClient) -> None:
     assert "SI 정정 + VGM" not in json.dumps(order, ensure_ascii=False)
 
 
-def _saas_plan(platform_client: TestClient, saas_login) -> str:
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
-    _assign(plan_id, FORWARDER_ORG_ID)
-    return plan_id
+def _saas_plan(saas_login) -> str:
+    return _forwarder_plan(saas_login)["plan_id"]
 
 
-def test_forwarder_orders_use_saas_wording(
-    platform_client: TestClient, saas_login, forwarder_client: TestClient
-) -> None:
-    plan_id = _saas_plan(platform_client, saas_login)
-    assert (
-        platform_client.post(f"/api/plans/{plan_id}/events", json={"event": REDUCE}).status_code
-        == 200
+def _reduced(saas_login, forwarder_client: TestClient, plan_id: str) -> None:
+    accept_plan(saas_login, plan_id)
+    open_quantity_window()
+    queue_quantity(
+        saas_login("shipper-sancheong"), plan_id, REDUCE["lot_id"], REDUCE["new_pallets"]
     )
-    applied = platform_client.post(
+    event = forwarder_client.post(f"/api/plans/{plan_id}/events", json={"event": REDUCE})
+    assert event.status_code == 200, event.text
+    applied = forwarder_client.post(
         f"/api/plans/{plan_id}/apply", json={"alternative_id": "pull_forward"}
     )
     assert applied.status_code == 200, applied.text
+
+
+def test_forwarder_orders_use_saas_wording(saas_login, forwarder_client: TestClient) -> None:
+    plan_id = _saas_plan(saas_login)
+    _reduced(saas_login, forwarder_client, plan_id)
     orders = forwarder_client.get(f"/api/saas/forwarder/plans/{plan_id}/orders").json()
     amendment = next(r for r in orders[0]["requests"] if r["kind"] == "booking_amendment")
     assert amendment["text"].startswith("[SI 정정 + VGM 재제출 요청]")
@@ -131,18 +134,16 @@ def test_forwarder_orders_use_saas_wording(
 
 
 def test_forwarder_plan_detail_has_execution_card(
-    platform_client: TestClient,
     saas_login,
     forwarder_client: TestClient,
     other_forwarder_client: TestClient,
 ) -> None:
-    plan_id = _saas_plan(platform_client, saas_login)
+    plan_id = _saas_plan(saas_login)
     detail = forwarder_client.get(f"/api/saas/forwarder/plans/{plan_id}").json()
     card = detail["execution_card"]
     assert card["mock"] is True and card["plan_id"] == plan_id
     assert card["containers"]
-    scenario = _scenario()
-    voyages = {v.id: v for v in scenario.voyages}
+    voyages = {v.id: v for v in Scenario.model_validate(detail["scenario"]).voyages}
     for row in card["containers"]:
         assert row["mock"] is True
         assert re.fullmatch(r"FRSU\d{7}", row["container_no"])
@@ -279,20 +280,12 @@ def test_saas_texts_keep_shipper_breakdown() -> None:
 
 
 def test_shipper_and_forwarder_see_same_saas_wording(
-    platform_client: TestClient,
     saas_login,
     forwarder_client: TestClient,
     shipper_client: TestClient,
 ) -> None:
-    plan_id = _saas_plan(platform_client, saas_login)
-    assert (
-        platform_client.post(f"/api/plans/{plan_id}/events", json={"event": REDUCE}).status_code
-        == 200
-    )
-    applied = platform_client.post(
-        f"/api/plans/{plan_id}/apply", json={"alternative_id": "pull_forward"}
-    )
-    assert applied.status_code == 200, applied.text
+    plan_id = _saas_plan(saas_login)
+    _reduced(saas_login, forwarder_client, plan_id)
     forwarder = forwarder_client.get(f"/api/saas/forwarder/plans/{plan_id}/orders").json()
     shipper = shipper_client.get(f"/api/saas/shipper/plans/{plan_id}/orders").json()
     sent = next(r for r in forwarder[0]["requests"] if r["kind"] == "booking_amendment")

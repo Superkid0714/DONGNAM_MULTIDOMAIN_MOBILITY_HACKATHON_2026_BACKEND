@@ -1,10 +1,10 @@
 import pytest
 from fastapi.testclient import TestClient
+from saas_fixtures import saas_app, sign_in_as
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 
 from freshswitch_backend.data.loader import get_scenario
-from freshswitch_backend.main import create_app
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.tables import OrganizationRow, PlanForwarderRow
 from freshswitch_backend.planning.store import store
@@ -14,16 +14,16 @@ PLATFORM = "freshswitch"
 OTHER_PLATFORM = "platform-other"
 DONGNAM = "forwarder-dongnam"
 SINHANG = "forwarder-sinhang"
+RETIRED = "플랫폼은 서비스 관리·조회만 할 수 있습니다. 운송 계획은 포워더가 관리합니다"
 
 
 @pytest.fixture
 def saas() -> TestClient:
-    return TestClient(create_app(), base_url="https://testserver")
+    return TestClient(saas_app, base_url="https://testserver")
 
 
 def _login(client: TestClient, org_type: str) -> None:
-    response = client.post("/api/auth/demo-login", json={"org_type": org_type})
-    assert response.status_code == 200
+    sign_in_as(client, org_type)
 
 
 def _plan(org_id: str) -> str:
@@ -99,50 +99,30 @@ def test_assign_requires_csrf_header(platform: TestClient) -> None:
     assert _assigned(plan_id) == []
 
 
-def test_assign_reassign_and_unassign(platform: TestClient) -> None:
-    plan_id = _plan(PLATFORM)
-    first = platform.put(_forwarder_path(plan_id), json={"forwarder_org_id": DONGNAM}, headers=CSRF)
-    assert first.status_code == 200
-    assert first.json() == {
-        "plan_id": plan_id,
-        "forwarder": {"org_id": DONGNAM, "org_name": "동남 콜드체인 포워딩"},
-        "before_shipper_confirmation": False,
-    }
+def test_platform_cannot_assign_or_unassign_forwarder(platform: TestClient) -> None:
+    plan_id = _plan(DONGNAM)
     assert _assigned(plan_id) == [DONGNAM]
-
-    again = platform.put(_forwarder_path(plan_id), json={"forwarder_org_id": DONGNAM}, headers=CSRF)
-    assert again.status_code == 200
-    assert _assigned(plan_id) == [DONGNAM]
-
-    second = platform.put(
-        _forwarder_path(plan_id), json={"forwarder_org_id": SINHANG}, headers=CSRF
-    )
-    assert second.status_code == 200
-    assert second.json()["forwarder"]["org_id"] == SINHANG
-    assert _assigned(plan_id) == [SINHANG]
-
+    for target in (DONGNAM, SINHANG):
+        put = platform.put(
+            _forwarder_path(plan_id), json={"forwarder_org_id": target}, headers=CSRF
+        )
+        assert put.status_code == 403
+        assert put.json()["detail"] == RETIRED
     removed = platform.delete(_forwarder_path(plan_id), headers=CSRF)
-    assert removed.status_code == 204
-    assert removed.content == b""
-    assert _assigned(plan_id) == []
-    assert platform.delete(_forwarder_path(plan_id), headers=CSRF).status_code == 204
-
-
-def test_assignment_records_assigning_user(platform: TestClient) -> None:
-    plan_id = _plan(PLATFORM)
-    platform.put(_forwarder_path(plan_id), json={"forwarder_org_id": DONGNAM}, headers=CSRF)
-    with database.begin() as db:
-        row = db.get(PlanForwarderRow, (plan_id, DONGNAM))
-        assert row is not None
-        assert row.assigned_by == f"user-{PLATFORM}"
+    assert removed.status_code == 403
+    assert removed.json()["detail"] == RETIRED
+    assert _assigned(plan_id) == [DONGNAM]
+    listed = platform.get("/api/saas/platform/plans").json()
+    item = next(p for p in listed if p["plan_id"] == plan_id)
+    assert item["forwarder"] == {"org_id": DONGNAM, "org_name": "동남 콜드체인 포워딩"}
 
 
 @pytest.mark.parametrize("target", ["shipper-jinju", PLATFORM, "demo", "missing-org"])
-def test_assign_non_forwarder_is_unprocessable(platform: TestClient, target: str) -> None:
-    plan_id = _plan(PLATFORM)
+def test_assign_non_forwarder_is_forbidden(platform: TestClient, target: str) -> None:
+    plan_id = _plan(DONGNAM)
     put = platform.put(_forwarder_path(plan_id), json={"forwarder_org_id": target}, headers=CSRF)
-    assert put.status_code == 422
-    assert _assigned(plan_id) == []
+    assert put.status_code == 403
+    assert _assigned(plan_id) == [DONGNAM]
 
 
 def test_other_platform_plan_is_not_found(platform: TestClient) -> None:
@@ -155,19 +135,14 @@ def test_other_platform_plan_is_not_found(platform: TestClient) -> None:
     foreign = _plan(OTHER_PLATFORM)
     demo_plan = _plan("demo")
     for plan_id in (foreign, demo_plan, "no-such-plan"):
+        confirmation = platform.get(f"/api/saas/platform/plans/{plan_id}/confirmation")
+        assert confirmation.status_code == 404
+        assert platform.get(f"/api/plans/{plan_id}").status_code == 404
         put = platform.put(
             _forwarder_path(plan_id), json={"forwarder_org_id": DONGNAM}, headers=CSRF
         )
-        assert put.status_code == 404
-        assert platform.delete(_forwarder_path(plan_id), headers=CSRF).status_code == 404
+        assert put.status_code == 403
+        assert platform.delete(_forwarder_path(plan_id), headers=CSRF).status_code == 403
         assert _assigned(plan_id) == []
-
-
-def test_unassign_does_not_touch_other_plans(platform: TestClient) -> None:
-    kept = _plan(PLATFORM)
-    dropped = _plan(PLATFORM)
-    for plan_id in (kept, dropped):
-        platform.put(_forwarder_path(plan_id), json={"forwarder_org_id": DONGNAM}, headers=CSRF)
-    assert platform.delete(_forwarder_path(dropped), headers=CSRF).status_code == 204
-    assert _assigned(kept) == [DONGNAM]
-    assert _assigned(dropped) == []
+    listed = {p["plan_id"] for p in platform.get("/api/saas/platform/plans").json()}
+    assert not listed & {foreign, demo_plan}

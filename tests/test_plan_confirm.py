@@ -5,25 +5,30 @@ from saas_fixtures import (
     FORWARDER_ORG_ID,
     REAL_PLATFORM_EMAIL,
     REAL_PLATFORM_PASSWORD,
+    accept_plan,
     create_real_platform,
+    open_quantity_window,
     password_client,
+    queue_quantity,
+    saas_app,
 )
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.domain.models import Assignment, Plan
 from freshswitch_backend.execution.models import ReplanCandidate
-from freshswitch_backend.main import app
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.seed import shipper_org_id
 from freshswitch_backend.persistence.tables import (
+    OrganizationRow,
     PlanConfirmationRow,
-    PlanForwarderRow,
     PlanRow,
 )
 from freshswitch_backend.planning.store import _still_relevant
 
 PLATFORM = "/api/saas/platform/plans"
+FORWARDER = "/api/saas/forwarder/plans"
+ATTENTION = "/api/saas/forwarder/plan-confirmations"
 REDUCE = {"type": "reduce", "lot_id": "lot-sancheong-sb-1", "new_pallets": 3}
 
 
@@ -54,16 +59,16 @@ def _register(saas_login, skip: tuple[str, ...] = ()) -> list[str]:
     return ids
 
 
-def _plan(platform_client: TestClient, saas_login, **options) -> dict:
+def _plan(forwarder_client: TestClient, saas_login, **options) -> dict:
     skip = options.pop("skip", ())
     body = {"lot_ids": _register(saas_login, skip), **options}
-    created = platform_client.post(PLATFORM, json=body)
+    created = forwarder_client.post(FORWARDER, json=body)
     assert created.status_code == 201, created.text
     return created.json()
 
 
-def _state(platform_client: TestClient, plan_id: str) -> dict:
-    response = platform_client.get(f"{PLATFORM}/{plan_id}/confirmation")
+def _state(forwarder_client: TestClient, plan_id: str) -> dict:
+    response = forwarder_client.get(f"{FORWARDER}/{plan_id}/confirmation")
     assert response.status_code == 200, response.text
     return response.json()
 
@@ -80,13 +85,13 @@ def _kinds(client: TestClient, plan_id: str) -> list[str]:
 
 
 def test_saas_plan_waits_for_every_shipper_then_commits(
-    platform_client: TestClient, saas_login
+    forwarder_client: TestClient, saas_login
 ) -> None:
-    plan = _plan(platform_client, saas_login)
+    plan = _plan(forwarder_client, saas_login)
     plan_id = plan["plan_id"]
     assert plan["status"] == "pending_shipper_confirmation"
 
-    state = _state(platform_client, plan_id)
+    state = _state(forwarder_client, plan_id)
     shippers = sorted({lot["shipper_id"] for lot in plan["scenario"]["lots"]})
     assert state["round"] == 1
     assert [c["shipper_id"] for c in state["confirmations"]] == shippers
@@ -102,7 +107,7 @@ def test_saas_plan_waits_for_every_shipper_then_commits(
     listed = jinju.get("/api/saas/shipper/plan-confirmations?status=pending").json()
     assert [(c["plan_id"], c["shipper_id"]) for c in listed] == [(plan_id, "sh-jinju")]
 
-    attention = platform_client.get("/api/saas/platform/plan-confirmations").json()
+    attention = forwarder_client.get(ATTENTION).json()
     assert [s["plan_id"] for s in attention] == [plan_id]
 
     for shipper_id in shippers[:-1]:
@@ -115,23 +120,23 @@ def test_saas_plan_waits_for_every_shipper_then_commits(
     last = _decide(saas_login, plan_id, shippers[-1], {"accept": True})
     assert last.status_code == 200, last.text
     assert last.json()["plan_status"] == "committed"
-    assert platform_client.get(f"/api/plans/{plan_id}").json()["status"] == "committed"
-    assert _state(platform_client, plan_id)["status"] == "committed"
-    assert platform_client.get("/api/saas/platform/plan-confirmations").json() == []
+    assert forwarder_client.get(f"/api/plans/{plan_id}").json()["status"] == "committed"
+    assert _state(forwarder_client, plan_id)["status"] == "committed"
+    assert forwarder_client.get(ATTENTION).json() == []
 
 
-def test_shipper_outside_plan_cannot_decide(platform_client: TestClient, saas_login) -> None:
-    plan_id = _plan(platform_client, saas_login, skip=("sh-sangju",))["plan_id"]
+def test_shipper_outside_plan_cannot_decide(forwarder_client: TestClient, saas_login) -> None:
+    plan_id = _plan(forwarder_client, saas_login, skip=("sh-sangju",))["plan_id"]
     outsider = _decide(saas_login, plan_id, "sh-sangju", {"accept": True})
     assert outsider.status_code == 404
-    shippers = [c["shipper_id"] for c in _state(platform_client, plan_id)["confirmations"]]
+    shippers = [c["shipper_id"] for c in _state(forwarder_client, plan_id)["confirmations"]]
     assert "sh-sangju" not in shippers
 
 
 def test_rejection_needs_reason_and_opens_replan_entry(
-    platform_client: TestClient, saas_login
+    forwarder_client: TestClient, saas_login
 ) -> None:
-    plan_id = _plan(platform_client, saas_login)["plan_id"]
+    plan_id = _plan(forwarder_client, saas_login)["plan_id"]
     blank = _decide(saas_login, plan_id, "sh-pohang", {"accept": False, "reason": "  "})
     assert blank.status_code == 422
 
@@ -143,7 +148,7 @@ def test_rejection_needs_reason_and_opens_replan_entry(
     flipped = _decide(saas_login, plan_id, "sh-pohang", {"accept": True})
     assert flipped.status_code == 409
 
-    state = _state(platform_client, plan_id)
+    state = _state(forwarder_client, plan_id)
     assert state["status"] == "pending_shipper_confirmation"
     assert state["needs_replan"] is True
     [candidate] = state["replan_candidates"]
@@ -159,13 +164,13 @@ def test_rejection_needs_reason_and_opens_replan_entry(
 
 
 def test_recompute_without_rejected_shipper_releases_lots_and_reasks(
-    platform_client: TestClient, saas_login
+    forwarder_client: TestClient, saas_login
 ) -> None:
-    plan_id = _plan(platform_client, saas_login)["plan_id"]
+    plan_id = _plan(forwarder_client, saas_login)["plan_id"]
     _decide(saas_login, plan_id, "sh-jinju", {"accept": True})
     _decide(saas_login, plan_id, "sh-pohang", {"accept": False, "reason": "가격"})
 
-    recomputed = platform_client.post(f"{PLATFORM}/{plan_id}/confirmation/recompute", json={})
+    recomputed = forwarder_client.post(f"{FORWARDER}/{plan_id}/confirmation/recompute", json={})
     assert recomputed.status_code == 200, recomputed.text
     plan = recomputed.json()["plan"]
     state = recomputed.json()["confirmation"]
@@ -187,75 +192,96 @@ def test_recompute_without_rejected_shipper_releases_lots_and_reasks(
     jinju = saas_login("shipper-jinju")
     assert _kinds(jinju, plan_id).count("plan_confirmation_requested") == 2
 
-    nothing = platform_client.post(f"{PLATFORM}/{plan_id}/confirmation/recompute", json={})
+    nothing = forwarder_client.post(f"{FORWARDER}/{plan_id}/confirmation/recompute", json={})
     assert nothing.status_code == 422
     for c in state["confirmations"]:
         assert _decide(saas_login, plan_id, c["shipper_id"], {"accept": True}).status_code == 200
-    assert _state(platform_client, plan_id)["status"] == "committed"
-    late = platform_client.post(
-        f"{PLATFORM}/{plan_id}/confirmation/recompute", json={"shipper_ids": ["sh-jinju"]}
+    assert _state(forwarder_client, plan_id)["status"] == "committed"
+    late = forwarder_client.post(
+        f"{FORWARDER}/{plan_id}/confirmation/recompute", json={"shipper_ids": ["sh-jinju"]}
     )
     assert late.status_code == 409
 
 
-def test_sandbox_auto_accept_switch(platform_client: TestClient, saas_login) -> None:
-    plan = _plan(platform_client, saas_login, auto_accept=True)
-    assert plan["status"] == "committed"
-    state = _state(platform_client, plan["plan_id"])
-    assert all(c["status"] == "accepted" and c["auto_accepted"] for c in state["confirmations"])
-    assert _kinds(saas_login("shipper-jinju"), plan["plan_id"]) == []
+def test_auto_accept_switch_is_retired(forwarder_client: TestClient, saas_login) -> None:
+    refused = forwarder_client.post(
+        FORWARDER, json={"lot_ids": _register(saas_login), "auto_accept": True}
+    )
+    assert refused.status_code == 422
 
-    assert platform_client.delete(f"/api/plans/{plan['plan_id']}").status_code == 204
-    pending = platform_client.post(PLATFORM, json={"lot_ids": [], "include_registered": True})
+    pending = forwarder_client.post(FORWARDER, json={"lot_ids": [], "include_registered": True})
     assert pending.status_code == 201, pending.text
     plan_id = pending.json()["plan_id"]
-    switched = platform_client.post(f"{PLATFORM}/{plan_id}/confirmation/auto-accept")
-    assert switched.status_code == 200, switched.text
-    assert switched.json()["status"] == "committed"
+    assert pending.json()["status"] == "pending_shipper_confirmation"
+    switched = forwarder_client.post(f"{FORWARDER}/{plan_id}/confirmation/auto-accept")
+    assert switched.status_code == 404
+    state = _state(forwarder_client, plan_id)
+    assert state["status"] == "pending_shipper_confirmation"
+    assert state["confirmations"]
+    assert all(c["status"] == "pending" and not c["auto_accepted"] for c in state["confirmations"])
 
 
-def test_auto_accept_is_sandbox_only() -> None:
+def test_auto_accept_is_sandbox_only(forwarder_client: TestClient, saas_login) -> None:
+    plan_id = _plan(forwarder_client, saas_login)["plan_id"]
+    with database.begin() as db:
+        db.execute(
+            update(OrganizationRow)
+            .where(OrganizationRow.id == FORWARDER_ORG_ID)
+            .values(sandbox=False)
+        )
+    switched = forwarder_client.post(f"{FORWARDER}/{plan_id}/confirmation/auto-accept")
+    assert switched.status_code == 404
+    assert _state(forwarder_client, plan_id)["status"] == "pending_shipper_confirmation"
+
     create_real_platform()
-    real = password_client(app, REAL_PLATFORM_EMAIL, REAL_PLATFORM_PASSWORD)
+    real = password_client(saas_app, REAL_PLATFORM_EMAIL, REAL_PLATFORM_PASSWORD)
     created = real.post(PLATFORM, json={"lot_ids": ["x"], "auto_accept": True})
     assert created.status_code == 403
     missing = real.post(f"{PLATFORM}/nope/confirmation/auto-accept")
-    assert missing.status_code == 403
+    assert missing.status_code == 404
 
 
-def test_order_commit_keeps_plan_waiting_until_shippers_accept(
-    platform_client: TestClient, saas_login, forwarder_client: TestClient
+def test_order_commit_waits_for_shippers_to_accept_the_plan(
+    forwarder_client: TestClient, saas_login
 ) -> None:
-    plan_id = _plan(platform_client, saas_login)["plan_id"]
-    with database.begin() as db:
-        db.add(PlanForwarderRow(plan_id=plan_id, forwarder_org_id=FORWARDER_ORG_ID))
+    plan_id = _plan(forwarder_client, saas_login)["plan_id"]
+    open_quantity_window()
+    queue_quantity(
+        saas_login("shipper-sancheong"), plan_id, REDUCE["lot_id"], REDUCE["new_pallets"]
+    )
     assert (
-        platform_client.post(f"/api/plans/{plan_id}/events", json={"event": REDUCE}).status_code
+        forwarder_client.post(f"/api/plans/{plan_id}/events", json={"event": REDUCE}).status_code
         == 200
     )
-    applied = platform_client.post(
+    applied = forwarder_client.post(
         f"/api/plans/{plan_id}/apply", json={"alternative_id": "pull_forward"}
     )
     assert applied.status_code == 200, applied.text
     assert applied.json()["status"] == "pending_confirmation"
     order_id = applied.json()["active_order_id"]
-    order = platform_client.get(f"/api/plans/{plan_id}/orders/{order_id}").json()
+    order = forwarder_client.get(f"/api/plans/{plan_id}/orders/{order_id}").json()
     for c in order["shipper_confirmations"]:
         answered = saas_login(shipper_org_id(c["shipper_id"])).post(
             f"/api/saas/shipper/plans/{plan_id}/orders/{order_id}/confirm",
             json={"accept": True, "shipper_id": c["shipper_id"]},
         )
         assert answered.status_code == 200, answered.text
-    done = forwarder_client.post(
-        f"/api/saas/forwarder/plans/{plan_id}/orders/{order_id}/confirm", json={"accept": True}
+    confirm = f"/api/saas/forwarder/plans/{plan_id}/orders/{order_id}/confirm"
+    early = forwarder_client.post(confirm, json={"accept": True})
+    assert early.status_code == 409, early.text
+    assert "모든 화주가 배정을 수락" in early.json()["detail"]
+    assert forwarder_client.get(f"/api/plans/{plan_id}").json()["status"] == (
+        "pending_confirmation"
     )
-    assert done.status_code == 200, done.text
-    session = platform_client.get(f"/api/plans/{plan_id}").json()
-    assert session["status"] == "pending_shipper_confirmation"
-    assert session["committed_version"] == session["version"]
+    waiting = _state(forwarder_client, plan_id)["confirmations"]
+    assert all(c["status"] == "pending" for c in waiting)
 
-    switched = platform_client.post(f"{PLATFORM}/{plan_id}/confirmation/auto-accept")
-    assert switched.json()["status"] == "committed"
+    accept_plan(saas_login, plan_id)
+    done = forwarder_client.post(confirm, json={"accept": True})
+    assert done.status_code == 200, done.text
+    session = forwarder_client.get(f"/api/plans/{plan_id}").json()
+    assert session["status"] == "committed"
+    assert session["committed_version"] == session["version"]
 
     request = next(
         r
@@ -269,7 +295,7 @@ def test_order_commit_keeps_plan_waiting_until_shippers_accept(
         json={"accepted": False, "note": "선복 부족"},
     )
     assert declined.status_code == 200, declined.text
-    state = _state(platform_client, plan_id)
+    state = _state(forwarder_client, plan_id)
     assert state["needs_replan"] is True
     [candidate] = state["replan_candidates"]
     assert candidate["source"] == "request_declined"
@@ -282,7 +308,7 @@ def test_order_commit_keeps_plan_waiting_until_shippers_accept(
         assert candidate["events"] == [
             {"type": "air_switch", "lot_id": lot_id} for lot_id in request["lot_ids"]
         ]
-    attention = platform_client.get("/api/saas/platform/plan-confirmations").json()
+    attention = forwarder_client.get(ATTENTION).json()
     assert [s["plan_id"] for s in attention] == [plan_id]
 
 
@@ -309,8 +335,13 @@ def test_demo_plan_is_committed_without_confirmations(client: TestClient) -> Non
     assert applied.json()["status"] == "pending_confirmation"
 
 
-def test_logged_in_api_plans_create_asks_shippers(platform_client: TestClient, saas_login) -> None:
-    created = platform_client.post("/api/plans", json={"lot_ids": _register(saas_login)})
+def test_forwarder_api_plans_create_asks_shippers(
+    forwarder_client: TestClient, platform_client: TestClient, saas_login
+) -> None:
+    lot_ids = _register(saas_login)
+    refused = platform_client.post("/api/plans", json={"lot_ids": lot_ids})
+    assert refused.status_code == 403
+    created = forwarder_client.post("/api/plans", json={"lot_ids": lot_ids})
     assert created.status_code == 201, created.text
     plan = created.json()
     assert plan["status"] == "pending_shipper_confirmation"
@@ -318,12 +349,15 @@ def test_logged_in_api_plans_create_asks_shippers(platform_client: TestClient, s
     assert _kinds(shipper, plan["plan_id"]) == ["plan_confirmation_requested"]
 
 
-def test_sandbox_auto_accept_create_sends_no_confirmation(
-    platform_client: TestClient, saas_login
-) -> None:
-    plan = _plan(platform_client, saas_login, auto_accept=True)
+def test_auto_accept_create_is_retired(forwarder_client: TestClient, saas_login) -> None:
+    lot_ids = _register(saas_login)
+    refused = forwarder_client.post(FORWARDER, json={"lot_ids": lot_ids, "auto_accept": True})
+    assert refused.status_code == 422
+    created = forwarder_client.post(FORWARDER, json={"lot_ids": lot_ids})
+    assert created.status_code == 201, created.text
+    plan = created.json()
     shipper = saas_login(shipper_org_id("sh-miryang"))
-    assert _kinds(shipper, plan["plan_id"]) == []
+    assert _kinds(shipper, plan["plan_id"]) == ["plan_confirmation_requested"]
 
 
 def _placed(lot_id: str, container_id: str, voyage_id: str) -> Assignment:

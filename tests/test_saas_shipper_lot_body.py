@@ -1,8 +1,6 @@
 from fastapi.testclient import TestClient
-from saas_fixtures import OTHER_SHIPPER_ORG_ID
+from saas_fixtures import OTHER_SHIPPER_ORG_ID, saas_app
 from test_saas_api import _lot_body, _scenario
-
-from freshswitch_backend.main import create_app
 
 
 def _body_without_shipper(lot, **extra) -> dict:
@@ -36,7 +34,7 @@ def test_shipper_lot_create_ignores_body_shipper_org(
 
 
 def test_saas_openapi_shipper_lot_create_optional_shipper() -> None:
-    schemas = create_app().openapi()["components"]["schemas"]
+    schemas = saas_app.openapi()["components"]["schemas"]
     lot_create = schemas["ShipperLotCreate"]
     assert "shipper" not in lot_create.get("required", [])
     assert "shipper_org_id" in lot_create["properties"]

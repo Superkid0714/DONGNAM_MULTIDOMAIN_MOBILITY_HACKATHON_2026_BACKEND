@@ -1,6 +1,6 @@
 import pytest
 from fastapi.testclient import TestClient
-from saas_fixtures import seed_client
+from saas_fixtures import forwarder_scenario_plan, seed_client
 
 from freshswitch_backend.coldchain.power_plan import PowerPlanParams, power_plan
 from freshswitch_backend.config import get_settings
@@ -35,8 +35,8 @@ def _with_peak(session: PlanSession, truck_id: str) -> PlanSession:
     return session.model_copy(update={"routes": routes})
 
 
-def test_demo_power_plan_segments(client: TestClient) -> None:
-    plan_id = client.post("/api/plans", json={"scenario_id": "default"}).json()["plan_id"]
+def test_forwarder_power_plan_segments(demo_tenants) -> None:
+    client, plan_id = forwarder_scenario_plan()
     response = client.get(f"/api/coldchain/plans/{plan_id}/power-plan")
     assert response.status_code == 200, response.text
     body = response.json()

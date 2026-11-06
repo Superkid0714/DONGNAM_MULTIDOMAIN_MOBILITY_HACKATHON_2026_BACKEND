@@ -1,10 +1,9 @@
 from fastapi.testclient import TestClient
 from saas_fixtures import FORWARDER_ORG_ID
-from test_plan_confirm import _plan
+from test_plan_confirm import _lot_body, _plan
 from test_r2_plan_state import (
     _accept_others,
     _apply,
-    _assign,
     _confirm_order,
     _event,
     _reject_pohang,
@@ -12,6 +11,7 @@ from test_r2_plan_state import (
 )
 from test_r2_tenancy import _accept_all, _go_real
 from test_r2_tenancy import _assign as _assign_real
+from test_saas_api import _scenario
 
 from freshswitch_backend.persistence.seed import shipper_org_id
 
@@ -27,12 +27,17 @@ def _parties(payload: dict) -> tuple[set[str], set[str], set[str]]:
 
 
 def test_forwarder_and_shipper_see_only_shippers_in_the_plan(
-    platform_client: TestClient, saas_login
+    forwarder_client: TestClient, platform_client: TestClient, saas_login
 ) -> None:
-    plan_id = _plan(platform_client, saas_login, skip=("sh-pohang",))["plan_id"]
+    pohang = next(lot for lot in _scenario().lots if lot.shipper_id == "sh-pohang")
+    registered = saas_login(shipper_org_id("sh-pohang")).post(
+        "/api/saas/shipper/lots", json=_lot_body(pohang)
+    )
+    assert registered.status_code == 201, registered.text
+    plan_id = _plan(forwarder_client, saas_login, skip=("sh-pohang",))["plan_id"]
     real = _go_real(saas_login)
-    _accept_all(real, platform_client, plan_id)
-    assert _assign_real(platform_client, plan_id).status_code == 200
+    _accept_all(real, real(FORWARDER_ORG_ID), plan_id)
+    assert _assign_real(platform_client, plan_id).status_code == 403
 
     full = platform_client.get(f"/api/plans/{plan_id}").json()
     assert "sh-pohang" in {s["id"] for s in full["scenario"]["shippers"]}
@@ -53,18 +58,17 @@ def test_forwarder_and_shipper_see_only_shippers_in_the_plan(
 
 
 def test_rejected_shipper_dropped_by_cancel_candidate_loses_plan_access(
-    platform_client: TestClient, saas_login, forwarder_client: TestClient
+    forwarder_client: TestClient, saas_login
 ) -> None:
-    plan_id = _plan(platform_client, saas_login)["plan_id"]
-    _assign(platform_client, plan_id)
+    plan_id = _plan(forwarder_client, saas_login)["plan_id"]
     _reject_pohang(saas_login, plan_id)
-    _accept_others(saas_login, platform_client, plan_id)
-    candidate = _rejected_candidate(platform_client, plan_id)
+    _accept_others(saas_login, forwarder_client, plan_id)
+    candidate = _rejected_candidate(forwarder_client, plan_id)
     applied = _apply(
-        platform_client, plan_id, _event(platform_client, plan_id, candidate["events"][0])
+        forwarder_client, plan_id, _event(forwarder_client, plan_id, candidate["events"][0])
     )
     _confirm_order(
-        platform_client, saas_login, forwarder_client, plan_id, applied["active_order_id"]
+        forwarder_client, saas_login, forwarder_client, plan_id, applied["active_order_id"]
     )
 
     pohang = saas_login(shipper_org_id("sh-pohang"))

@@ -155,9 +155,9 @@ def test_replan5_adjustment_only_shipper_gets_notice(
 
 
 def test_replan6_logged_in_platform_cannot_answer_requests(
-    platform_client: TestClient, saas_login
+    platform_client: TestClient, forwarder_client: TestClient, saas_login
 ) -> None:
-    plan_id = _plan(platform_client, saas_login)["plan_id"]
+    plan_id = _plan(forwarder_client, saas_login)["plan_id"]
     response = platform_client.post(
         f"/api/plans/{plan_id}/orders/any/requests/REQ-1", json={"accepted": True}
     )

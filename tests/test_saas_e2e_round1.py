@@ -2,12 +2,10 @@ import json
 import re
 
 from fastapi.testclient import TestClient
-from saas_fixtures import FORWARDER_ORG_ID
+from saas_fixtures import accept_plan, open_quantity_window, queue_quantity
 
 from freshswitch_backend.data.loader import get_scenario
-from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.seed import shipper_org_id
-from freshswitch_backend.persistence.tables import PlanForwarderRow
 
 POHANG_REDUCE = {"type": "reduce", "lot_id": "lot-pohang-gr-1", "new_pallets": 2}
 MONEY = re.compile(r"\d[\d,]*(?:\.\d+)?\s*(?:만\s*)?원")
@@ -25,7 +23,7 @@ def _lot_body(lot) -> dict:
     }
 
 
-def _reduced_plan(platform_client: TestClient, saas_login) -> tuple[str, str]:
+def _reduced_plan(forwarder_client: TestClient, saas_login) -> tuple[str, str]:
     scenario = get_scenario("default")
     assert scenario is not None
     ids = []
@@ -34,14 +32,20 @@ def _reduced_plan(platform_client: TestClient, saas_login) -> tuple[str, str]:
         response = client.post("/api/saas/shipper/lots", json=_lot_body(lot))
         assert response.status_code == 201, response.text
         ids.append(response.json()["registered"]["id"])
-    created = platform_client.post("/api/saas/platform/plans", json={"lot_ids": ids})
+    created = forwarder_client.post("/api/saas/forwarder/plans", json={"lot_ids": ids})
     assert created.status_code == 201, created.text
     plan_id = created.json()["plan_id"]
-    with database.begin() as db:
-        db.add(PlanForwarderRow(plan_id=plan_id, forwarder_org_id=FORWARDER_ORG_ID))
-    event = platform_client.post(f"/api/plans/{plan_id}/events", json={"event": POHANG_REDUCE})
+    accept_plan(saas_login, plan_id)
+    open_quantity_window()
+    queue_quantity(
+        saas_login("shipper-pohang"),
+        plan_id,
+        POHANG_REDUCE["lot_id"],
+        POHANG_REDUCE["new_pallets"],
+    )
+    event = forwarder_client.post(f"/api/plans/{plan_id}/events", json={"event": POHANG_REDUCE})
     assert event.status_code == 200, event.text
-    applied = platform_client.post(
+    applied = forwarder_client.post(
         f"/api/plans/{plan_id}/apply", json={"alternative_id": "pull_forward"}
     )
     assert applied.status_code == 200, applied.text
@@ -74,7 +78,7 @@ def _settlement_texts(orders: list[dict]) -> list[str]:
 def test_forwarder_free_text_has_no_settlement_amounts(
     platform_client: TestClient, saas_login, forwarder_client: TestClient
 ) -> None:
-    plan_id, _ = _reduced_plan(platform_client, saas_login)
+    plan_id, _ = _reduced_plan(forwarder_client, saas_login)
     platform_orders = platform_client.get(f"/api/plans/{plan_id}/orders").json()
     assert any(MONEY.search(t) for t in _settlement_texts(platform_orders))
 
@@ -93,8 +97,10 @@ def test_forwarder_free_text_has_no_settlement_amounts(
     assert platform_plan["history"][0]["explanation"]["shipper_messages"]
 
 
-def test_shipper_free_text_has_only_own_amounts(platform_client: TestClient, saas_login) -> None:
-    plan_id, _ = _reduced_plan(platform_client, saas_login)
+def test_shipper_free_text_has_only_own_amounts(
+    platform_client: TestClient, saas_login, forwarder_client: TestClient
+) -> None:
+    plan_id, _ = _reduced_plan(forwarder_client, saas_login)
     platform_plan = platform_client.get(f"/api/plans/{plan_id}").json()
     platform_messages = platform_plan["history"][0]["explanation"]["shipper_messages"]
     sangju_message = next(m for m in platform_messages if m["shipper_id"] == "sh-sangju")
@@ -135,9 +141,9 @@ def test_shipper_free_text_has_only_own_amounts(platform_client: TestClient, saa
 
 
 def test_shipper_plan_detail_holds_only_own_settlement(
-    platform_client: TestClient, saas_login
+    platform_client: TestClient, saas_login, forwarder_client: TestClient
 ) -> None:
-    plan_id, _ = _reduced_plan(platform_client, saas_login)
+    plan_id, _ = _reduced_plan(forwarder_client, saas_login)
     full = platform_client.get(f"/api/plans/{plan_id}").json()
     own_row = next(s for s in full["plan"]["settlements"] if s["shipper_id"] == "sh-pohang")
     own_cost = next(c for c in full["plan"]["shipper_costs"] if c["shipper_id"] == "sh-pohang")
@@ -174,13 +180,13 @@ def test_shipper_plan_detail_holds_only_own_settlement(
 
 
 def _confirm_all(
-    platform_client: TestClient,
+    reader: TestClient,
     saas_login,
     forwarder_client: TestClient,
     plan_id: str,
     order_id: str,
 ) -> None:
-    order = platform_client.get(f"/api/plans/{plan_id}/orders/{order_id}").json()
+    order = reader.get(f"/api/plans/{plan_id}/orders/{order_id}").json()
     for confirmation in order["shipper_confirmations"]:
         shipper = saas_login(shipper_org_id(confirmation["shipper_id"]))
         answered = shipper.post(
@@ -202,12 +208,12 @@ def _pallets(client: TestClient, path: str, lot_id: str) -> tuple[int, str]:
 def test_confirmed_reduce_updates_lot_record(
     platform_client: TestClient, saas_login, forwarder_client: TestClient
 ) -> None:
-    plan_id, order_id = _reduced_plan(platform_client, saas_login)
+    plan_id, order_id = _reduced_plan(forwarder_client, saas_login)
     pohang = saas_login("shipper-pohang")
     lot_id = POHANG_REDUCE["lot_id"]
     assert _pallets(pohang, "/api/saas/shipper/lots", lot_id) == (5, "planned")
 
-    _confirm_all(platform_client, saas_login, forwarder_client, plan_id, order_id)
+    _confirm_all(forwarder_client, saas_login, forwarder_client, plan_id, order_id)
 
     assert _pallets(pohang, "/api/saas/shipper/lots", lot_id) == (2, "planned")
     assert _pallets(platform_client, "/api/saas/platform/lots", lot_id) == (2, "planned")
@@ -215,8 +221,10 @@ def test_confirmed_reduce_updates_lot_record(
     assert _pallets(sangju, "/api/saas/shipper/lots", "lot-sangju-gr-1") == (13, "planned")
 
 
-def test_rejected_reduce_keeps_lot_record(platform_client: TestClient, saas_login) -> None:
-    plan_id, order_id = _reduced_plan(platform_client, saas_login)
+def test_rejected_reduce_keeps_lot_record(
+    platform_client: TestClient, saas_login, forwarder_client: TestClient
+) -> None:
+    plan_id, order_id = _reduced_plan(forwarder_client, saas_login)
     order = platform_client.get(f"/api/plans/{plan_id}/orders/{order_id}").json()
     first = order["shipper_confirmations"][0]["shipper_id"]
     shipper = saas_login(shipper_org_id(first))
@@ -232,18 +240,19 @@ def test_rejected_reduce_keeps_lot_record(platform_client: TestClient, saas_logi
 def test_confirmed_cancel_marks_lot_cancelled(
     platform_client: TestClient, saas_login, forwarder_client: TestClient
 ) -> None:
-    plan_id, order_id = _reduced_plan(platform_client, saas_login)
-    _confirm_all(platform_client, saas_login, forwarder_client, plan_id, order_id)
+    plan_id, order_id = _reduced_plan(forwarder_client, saas_login)
+    _confirm_all(forwarder_client, saas_login, forwarder_client, plan_id, order_id)
     cancel = {"type": "cancel", "lot_id": "lot-jinju-sb-1"}
-    event = platform_client.post(f"/api/plans/{plan_id}/events", json={"event": cancel})
+    queue_quantity(saas_login("shipper-jinju"), plan_id, cancel["lot_id"], 0)
+    event = forwarder_client.post(f"/api/plans/{plan_id}/events", json={"event": cancel})
     assert event.status_code == 200, event.text
     alternative = next(a["id"] for a in event.json()["alternatives"] if a["feasible"])
-    applied = platform_client.post(
+    applied = forwarder_client.post(
         f"/api/plans/{plan_id}/apply", json={"alternative_id": alternative}
     )
     assert applied.status_code == 200, applied.text
     _confirm_all(
-        platform_client, saas_login, forwarder_client, plan_id, applied.json()["active_order_id"]
+        forwarder_client, saas_login, forwarder_client, plan_id, applied.json()["active_order_id"]
     )
     jinju = saas_login("shipper-jinju")
     assert _pallets(jinju, "/api/saas/shipper/lots", "lot-jinju-sb-1") == (8, "cancelled")

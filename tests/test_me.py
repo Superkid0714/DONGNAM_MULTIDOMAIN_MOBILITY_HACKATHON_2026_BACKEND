@@ -2,11 +2,9 @@ import json
 
 import pytest
 from fastapi.testclient import TestClient
+from saas_fixtures import saas_app
 
-from freshswitch_backend.config import get_settings
-from freshswitch_backend.main import app, create_app
 from freshswitch_backend.persistence import database
-from freshswitch_backend.persistence.seed import demo_orgs
 from freshswitch_backend.persistence.tables import UserRow
 
 CSRF = {"X-Requested-With": "freshswitch"}
@@ -29,12 +27,12 @@ def signup(client: TestClient, email: str) -> dict:
 
 @pytest.fixture
 def profile_client() -> TestClient:
-    return TestClient(app, base_url="https://testserver")
+    return TestClient(saas_app, base_url="https://testserver")
 
 
 def test_profile_update_persists_and_preserves_other_users_and_memberships(profile_client):
     before = signup(profile_client, "owner@example.com")
-    other = TestClient(app, base_url="https://testserver")
+    other = TestClient(saas_app, base_url="https://testserver")
     other_before = signup(other, "other@example.com")
     response = profile_client.patch("/api/me", json={"name": "  수정한 이름  "}, headers=CSRF)
     assert response.status_code == 200, response.text
@@ -92,28 +90,3 @@ def test_profile_update_accepts_maximum_trimmed_name(profile_client):
     response = profile_client.patch("/api/me", json={"name": f" {name} "}, headers=CSRF)
     assert response.status_code == 200, response.text
     assert profile_client.get("/api/me").json()["user"]["name"] == name
-
-
-def test_visitor_profile_update_is_isolated_from_seed_and_other_visitors(demo_tenants):
-    settings = get_settings().model_copy(update={"saas_mode": True})
-    visitor_app = create_app(settings)
-    visitor = TestClient(visitor_app, base_url="https://testserver", headers=CSRF)
-    other = TestClient(visitor_app, base_url="https://testserver", headers=CSRF)
-    before = visitor.post("/api/auth/demo-login", json={"new_world": True}).json()
-    other_before = other.post("/api/auth/demo-login", json={"new_world": True}).json()
-    with database.begin() as db:
-        seeds_before = {o.user_id: db.get(UserRow, o.user_id).name for o in demo_orgs()}
-    response = visitor.patch("/api/me", json={"name": "내 데모 이름"})
-    assert response.status_code == 200, response.text
-    assert response.json() == {**before["user"], "name": "내 데모 이름"}
-    assert other.get("/api/me").json() == other_before
-    with database.begin() as db:
-        assert {o.user_id: db.get(UserRow, o.user_id).name for o in demo_orgs()} == seeds_before
-
-
-def test_shared_seed_profile_cannot_be_edited(profile_client, demo_tenants):
-    response = profile_client.post("/api/auth/demo-login", json={"org_type": "shipper"})
-    assert response.status_code == 200, response.text
-    before = response.json()
-    assert profile_client.patch("/api/me", json={"name": "변경"}, headers=CSRF).status_code == 403
-    assert profile_client.get("/api/me").json() == before

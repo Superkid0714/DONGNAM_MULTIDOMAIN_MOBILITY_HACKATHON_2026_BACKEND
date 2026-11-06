@@ -2,14 +2,13 @@ from datetime import UTC, datetime
 
 import pytest
 from fastapi.testclient import TestClient
-from saas_fixtures import FORWARDER_ORG_ID
+from saas_fixtures import accept_plan, open_quantity_window, queue_quantity
 from test_add_lot import _apply_add, _plan_with_spare
+from test_plan_confirm import ATTENTION
 from test_saas_api import _register_all
 
 from freshswitch_backend.execution.models import OrderLogEntry
-from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.seed import shipper_org_id
-from freshswitch_backend.persistence.tables import PlanForwarderRow
 from freshswitch_backend.planning import store as store_module
 from freshswitch_backend.planning.store import store
 from freshswitch_backend.quality import quality_history
@@ -308,20 +307,20 @@ def test_apply_rejects_order_past_deadline_on_every_branch(
     assert _orders(client, plan_id) == []
 
 
-def test_platform_attention_applies_expiry_before_listing(
-    platform_client: TestClient, saas_login
+def test_forwarder_attention_applies_expiry_before_listing(
+    forwarder_client: TestClient, platform_client: TestClient, saas_login
 ) -> None:
-    plan_id, extra = _plan_with_spare(platform_client, saas_login, skip=("sh-jinju",))
-    _apply_add(platform_client, plan_id, extra)
+    plan_id, extra = _plan_with_spare(forwarder_client, saas_login, skip=("sh-jinju",))
+    _apply_add(forwarder_client, plan_id, extra)
 
     def attention() -> dict:
-        items = platform_client.get("/api/saas/platform/plan-confirmations").json()
+        items = forwarder_client.get(ATTENTION).json()
         return next(s for s in items if s["plan_id"] == plan_id)
 
     pending = attention()
     assert pending["status"] == "pending_confirmation"
     store.clock = lambda: LATE
-    listed = platform_client.get("/api/saas/platform/plan-confirmations").json()
+    listed = forwarder_client.get(ATTENTION).json()
     assert plan_id not in {s["plan_id"] for s in listed}
     session = platform_client.get(f"/api/plans/{plan_id}").json()
     assert session["status"] == "committed"
@@ -343,19 +342,29 @@ def test_demo_plan_list_applies_expiry_before_listing(client: TestClient) -> Non
     assert listed["version"] == detail["version"] == 3
 
 
-def test_saas_lists_and_settlements_apply_expiry(platform_client: TestClient, saas_login) -> None:
-    created = platform_client.post(
-        "/api/saas/platform/plans", json={"lot_ids": _register_all(saas_login), "auto_accept": True}
+def _cancel_sangju(forwarder_client: TestClient, saas_login, plan_id: str, sangju: str) -> None:
+    open_quantity_window()
+    queued = queue_quantity(saas_login(shipper_org_id("sh-sangju")), plan_id, sangju, 0)
+    path = f"/api/saas/forwarder/change-requests/{queued['change_request_id']}"
+    computed = forwarder_client.post(f"{path}/replan?llm=false")
+    assert computed.status_code == 200, computed.text
+    chosen = computed.json()["replan"]["recommended_id"]
+    applied = forwarder_client.post(f"{path}/apply", json={"alternative_id": chosen})
+    assert applied.status_code == 200, applied.text
+
+
+def test_saas_lists_and_settlements_apply_expiry(
+    forwarder_client: TestClient, platform_client: TestClient, saas_login
+) -> None:
+    created = forwarder_client.post(
+        "/api/saas/forwarder/plans", json={"lot_ids": _register_all(saas_login)}
     )
     assert created.status_code == 201, created.text
     plan = created.json()
     plan_id = plan["plan_id"]
-    with database.begin() as db:
-        db.add(PlanForwarderRow(plan_id=plan_id, forwarder_org_id=FORWARDER_ORG_ID))
+    accept_plan(saas_login, plan_id)
     sangju = next(lot["id"] for lot in plan["scenario"]["lots"] if lot["shipper_id"] == "sh-sangju")
-    result = _event(platform_client, plan_id, {"type": "cancel", "lot_id": sangju})
-    chosen = result["recommended_id"] or _charged(result)
-    assert _apply(platform_client, plan_id, result, chosen).status_code == 200
+    _cancel_sangju(forwarder_client, saas_login, plan_id, sangju)
 
     def platform_item() -> dict:
         items = platform_client.get("/api/saas/platform/plans").json()
@@ -371,10 +380,7 @@ def test_saas_lists_and_settlements_apply_expiry(platform_client: TestClient, sa
     assert platform_item()["status"] == "committed"
     settled = platform_settlement()
     assert settled != pending_settlement
-    store.clock = lambda: datetime(2026, 11, 10, 0, 0, tzinfo=UTC)
-    second = _event(platform_client, plan_id, {"type": "cancel", "lot_id": sangju})
-    chosen = second["recommended_id"] or _charged(second)
-    assert _apply(platform_client, plan_id, second, chosen).status_code == 200
+    _cancel_sangju(forwarder_client, saas_login, plan_id, sangju)
     store.clock = lambda: LATE
     sangju_client = saas_login(shipper_org_id("sh-sangju"))
     mine = next(
@@ -383,11 +389,7 @@ def test_saas_lists_and_settlements_apply_expiry(platform_client: TestClient, sa
     assert mine["status"] == "committed"
     assert mine["my_pallets"] > 0
     assert sangju_client.get("/api/saas/shipper/settlements").json() != []
-    store.clock = lambda: datetime(2026, 11, 10, 0, 0, tzinfo=UTC)
-    third = _event(platform_client, plan_id, {"type": "cancel", "lot_id": sangju})
-    chosen = third["recommended_id"] or _charged(third)
-    assert _apply(platform_client, plan_id, third, chosen).status_code == 200
+    _cancel_sangju(forwarder_client, saas_login, plan_id, sangju)
     store.clock = lambda: LATE
-    forwarder = saas_login(FORWARDER_ORG_ID)
-    items = forwarder.get("/api/saas/forwarder/plans").json()
+    items = forwarder_client.get("/api/saas/forwarder/plans").json()
     assert next(p for p in items if p["plan_id"] == plan_id)["status"] == "committed"

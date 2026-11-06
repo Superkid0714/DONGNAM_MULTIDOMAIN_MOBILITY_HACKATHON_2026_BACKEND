@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
-from saas_fixtures import seed_client
+from saas_fixtures import SCENARIO_DEVICE_ID, forwarder_scenario_plan, seed_client
 
 from freshswitch_backend.coldchain import ColdchainParams
 from freshswitch_backend.coldchain.models import ReadingIn, TimelinePoint
@@ -14,8 +14,6 @@ from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.domain.models import KST
 from freshswitch_backend.lots import ANY_ORG, lot_store
 from freshswitch_backend.main import create_app
-from freshswitch_backend.persistence import database
-from freshswitch_backend.persistence.tables import PlanForwarderRow
 from freshswitch_backend.planning.store import store
 
 CSRF = {"X-Requested-With": "freshswitch"}
@@ -86,14 +84,19 @@ def test_residual_risks_flag_swing_gap_and_door() -> None:
     }
 
 
-def test_demo_csv_downloads(client: TestClient) -> None:
-    plan_id = client.post("/api/plans", json={"scenario_id": "default"}).json()["plan_id"]
+def test_forwarder_csv_downloads(demo_tenants) -> None:
+    client, plan_id = forwarder_scenario_plan()
     params = {"plan_id": plan_id}
     before = client.get("/api/coldchain/containers/CA-01/readings.csv", params=params)
     assert before.status_code == 404
     client.post(
         "/api/coldchain/simulate",
-        json={"preset": "power_cut_restore", "plan_id": plan_id, "container_id": "CA-01"},
+        json={
+            "preset": "power_cut_restore",
+            "plan_id": plan_id,
+            "container_id": "CA-01",
+            "device_id": SCENARIO_DEVICE_ID,
+        },
     )
     state = client.get("/api/coldchain/containers/CA-01", params=params).json()
     readings = _rows(client.get("/api/coldchain/containers/CA-01/readings.csv", params=params))
@@ -132,15 +135,13 @@ def saas_plan(saas_app) -> str:
     lot = next(item for item in scenario.lots if item.id == LOT_ID)
     lot_store.create(lambda _: (lot, scenario.id, None), org_id=SHIPPER)
     session = store.create(
-        scenario, registered_lot_ids=[LOT_ID], org_id=PLATFORM, lot_org_id=ANY_ORG
+        scenario, registered_lot_ids=[LOT_ID], org_id=FORWARDER, lot_org_id=ANY_ORG
     )
-    with database.begin() as db:
-        db.add(PlanForwarderRow(plan_id=session.plan_id, forwarder_org_id=FORWARDER))
-    platform = _login(saas_app, PLATFORM)
-    registered = platform.post("/api/saas/devices", json={"device_id": "demo-sensor-01"})
+    forwarder = _login(saas_app, FORWARDER)
+    registered = forwarder.post("/api/saas/devices", json={"device_id": "demo-sensor-01"})
     assert registered.status_code == 201, registered.text
     for container_id in ("CA-01", "CA-02"):
-        run = platform.post(
+        run = forwarder.post(
             "/api/coldchain/simulate",
             json={
                 "preset": "short_outage",
@@ -173,8 +174,8 @@ def test_csv_role_scope(saas_app, saas_plan: str, kind: str) -> None:
     assert anonymous.get(own, params=params).status_code == 401
 
 
-def test_readings_csv_neutralises_formula_cells(client: TestClient) -> None:
-    plan_id = client.post("/api/plans", json={"scenario_id": "default"}).json()["plan_id"]
+def test_readings_csv_neutralises_formula_cells(demo_tenants) -> None:
+    client, plan_id = forwarder_scenario_plan()
     reading = {
         "device_id": "=1+1",
         "container_id": "CA-01",
@@ -186,7 +187,8 @@ def test_readings_csv_neutralises_formula_cells(client: TestClient) -> None:
     rejected = client.post("/api/coldchain/readings", json=reading)
     assert rejected.status_code == 422, rejected.text
     stored = coldchain_store.ingest(
-        [ReadingIn.model_construct(**{**reading, "ts": START, "stage": None})]
+        [ReadingIn.model_construct(**{**reading, "ts": START, "stage": None})],
+        org_id=FORWARDER,
     )
     assert stored.accepted == 1
     params = {"plan_id": plan_id}

@@ -16,8 +16,6 @@ from freshswitch_backend.config import get_settings
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.lots import ANY_ORG, lot_store
 from freshswitch_backend.main import create_app
-from freshswitch_backend.persistence import database
-from freshswitch_backend.persistence.tables import PlanForwarderRow
 from freshswitch_backend.planning.store import store
 
 OWN_LOT = "lot-jinju-sb-1"
@@ -36,15 +34,13 @@ def plan_id(demo_tenants) -> str:
     lot = next(item for item in scenario.lots if item.id == OWN_LOT)
     lot_store.create(lambda _: (lot, scenario.id, None), org_id=SHIPPER_ORG_ID)
     session = store.create(
-        scenario, registered_lot_ids=[OWN_LOT], org_id=PLATFORM_ORG_ID, lot_org_id=ANY_ORG
+        scenario, registered_lot_ids=[OWN_LOT], org_id=FORWARDER_ORG_ID, lot_org_id=ANY_ORG
     )
-    with database.begin() as db:
-        db.add(PlanForwarderRow(plan_id=session.plan_id, forwarder_org_id=FORWARDER_ORG_ID))
     return session.plan_id
 
 
 def _foreign_lots(plan_id: str) -> list[str]:
-    session = store.get(plan_id, org_id=PLATFORM_ORG_ID)
+    session = store.get(plan_id, org_id=FORWARDER_ORG_ID)
     assert session is not None
     return [lot.id for lot in session.scenario.lots if lot.shipper_id != OWN_SHIPPER]
 
@@ -59,8 +55,8 @@ def _leaks(payload: object, raw_ids: list[str]) -> list[str]:
 
 
 @pytest.fixture
-def platform(saas_app, plan_id: str) -> TestClient:
-    client = seed_client(PLATFORM_ORG_ID, saas_app)
+def forwarder(saas_app, plan_id: str) -> TestClient:
+    client = seed_client(FORWARDER_ORG_ID, saas_app)
     registered = client.post("/api/saas/devices", json={"device_id": "demo-sensor-01"})
     assert registered.status_code == 201, registered.text
     run = client.post(
@@ -80,15 +76,15 @@ def _action_path(key: str, step: str) -> str:
     return f"/api/coldchain/containers/CA-01/actions/{key}/{step}"
 
 
-def _handled(saas_app, plan_id: str, platform: TestClient) -> list[dict]:
+def _handled(saas_app, plan_id: str, forwarder: TestClient) -> list[dict]:
     params = {"plan_id": plan_id}
+    platform = seed_client(PLATFORM_ORG_ID, saas_app)
     actions = platform.get("/api/coldchain/containers/CA-01", params=params).json()["actions"]
     note = "lot-sancheong-sb-1 하차 확인"
-    accepted = platform.post(
+    accepted = forwarder.post(
         _action_path(actions[0]["key"], "accept"), params=params, json={"note": note}
     )
     assert accepted.status_code == 200, accepted.text
-    forwarder = seed_client(FORWARDER_ORG_ID, saas_app)
     done = forwarder.post(_action_path(actions[1]["key"], "complete"), params=params)
     assert done.status_code == 200, done.text
     return platform.get("/api/coldchain/containers/CA-01", params=params).json()["actions"]
@@ -97,7 +93,7 @@ def _handled(saas_app, plan_id: str, platform: TestClient) -> list[dict]:
 def _plan_detail_ids(shipper: TestClient, plan_id: str) -> dict[str, str]:
     detail = shipper.get(f"/api/saas/shipper/plans/{plan_id}")
     assert detail.status_code == 200, detail.text
-    session = store.get(plan_id, org_id=PLATFORM_ORG_ID)
+    session = store.get(plan_id, org_id=FORWARDER_ORG_ID)
     assert session is not None
     raw = [lot.id for lot in session.scenario.lots]
     shown = [lot["id"] for lot in detail.json()["scenario"]["lots"]]
@@ -109,10 +105,10 @@ def _expected(raw_actions: list[dict], mapping: dict[str, str]) -> dict[str, lis
 
 
 def test_shipper_twin_actions_use_plan_detail_anon_ids(
-    saas_app, plan_id: str, platform: TestClient
+    saas_app, plan_id: str, forwarder: TestClient
 ) -> None:
-    raw_actions = _handled(saas_app, plan_id, platform)
-    assert raw_actions[0]["accepted_by"]["org_id"] == PLATFORM_ORG_ID
+    raw_actions = _handled(saas_app, plan_id, forwarder)
+    assert raw_actions[0]["accepted_by"]["org_id"] == FORWARDER_ORG_ID
     assert raw_actions[0]["accepted_by"]["user_id"]
     assert raw_actions[1]["done_by"]["org_id"] == FORWARDER_ORG_ID
     shipper = seed_client(SHIPPER_ORG_ID, saas_app)
@@ -130,7 +126,7 @@ def test_shipper_twin_actions_use_plan_detail_anon_ids(
     assert _leaks(body, _foreign_lots(plan_id)) == []
     first = next(a for a in body["actions"] if a["key"] == raw_actions[0]["key"])
     assert first["note"] == f"{mapping['lot-sancheong-sb-1']} 하차 확인"
-    assert first["accepted_by"] == {"org_type": "platform", "org_id": None, "user_id": None}
+    assert first["accepted_by"] == {"org_type": "forwarder", "org_id": None, "user_id": None}
     second = next(a for a in body["actions"] if a["key"] == raw_actions[1]["key"])
     assert second["done_by"] == {"org_type": "forwarder", "org_id": None, "user_id": None}
     text = json.dumps(body, ensure_ascii=False)
@@ -139,9 +135,9 @@ def test_shipper_twin_actions_use_plan_detail_anon_ids(
 
 
 def test_shipper_alerts_and_stream_use_plan_detail_anon_ids(
-    saas_app, plan_id: str, platform: TestClient
+    saas_app, plan_id: str, forwarder: TestClient
 ) -> None:
-    raw_actions = _handled(saas_app, plan_id, platform)
+    raw_actions = _handled(saas_app, plan_id, forwarder)
     shipper = seed_client(SHIPPER_ORG_ID, saas_app)
     mapping = _plan_detail_ids(shipper, plan_id)
     expected = _expected(raw_actions, mapping)
@@ -166,20 +162,20 @@ def test_shipper_alerts_and_stream_use_plan_detail_anon_ids(
     assert [h for h in handlers if h is not None and (h["org_id"] or h["user_id"])] == []
 
 
-def test_platform_and_forwarder_keep_raw_ids(saas_app, plan_id: str, platform: TestClient) -> None:
-    raw_actions = _handled(saas_app, plan_id, platform)
-    forwarder = seed_client(FORWARDER_ORG_ID, saas_app)
+def test_platform_and_forwarder_keep_raw_ids(saas_app, plan_id: str, forwarder: TestClient) -> None:
+    raw_actions = _handled(saas_app, plan_id, forwarder)
+    platform = seed_client(PLATFORM_ORG_ID, saas_app)
     params = {"plan_id": plan_id}
     state = forwarder.get("/api/coldchain/containers/CA-01", params=params).json()
     assert [a["lot_ids"] for a in state["actions"]] == [a["lot_ids"] for a in raw_actions]
-    assert state["actions"][0]["accepted_by"]["org_id"] == PLATFORM_ORG_ID
+    assert state["actions"][0]["accepted_by"]["org_id"] == FORWARDER_ORG_ID
     assert state["loss"]["cargo_value"] is None
     alerts = platform.get("/api/coldchain/alerts", params=params).json()["alerts"]
     assert "lot-sancheong-sb-1" in json.dumps(alerts, ensure_ascii=False)
 
 
 def test_shipper_action_hides_lot_ids_missing_from_ledger(plan_id: str) -> None:
-    session = store.get(plan_id, org_id=PLATFORM_ORG_ID)
+    session = store.get(plan_id, org_id=FORWARDER_ORG_ID)
     assert session is not None
     view = shipper_coldchain_view(session, [OWN_SHIPPER])
     fresh = "lot-newcomer-9"

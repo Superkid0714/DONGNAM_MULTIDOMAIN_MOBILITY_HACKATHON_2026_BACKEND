@@ -2,19 +2,18 @@ import json
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select, update
+from saas_fixtures import saas_app
+from sqlalchemy import update
 
-from freshswitch_backend.config import get_settings
-from freshswitch_backend.main import app, create_app
 from freshswitch_backend.persistence import database
-from freshswitch_backend.persistence.tables import MembershipRow, OrganizationRow, ShipperProfileRow
+from freshswitch_backend.persistence.tables import MembershipRow, OrganizationRow
 
 CSRF = {"X-Requested-With": "freshswitch"}
 PATH = "/api/saas/org"
 
 
 def signup(email: str, org_type: str = "shipper") -> tuple[TestClient, dict]:
-    client = TestClient(app, base_url="https://testserver", headers=CSRF)
+    client = TestClient(saas_app, base_url="https://testserver", headers=CSRF)
     response = client.post(
         "/api/auth/signup",
         json={
@@ -47,7 +46,7 @@ def test_rename_persists_for_current_company_only(org_type):
 
 
 def test_rename_requires_authentication_csrf_and_admin():
-    anonymous = TestClient(app, base_url="https://testserver")
+    anonymous = TestClient(saas_app, base_url="https://testserver")
     assert anonymous.patch(PATH, json={"name": "수정"}).status_code == 401
     client, before = signup("owner@example.com")
     for header in ("", "XMLHttpRequest"):
@@ -100,40 +99,4 @@ def test_org_header_cannot_select_unrelated_company():
         ).status_code
         == 403
     )
-    assert client.get("/api/me").json() == before
-
-
-def test_visitor_company_rename_syncs_shipper_profile_and_preserves_other_worlds(demo_tenants):
-    visitor_app = create_app(get_settings().model_copy(update={"saas_mode": True}))
-    visitor = TestClient(visitor_app, base_url="https://testserver", headers=CSRF)
-    other = TestClient(visitor_app, base_url="https://testserver", headers=CSRF)
-    before = visitor.post("/api/auth/demo-login", json={"org_type": "shipper"}).json()
-    other_before = other.post("/api/auth/demo-login", json={"org_type": "shipper"}).json()
-    org_id = before["active_org"]["org_id"]
-    with database.begin() as db:
-        previous_names = dict(
-            db.execute(select(ShipperProfileRow.id, ShipperProfileRow.name)).all()
-        )
-        own_ids = set(
-            db.scalars(select(ShipperProfileRow.id).where(ShipperProfileRow.org_id == org_id))
-        )
-    assert own_ids
-    response = visitor.patch(PATH, json={"name": "우리 업체"})
-    assert response.status_code == 200, response.text
-    profile = visitor.get("/api/saas/shipper/profile").json()
-    assert profile["org_name"] == profile["profile"]["name"] == "우리 업체"
-    assert other.get("/api/me").json() == other_before
-    with database.begin() as db:
-        after_names = dict(db.execute(select(ShipperProfileRow.id, ShipperProfileRow.name)).all())
-    assert after_names == {
-        key: "우리 업체" if key in own_ids else name for key, name in previous_names.items()
-    }
-
-
-def test_shared_seed_company_rename_is_forbidden(demo_tenants):
-    client = TestClient(app, base_url="https://testserver", headers=CSRF)
-    response = client.post("/api/auth/demo-login", json={"org_type": "shipper"})
-    assert response.status_code == 200, response.text
-    before = response.json()
-    assert client.patch(PATH, json={"name": "수정"}).status_code == 403
     assert client.get("/api/me").json() == before

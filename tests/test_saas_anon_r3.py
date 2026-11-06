@@ -2,8 +2,9 @@ import json
 from datetime import UTC, datetime
 
 from fastapi.testclient import TestClient
-from saas_fixtures import PLATFORM_ORG_ID
-from test_saas_api import REDUCE, _assign, _platform_plan
+from saas_fixtures import FORWARDER_ORG_ID
+from test_deep_review_views import _queue_event
+from test_saas_api import REDUCE, _forwarder_plan
 
 from freshswitch_backend.api import saas_views
 from freshswitch_backend.api.saas_views import shipper_fixed_reasons, shipper_route_changes
@@ -16,11 +17,12 @@ CANCELLED = "lot-sancheong-sb-1"
 CANCEL = {"type": "cancel", "lot_id": CANCELLED}
 
 
-def _apply(platform_client: TestClient, plan_id: str, event: dict) -> dict:
-    replanned = platform_client.post(f"/api/plans/{plan_id}/events", json={"event": event})
+def _apply(forwarder_client: TestClient, plan_id: str, event: dict) -> dict:
+    _queue_event(plan_id, event)
+    replanned = forwarder_client.post(f"/api/plans/{plan_id}/events", json={"event": event})
     assert replanned.status_code == 200, replanned.text
     alternative = next(a["id"] for a in replanned.json()["alternatives"] if a["feasible"])
-    applied = platform_client.post(
+    applied = forwarder_client.post(
         f"/api/plans/{plan_id}/apply", json={"alternative_id": alternative}
     )
     assert applied.status_code == 200, applied.text
@@ -31,21 +33,19 @@ def _anon_id(plan: dict, raw_ids: list[str], lot_id: str) -> str:
     return plan["registered_lot_ids"][raw_ids.index(lot_id)]
 
 
-def _cancelled_plan(platform_client: TestClient, saas_login) -> tuple[str, list[str], str]:
-    created = _platform_plan(platform_client, saas_login)
+def _cancelled_plan(saas_login) -> tuple[str, list[str], str]:
+    created = _forwarder_plan(saas_login)
     plan_id = created["plan_id"]
     raw_ids = created["registered_lot_ids"]
     jinju = saas_login("shipper-jinju")
     before = jinju.get(f"/api/saas/shipper/plans/{plan_id}").json()
     anon = _anon_id(before, raw_ids, CANCELLED)
-    _apply(platform_client, plan_id, CANCEL)
+    _apply(saas_login(FORWARDER_ORG_ID), plan_id, CANCEL)
     return plan_id, raw_ids, anon
 
 
-def test_cancelled_lot_keeps_one_anonymous_id_across_plan_and_orders(
-    platform_client: TestClient, saas_login
-) -> None:
-    plan_id, raw_ids, anon = _cancelled_plan(platform_client, saas_login)
+def test_cancelled_lot_keeps_one_anonymous_id_across_plan_and_orders(saas_login) -> None:
+    plan_id, raw_ids, anon = _cancelled_plan(saas_login)
     assert anon.startswith("anon-")
     jinju = saas_login("shipper-jinju")
     plan = jinju.get(f"/api/saas/shipper/plans/{plan_id}").json()
@@ -59,7 +59,7 @@ def test_cancelled_lot_keeps_one_anonymous_id_across_plan_and_orders(
     assert plan["history"][0]["event"]["lot_id"] == anon
     order = orders[0]
     assert order["event"]["lot_id"] == anon
-    assert order["cancellation"]["lot_id"] == anon
+    assert order["cancellation"] is None
     label = anon.split("-")[1]
     moved = [a for a in order["automatic"] if a["lot_ids"] == [anon]]
     assert moved
@@ -72,13 +72,13 @@ def test_cancelled_lot_keeps_one_anonymous_id_across_plan_and_orders(
     )
 
 
-def test_cancelled_shipper_still_sees_own_lot_id(platform_client: TestClient, saas_login) -> None:
-    plan_id, _, _ = _cancelled_plan(platform_client, saas_login)
+def test_cancelled_shipper_still_sees_own_lot_id(saas_login) -> None:
+    plan_id, _, _ = _cancelled_plan(saas_login)
     sancheong = saas_login("shipper-sancheong")
     plan = sancheong.get(f"/api/saas/shipper/plans/{plan_id}").json()
     assert plan["history"][0]["event"]["lot_id"] == CANCELLED
     orders = sancheong.get(f"/api/saas/shipper/plans/{plan_id}/orders").json()
-    assert orders[0]["cancellation"]["lot_id"] == CANCELLED
+    assert orders[0]["event"]["lot_id"] == CANCELLED
     assert "lot-jinju" not in json.dumps([plan, orders], ensure_ascii=False)
 
 
@@ -97,7 +97,7 @@ def _runs(payload: dict) -> list[tuple[str, int, dict]]:
 def test_shipper_routes_hide_money_of_shared_and_other_runs(
     platform_client: TestClient, saas_login
 ) -> None:
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
+    plan_id = _forwarder_plan(saas_login)["plan_id"]
     full = platform_client.get(f"/api/plans/{plan_id}").json()
     owners = _owners(full)
     runs = {
@@ -129,17 +129,17 @@ def test_shipper_routes_hide_money_of_shared_and_other_runs(
 
 
 def test_route_changes_and_fixed_reasons_are_shipper_scoped(
-    platform_client: TestClient, saas_login
+    forwarder_client: TestClient, saas_login
 ) -> None:
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
-    result = platform_client.post(f"/api/plans/{plan_id}/events", json={"event": CANCEL}).json()
+    plan_id = _forwarder_plan(saas_login)["plan_id"]
+    result = forwarder_client.post(f"/api/plans/{plan_id}/events", json={"event": CANCEL}).json()
     changes = [
         RouteChange.model_validate(change)
         for alternative in result["alternatives"]
         for change in alternative["diff"]["route_changes"]
     ]
     assert changes
-    session = store.get(plan_id, org_id=PLATFORM_ORG_ID)
+    session = store.get(plan_id, org_id=FORWARDER_ORG_ID)
     assert session is not None
     owners = {lot.id: lot.shipper_id for lot in session.scenario.lots}
     packhouses = {s.id: s.packhouse_id for s in session.scenario.shippers}
@@ -202,11 +202,10 @@ def test_route_changes_and_fixed_reasons_are_shipper_scoped(
 
 
 def test_shipper_cannot_flip_a_decided_confirmation(
-    platform_client: TestClient, saas_login
+    platform_client: TestClient, forwarder_client: TestClient, saas_login
 ) -> None:
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
-    _assign(plan_id)
-    _apply(platform_client, plan_id, REDUCE)
+    plan_id = _forwarder_plan(saas_login)["plan_id"]
+    _apply(forwarder_client, plan_id, REDUCE)
     order_id = platform_client.get(f"/api/plans/{plan_id}").json()["active_order_id"]
     miryang = saas_login("shipper-miryang")
     path = f"/api/saas/shipper/plans/{plan_id}/orders/{order_id}/confirm"
@@ -224,9 +223,11 @@ def test_shipper_cannot_flip_a_decided_confirmation(
     assert mine["status"] != "rejected"
 
 
-def test_shipper_rejection_is_final(platform_client: TestClient, saas_login) -> None:
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
-    _apply(platform_client, plan_id, REDUCE)
+def test_shipper_rejection_is_final(
+    platform_client: TestClient, forwarder_client: TestClient, saas_login
+) -> None:
+    plan_id = _forwarder_plan(saas_login)["plan_id"]
+    _apply(forwarder_client, plan_id, REDUCE)
     order_id = platform_client.get(f"/api/plans/{plan_id}").json()["active_order_id"]
     miryang = saas_login("shipper-miryang")
     path = f"/api/saas/shipper/plans/{plan_id}/orders/{order_id}/confirm"
@@ -243,8 +244,10 @@ def _history_lots(plan: dict) -> list[tuple[str, str]]:
     ]
 
 
-def test_added_lot_keeps_anonymous_id_after_cancel(platform_client: TestClient, saas_login) -> None:
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
+def test_added_lot_keeps_anonymous_id_after_cancel(
+    platform_client: TestClient, forwarder_client: TestClient, saas_login
+) -> None:
+    plan_id = _forwarder_plan(saas_login)["plan_id"]
     full = platform_client.get(f"/api/plans/{plan_id}").json()
     base = next(lot for lot in full["scenario"]["lots"] if lot["shipper_id"] == "sh-miryang")
     extras = [f"lot-miryang-extra-{n}" for n in (1, 2)]
@@ -259,12 +262,12 @@ def test_added_lot_keeps_anonymous_id_after_cancel(platform_client: TestClient, 
             "lot_id": lot_id,
         }
         assert miryang.post("/api/saas/shipper/lots", json=body).status_code == 201
-        added = platform_client.post(
-            f"/api/saas/platform/plans/{plan_id}/add-lot", json={"lot_id": lot_id}
+        added = forwarder_client.post(
+            f"/api/saas/forwarder/plans/{plan_id}/add-lot", json={"lot_id": lot_id}
         )
         assert added.status_code == 200, added.text
         alternative = next(a["id"] for a in added.json()["alternatives"] if a["feasible"])
-        applied = platform_client.post(
+        applied = forwarder_client.post(
             f"/api/plans/{plan_id}/apply", json={"alternative_id": alternative}
         )
         assert applied.status_code == 200, applied.text
@@ -275,7 +278,7 @@ def test_added_lot_keeps_anonymous_id_after_cancel(platform_client: TestClient, 
     assert second.startswith("anon-")
     assert first != second
 
-    _apply(platform_client, plan_id, {"type": "cancel", "lot_id": extras[0]})
+    _apply(forwarder_client, plan_id, {"type": "cancel", "lot_id": extras[0]})
     plan = jinju.get(f"/api/saas/shipper/plans/{plan_id}").json()
     assert _history_lots(plan) == [*before, ("cancel", first)]
     orders = jinju.get(f"/api/saas/shipper/plans/{plan_id}/orders").json()
@@ -292,11 +295,9 @@ def test_added_lot_keeps_anonymous_id_after_cancel(platform_client: TestClient, 
     assert "밀양" not in text
 
 
-def test_stored_owner_fallback_never_marks_viewer_lot(
-    platform_client: TestClient, saas_login, monkeypatch
-) -> None:
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
-    session = store.get(plan_id, org_id=PLATFORM_ORG_ID)
+def test_stored_owner_fallback_never_marks_viewer_lot(saas_login, monkeypatch) -> None:
+    plan_id = _forwarder_plan(saas_login)["plan_id"]
+    session = store.get(plan_id, org_id=FORWARDER_ORG_ID)
     assert session is not None
     ghost = "lot-ghost-reused-1"
     stray = "lot-ghost-other-1"
@@ -317,8 +318,8 @@ def test_stored_owner_fallback_never_marks_viewer_lot(
     assert ghost not in json.dumps(payload)
 
 
-def test_hidden_runs_expose_only_reviewed_fields(platform_client: TestClient, saas_login) -> None:
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
+def test_hidden_runs_expose_only_reviewed_fields(saas_login) -> None:
+    plan_id = _forwarder_plan(saas_login)["plan_id"]
     jinju = saas_login(shipper_org_id("sh-jinju"))
     scoped = jinju.get(f"/api/saas/shipper/plans/{plan_id}").json()
     hidden = [route for _, _, route in _runs(scoped) if route["cost"] is None]

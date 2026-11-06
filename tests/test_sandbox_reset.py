@@ -1,17 +1,12 @@
+import secrets
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
 from saas_fixtures import (
     FORWARDER_ORG_ID,
-    PLATFORM_ORG_ID,
     REAL_PLATFORM_EMAIL,
-    REAL_PLATFORM_PASSWORD,
-    SAAS_CSRF,
-    SHIPPER_ORG_ID,
     create_real_platform,
-    login_client,
-    password_client,
 )
 from sqlalchemy import func, select
 
@@ -19,6 +14,15 @@ from freshswitch_backend.config import get_settings
 from freshswitch_backend.main import create_app
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence import sandbox_reset as sandbox_reset_module
+from freshswitch_backend.persistence.sandbox_reset import (
+    RESET_COOLDOWN,
+    SandboxResetCooldown,
+    reset_sandbox,
+)
+from freshswitch_backend.persistence.sandbox_world import (
+    VisitorWorld,
+    create_visitor_world,
+)
 from freshswitch_backend.persistence.seed import main, run_lots
 from freshswitch_backend.persistence.tables import (
     DEMO_ORG,
@@ -39,6 +43,7 @@ from freshswitch_backend.persistence.tables import (
     ReadingRow,
     RunRow,
     ShipperProfileRow,
+    UserRow,
 )
 from freshswitch_backend.quality import quality_history
 from freshswitch_backend.quality.models import ObservationIn
@@ -53,8 +58,43 @@ BASE_NOW = datetime(2026, 11, 10, 9, 0, tzinfo=UTC)
 
 
 @pytest.fixture
-def saas_app(demo_tenants):
-    return create_app(get_settings().model_copy(update={"saas_mode": True}))
+def demo_app(demo_tenants):
+    return create_app(get_settings().model_copy(update={"saas_mode": False}))
+
+
+def _session(user_id: str, org_id: str) -> str:
+    token_hash = secrets.token_hex(32)
+    now = datetime.now(UTC)
+    with database.begin() as db:
+        db.add(
+            AuthSessionRow(
+                token_hash=token_hash,
+                user_id=user_id,
+                active_org_id=org_id,
+                expires_at=now + timedelta(hours=12),
+                last_seen_at=now,
+            )
+        )
+    return token_hash
+
+
+def _visitor(world: VisitorWorld, slug: str = "freshswitch") -> str:
+    return _session(world.user_id, f"{world.world_id}-{slug}")
+
+
+def _real_session() -> str:
+    with database.begin() as db:
+        user_id = db.scalar(select(UserRow.id).where(UserRow.email == REAL_PLATFORM_EMAIL))
+    return _session(user_id, "platform-real")
+
+
+def _alive(token_hash: str) -> bool:
+    with database.begin() as db:
+        return db.get(AuthSessionRow, token_hash) is not None
+
+
+def _session_reset(world: VisitorWorld, caller: str):
+    return reset_sandbox(keep_token_hash=caller, cooldown=RESET_COOLDOWN, world_id=world.world_id)
 
 
 @pytest.fixture
@@ -270,48 +310,37 @@ def _count(db, row, real_plans) -> int:
     return db.scalar(select(func.count()).select_from(row).where(~row.plan_id.in_(real_plans)))
 
 
-def _world_forwarder(platform: TestClient) -> tuple[str, str, str]:
-    me = platform.get("/api/me").json()
-    forwarder = next(
-        item["org_id"]
-        for item in me["memberships"]
-        if item["org_id"].endswith(f"-{FORWARDER_ORG_ID}")
-    )
-    return me["world"]["world_id"], me["active_org"]["org_id"], forwarder
-
-
-def _sandbox_activity(platform: TestClient, shipper: TestClient) -> tuple[str, str, str]:
-    world_id, platform_org, forwarder = _world_forwarder(platform)
-    created = platform.post("/api/saas/platform/plans", json={"include_registered": True})
-    assert created.status_code == 201, created.text
-    plan_id = created.json()["plan_id"]
-    assigned = platform.put(
-        f"/api/saas/platform/plans/{plan_id}/forwarder",
-        json={"forwarder_org_id": forwarder},
-    )
-    assert assigned.status_code == 200, assigned.text
-    device = platform.post("/api/saas/devices", json={"device_id": "demo-sensor-9"})
-    assert device.status_code == 201, device.text
-    device_id = device.json()["device_id"]
-    profile = next(
-        row["id"]
-        for row in shipper.get("/api/saas/catalog").json()["shippers"]
-        if row["id"].endswith("sh-jinju")
-    )
-    lot = shipper.post(
-        "/api/intake/lots",
-        json={
-            "product": "strawberry",
-            "pallets": 2,
-            "ready_date": "2026-11-16",
-            "destination": "HKHKG",
-            "sell_by_date": "2026-11-23",
-            "shipper": profile,
-            "save": True,
-        },
-    )
-    assert lot.status_code == 200, lot.text
+def _sandbox_activity(world: VisitorWorld) -> tuple[str, str, str]:
+    world_id = world.world_id
+    platform_org = f"{world_id}-freshswitch"
+    forwarder = f"{world_id}-{FORWARDER_ORG_ID}"
+    plan_id = f"plan-{world_id}-sbx"
+    device_id = "demo-sensor-9"
+    planned = [lot_id for lot_id, *_ in _lots_for(world_id)]
+    _late_plan(plan_id, planned, forwarder)
     with database.begin() as db:
+        db.add(PlanForwarderRow(plan_id=plan_id, forwarder_org_id=forwarder))
+        db.add(DeviceRow(device_id=device_id, org_id=platform_org, token_hash=f"h-{plan_id}"))
+        for lot_id in planned:
+            db.get(LotRow, lot_id).status = "planned"
+        db.add(
+            LotRow(
+                id=f"lot-{world_id}-sbx",
+                scenario_id="default",
+                shipper_id=f"{world_id}-sh-jinju",
+                shipper_org_id=f"{world_id}-shipper-jinju",
+                product_id="strawberry",
+                pallets=2,
+                ready_date=date(2026, 11, 16),
+                destination="HKHKG",
+                sell_by_date=date(2026, 11, 23),
+                source="등록",
+                status="registered",
+                created_at=STAMP,
+                updated_at=STAMP,
+            )
+        )
+        db.flush()
         _plan_children(db, plan_id)
         _coldchain(db, "sbx", platform_org, plan_id, device_id)
         db.add(
@@ -402,17 +431,18 @@ def _sandbox_snapshot() -> dict:
 
 
 def test_admin_reset_restores_baseline_and_keeps_real_data(
-    saas_app, client, reset_admin_headers, reset_clock
+    demo_app, client, reset_admin_headers, reset_clock
 ) -> None:
     run_lots()
     seed_lots = _sandbox_snapshot()["lots"]
     assert len(seed_lots) == 6
     _real_world()
     assert client.post("/api/plans", json={"scenario_id": "default"}).status_code == 201
-    real_client = password_client(saas_app, REAL_PLATFORM_EMAIL, REAL_PLATFORM_PASSWORD)
-    platform = login_client(PLATFORM_ORG_ID, saas_app)
-    shipper = login_client(SHIPPER_ORG_ID, saas_app)
-    world_id = platform.get("/api/me").json()["world"]["world_id"]
+    real_session = _real_session()
+    world = create_visitor_world()
+    platform = _visitor(world)
+    shipper = _visitor(world, "shipper-jinju")
+    world_id = world.world_id
     visitor_before = _lots_for(world_id)
     rest_before = _lots_except(world_id)
     observations_before = _world_observations(world_id)
@@ -420,17 +450,19 @@ def test_admin_reset_restores_baseline_and_keeps_real_data(
     assert rest_before == seed_lots
     assert len(observations_before) == 6
     assert all(status == "registered" for _, _, status, _, _ in visitor_before)
-    _, device_id, activity_world = _sandbox_activity(platform, shipper)
+    _, device_id, activity_world = _sandbox_activity(world)
     assert activity_world == world_id
     real_before = _real_snapshot()
     dirty = _sandbox_snapshot()
+    assert {status for _, _, status, _, _ in _lots_for(world_id)} == {"planned", "registered"}
     assert dirty["plans"] == 1 and dirty["forwarders"] == 1
     assert dirty["pending"] == dirty["orders"] == dirty["idempotency"] == 1
-    assert dirty["devices"] == [device_id]
+    assert device_id in dirty["devices"]
+    assert all(d == device_id or d.startswith("RCM-") for d in dirty["devices"])
     assert len(dirty["lots"]) == 13
     assert "sbx-manual" in dirty["observations"]
 
-    response = TestClient(saas_app, base_url="https://testserver").post(
+    response = TestClient(demo_app, base_url="https://testserver").post(
         "/api/demo/reset",
         params={"scope": "sandbox", "world_id": world_id},
         headers=reset_admin_headers,
@@ -453,9 +485,9 @@ def test_admin_reset_restores_baseline_and_keeps_real_data(
     assert after["devices"] == []
     assert "sbx-manual" not in after["observations"]
     assert _real_snapshot() == real_before
-    assert real_client.get("/api/me").status_code == 200
-    assert platform.get("/api/me").status_code == 401
-    assert shipper.get("/api/me").status_code == 401
+    assert _alive(real_session)
+    assert not _alive(platform)
+    assert not _alive(shipper)
 
     reset_clock[0] = BASE_NOW + timedelta(seconds=5)
     again = client.post(
@@ -468,74 +500,64 @@ def test_admin_reset_restores_baseline_and_keeps_real_data(
     assert _real_snapshot() == real_before
 
 
-def test_session_reset_keeps_caller_and_logs_out_other_demo_users(saas_app, reset_clock) -> None:
+def test_session_reset_keeps_caller_and_logs_out_other_demo_users(
+    demo_tenants, reset_clock
+) -> None:
     run_lots()
-    platform = login_client(PLATFORM_ORG_ID, saas_app)
-    other_platform = login_client(PLATFORM_ORG_ID, saas_app)
-    shipper = login_client(SHIPPER_ORG_ID, saas_app)
-    _sandbox_activity(platform, shipper)
+    world = create_visitor_world()
+    platform = _visitor(world)
+    other_platform = _visitor(world)
+    shipper = _visitor(world, "shipper-jinju")
+    _sandbox_activity(world)
 
-    response = platform.post("/api/saas/sandbox/reset")
-    assert response.status_code == 200, response.text
-    assert response.json()["scope"] == "sandbox"
-    assert response.json()["orgs"] == 8
-    assert platform.get("/api/me").status_code == 200
-    assert other_platform.get("/api/me").status_code == 401
-    assert shipper.get("/api/me").status_code == 401
+    result = _session_reset(world, platform)
+    assert result.orgs == 8
+    assert result.world_id == world.world_id
+    assert _alive(platform)
+    assert not _alive(other_platform)
+    assert not _alive(shipper)
     with database.begin() as db:
         assert db.scalar(select(func.count()).select_from(AuthSessionRow)) == 1
-    pool = platform.get("/api/saas/platform/lots")
-    assert pool.status_code == 200
-    assert len(pool.json()) == 6
-    assert platform.get("/api/saas/platform/plans").json() == []
+    lots = _lots_for(world.world_id)
+    assert len(lots) == 6
+    assert {status for _, _, status, _, _ in lots} == {"registered"}
+    assert _sandbox_snapshot()["plans"] == 0
 
 
-def test_session_reset_cooldown(saas_app, reset_clock) -> None:
-    platform = login_client(PLATFORM_ORG_ID, saas_app)
-    assert platform.post("/api/saas/sandbox/reset").status_code == 200
+def test_session_reset_cooldown(demo_tenants, reset_clock) -> None:
+    world = create_visitor_world()
+    platform = _visitor(world)
+    _session_reset(world, platform)
 
     reset_clock[0] = BASE_NOW + timedelta(seconds=20)
-    blocked = platform.post("/api/saas/sandbox/reset")
-    assert blocked.status_code == 429
-    assert blocked.headers["retry-after"] == "40"
+    with pytest.raises(SandboxResetCooldown) as blocked:
+        _session_reset(world, platform)
+    assert blocked.value.retry_after == 40
 
     reset_clock[0] = BASE_NOW + timedelta(seconds=60)
-    assert platform.post("/api/saas/sandbox/reset").status_code == 200
+    assert _session_reset(world, platform).world_id == world.world_id
 
 
 def test_admin_reset_ignores_cooldown_but_starts_it(
-    saas_app, client, reset_admin_headers, reset_clock
+    demo_app, client, reset_admin_headers, reset_clock
 ) -> None:
-    platform = login_client(PLATFORM_ORG_ID, saas_app)
-    world_id = platform.get("/api/me").json()["world"]["world_id"]
-    params = {"scope": "sandbox", "world_id": world_id}
+    world = create_visitor_world()
+    platform = _visitor(world)
+    params = {"scope": "sandbox", "world_id": world.world_id}
     for _ in range(2):
         response = client.post("/api/demo/reset", params=params, headers=reset_admin_headers)
         assert response.status_code == 200, response.text
-    assert platform.post("/api/saas/sandbox/reset").status_code == 401
-    platform = login_client(PLATFORM_ORG_ID, saas_app)
-    assert platform.post("/api/saas/sandbox/reset").status_code == 429
+    assert not _alive(platform)
+    platform = _visitor(world)
+    with pytest.raises(SandboxResetCooldown):
+        _session_reset(world, platform)
 
 
-def test_session_reset_requires_sandbox_platform(saas_app, reset_clock) -> None:
-    create_real_platform()
-    real = password_client(saas_app, REAL_PLATFORM_EMAIL, REAL_PLATFORM_PASSWORD)
-    assert real.post("/api/saas/sandbox/reset").status_code == 403
-    assert login_client(SHIPPER_ORG_ID, saas_app).post("/api/saas/sandbox/reset").status_code == 403
+def test_admin_sandbox_reset_needs_token(demo_app, client, reset_admin_headers) -> None:
+    demo = TestClient(demo_app, base_url="https://testserver")
+    assert demo.post("/api/demo/reset", params={"scope": "sandbox"}).status_code == 401
     assert (
-        login_client(FORWARDER_ORG_ID, saas_app).post("/api/saas/sandbox/reset").status_code == 403
-    )
-    anonymous = TestClient(saas_app, base_url="https://testserver", headers=SAAS_CSRF)
-    assert anonymous.post("/api/saas/sandbox/reset").status_code == 401
-    with database.begin() as db:
-        assert db.scalar(select(func.count()).select_from(LotRow)) == 6
-
-
-def test_admin_sandbox_reset_needs_token(saas_app, client, reset_admin_headers) -> None:
-    saas = TestClient(saas_app, base_url="https://testserver")
-    assert saas.post("/api/demo/reset", params={"scope": "sandbox"}).status_code == 401
-    assert (
-        saas.post(
+        demo.post(
             "/api/demo/reset", params={"scope": "sandbox"}, headers={"Authorization": "Bearer x"}
         ).status_code
         == 401
@@ -602,19 +624,21 @@ def _late_plan(plan_id: str, lot_ids: list[str], org_id: str) -> None:
 
 
 def test_reset_logs_out_first_and_drops_plans_written_mid_reset(
-    saas_app, monkeypatch, reset_clock
+    demo_tenants, monkeypatch, reset_clock
 ) -> None:
+    from freshswitch_backend.api.plans import CreatePlanRequest, create_tenant_plan
     from freshswitch_backend.persistence import sandbox_world
 
-    platform = login_client(PLATFORM_ORG_ID, saas_app)
-    other = login_client(PLATFORM_ORG_ID, saas_app)
-    org_id = platform.get("/api/me").json()["active_org"]["org_id"]
-    seen: list[int] = []
+    world = create_visitor_world()
+    platform = _visitor(world)
+    other = _visitor(world)
+    org_id = f"{world.world_id}-freshswitch"
+    seen: list[bool] = []
     real_erase = sandbox_world.erase_world
 
     def erase(db, world_id: str, org_ids: list[str], *, keep_structure: bool) -> None:
         if not seen:
-            seen.append(other.get("/api/me").status_code)
+            seen.append(_alive(other))
             _late_plan("plan-mid-early", [], org_id)
             real_erase(db, world_id, org_ids, keep_structure=keep_structure)
             _late_plan("plan-mid-late", [], org_id)
@@ -622,8 +646,9 @@ def test_reset_logs_out_first_and_drops_plans_written_mid_reset(
         real_erase(db, world_id, org_ids, keep_structure=keep_structure)
 
     monkeypatch.setattr(sandbox_world, "erase_world", erase)
-    assert platform.post("/api/saas/sandbox/reset").status_code == 200
-    assert seen == [401]
+    _session_reset(world, platform)
+    assert seen == [False]
+    assert _alive(platform)
     with database.begin() as db:
         assert db.get(PlanRow, "plan-mid-early") is None
         assert db.get(PlanRow, "plan-mid-late") is None
@@ -631,28 +656,28 @@ def test_reset_logs_out_first_and_drops_plans_written_mid_reset(
     assert after["plans"] == 0
     assert len(after["lots"]) == 6
     assert all(status == "registered" for _, _, status, _, _ in after["lots"])
-    created = platform.post("/api/saas/platform/plans", json={"include_registered": True})
-    assert created.status_code == 201, created.text
+    created = create_tenant_plan(
+        CreatePlanRequest(include_registered=True), f"{world.world_id}-{FORWARDER_ORG_ID}"
+    )
     with database.begin() as db:
-        assert db.get(PlanRow, created.json()["plan_id"]).lot_count == 6
+        assert db.get(PlanRow, created.plan_id).lot_count == 6
 
 
-def test_failed_reset_does_not_start_cooldown(saas_app, monkeypatch, reset_clock) -> None:
-    platform = login_client(PLATFORM_ORG_ID, saas_app)
+def test_failed_reset_does_not_start_cooldown(demo_tenants, monkeypatch, reset_clock) -> None:
+    world = create_visitor_world()
+    platform = _visitor(world)
 
     def broken(*args, **kwargs) -> int:
         raise RuntimeError("seed failed")
 
-    monkeypatch.setattr(
-        "freshswitch_backend.persistence.sandbox_world.reseed_world", broken
-    )
+    monkeypatch.setattr("freshswitch_backend.persistence.sandbox_world.reseed_world", broken)
     with pytest.raises(RuntimeError):
-        platform.post("/api/saas/sandbox/reset")
+        _session_reset(world, platform)
     monkeypatch.undo()
     monkeypatch.setattr(sandbox_reset_module, "clock", lambda: BASE_NOW)
-    retried = platform.post("/api/saas/sandbox/reset")
-    assert retried.status_code == 200, retried.text
-    assert platform.post("/api/saas/sandbox/reset").status_code == 429
+    assert _session_reset(world, platform).world_id == world.world_id
+    with pytest.raises(SandboxResetCooldown):
+        _session_reset(world, platform)
 
 
 def test_reset_with_fuel_shock_scenario(demo_tenants, reset_clock) -> None:

@@ -1,7 +1,7 @@
 from fastapi.testclient import TestClient
-from saas_fixtures import FORWARDER_ORG_ID, SAAS_CSRF
+from saas_fixtures import SAAS_CSRF, saas_app
 from test_forwarder_execution_card import _mixed_plan
-from test_saas_api import _assign, _platform_plan
+from test_saas_api import _forwarder_plan
 
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.execution.card import (
@@ -10,7 +10,6 @@ from freshswitch_backend.execution.card import (
     iso6346_check_digit,
     mock_container_no,
 )
-from freshswitch_backend.main import app
 
 
 def _number(serial: str, owner: str = "MSKU") -> str:
@@ -35,18 +34,15 @@ def _put(client: TestClient, plan_id: str, container_id: str, body: dict):
     )
 
 
-def _plan(platform_client: TestClient, saas_login, forwarder_client: TestClient):
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
-    _assign(plan_id, FORWARDER_ORG_ID)
+def _plan(saas_login, forwarder_client: TestClient):
+    plan_id = _forwarder_plan(saas_login)["plan_id"]
     ids = [c["container_id"] for c in _card(forwarder_client, plan_id)["containers"]]
     assert ids
     return plan_id, ids
 
 
-def test_saved_numbers_replace_mock(
-    platform_client: TestClient, saas_login, forwarder_client: TestClient
-) -> None:
-    plan_id, ids = _plan(platform_client, saas_login, forwarder_client)
+def test_saved_numbers_replace_mock(saas_login, forwarder_client: TestClient) -> None:
+    plan_id, ids = _plan(saas_login, forwarder_client)
     number = _number("305438", "CSQU")
     assert number == "CSQU3054383"
     response = _put(
@@ -75,10 +71,8 @@ def test_saved_numbers_replace_mock(
     assert _row(detail["execution_card"], ids[0]) == saved
 
 
-def test_partial_input_keeps_other_fields_mock(
-    platform_client: TestClient, saas_login, forwarder_client: TestClient
-) -> None:
-    plan_id, ids = _plan(platform_client, saas_login, forwarder_client)
+def test_partial_input_keeps_other_fields_mock(saas_login, forwarder_client: TestClient) -> None:
+    plan_id, ids = _plan(saas_login, forwarder_client)
     before = _row(_card(forwarder_client, plan_id), ids[0])
     response = _put(forwarder_client, plan_id, ids[0], {"booking_no": "BK20261101"})
     assert response.status_code == 200, response.text
@@ -103,9 +97,9 @@ def test_partial_input_keeps_other_fields_mock(
 
 
 def test_wrong_check_digit_is_422_with_correct_digit(
-    platform_client: TestClient, saas_login, forwarder_client: TestClient
+    saas_login, forwarder_client: TestClient
 ) -> None:
-    plan_id, ids = _plan(platform_client, saas_login, forwarder_client)
+    plan_id, ids = _plan(saas_login, forwarder_client)
     response = _put(forwarder_client, plan_id, ids[0], {"container_no": "CSQU3054384"})
     assert response.status_code == 422
     assert "체크디지트는 3" in response.text and "CSQU3054383" in response.text
@@ -125,22 +119,20 @@ def test_only_assigned_forwarder_writes(
     other_forwarder_client: TestClient,
     shipper_client: TestClient,
 ) -> None:
-    plan_id, ids = _plan(platform_client, saas_login, forwarder_client)
+    plan_id, ids = _plan(saas_login, forwarder_client)
     body = {"booking_no": "BK-OTHER-1"}
     assert _put(other_forwarder_client, plan_id, ids[0], body).status_code == 404
     assert _put(shipper_client, plan_id, ids[0], body).status_code == 403
     assert _put(platform_client, plan_id, ids[0], body).status_code == 403
-    anonymous = TestClient(app, base_url="https://testserver", headers=SAAS_CSRF)
+    anonymous = TestClient(saas_app, base_url="https://testserver", headers=SAAS_CSRF)
     assert _put(anonymous, plan_id, ids[0], body).status_code in (401, 403)
     assert _put(forwarder_client, plan_id, "CA-NONE", body).status_code == 404
     assert _put(forwarder_client, "plan-missing", ids[0], body).status_code == 404
     assert _row(_card(forwarder_client, plan_id), ids[0])["booking_no_mock"] is True
 
 
-def test_duplicate_container_no_in_plan_is_409(
-    platform_client: TestClient, saas_login, forwarder_client: TestClient
-) -> None:
-    plan_id, ids = _plan(platform_client, saas_login, forwarder_client)
+def test_duplicate_container_no_in_plan_is_409(saas_login, forwarder_client: TestClient) -> None:
+    plan_id, ids = _plan(saas_login, forwarder_client)
     assert len(ids) > 1
     number = _number("777001")
     assert _put(forwarder_client, plan_id, ids[0], {"container_no": number}).status_code == 200
@@ -151,10 +143,8 @@ def test_duplicate_container_no_in_plan_is_409(
     assert _row(_card(forwarder_client, plan_id), ids[1])["container_no_mock"] is True
 
 
-def test_saved_numbers_survive_reread(
-    platform_client: TestClient, saas_login, forwarder_client: TestClient
-) -> None:
-    plan_id, ids = _plan(platform_client, saas_login, forwarder_client)
+def test_saved_numbers_survive_reread(saas_login, forwarder_client: TestClient) -> None:
+    plan_id, ids = _plan(saas_login, forwarder_client)
     body = {"booking_no": "BK-RELOAD-1", "seal_no": "SEAL0001"}
     assert _put(forwarder_client, plan_id, ids[-1], body).status_code == 200
     for _ in range(2):

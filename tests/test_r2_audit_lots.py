@@ -6,9 +6,15 @@ import pytest
 from conftest import FROZEN_NOW
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
-from saas_fixtures import PLATFORM_ORG_ID
+from saas_fixtures import (
+    FORWARDER_ORG_ID,
+    PLATFORM_ORG_ID,
+    accept_plan,
+    open_quantity_window,
+)
 from sqlalchemy import func, select, text
-from test_saas_api import _assign, _lot_body, _register_all, _scenario
+from test_deep_review_views import _queue_event
+from test_saas_api import _lot_body, _register_all, _scenario
 
 from freshswitch_backend.api import plans as plans_api
 from freshswitch_backend.api.plans import CreatePlanRequest, tenant_plan_scenario
@@ -18,6 +24,7 @@ from freshswitch_backend.lots import store as lot_store_module
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.seed import shipper_org_id
 from freshswitch_backend.persistence.tables import LotRow, PlanRow
+from freshswitch_backend.planning.quantity_policy import load_ledger, policy_rows
 from freshswitch_backend.planning.store import _mark_booked, store
 from freshswitch_backend.replan import DelayEvent, replan
 from freshswitch_backend.replan.engine import PREFERENCE
@@ -29,6 +36,12 @@ WAITING_ON_LOCK = text(
 )
 DELAY_TIE = {"type": "delay", "voyage_id": "V-2611A", "new_etd": "2026-11-20T18:00:00+09:00"}
 DELAY_A = {"type": "delay", "voyage_id": "V-2611A", "new_etd": "2026-11-22T18:00:00+09:00"}
+
+
+def _delay_a(plan: dict) -> dict:
+    voyages = {a["voyage_id"] for a in plan["plan"]["assignments"] if a["mode"] == "sea"}
+    first = next(v["id"] for v in plan["scenario"]["voyages"] if v["id"] in voyages)
+    return {**DELAY_A, "voyage_id": first}
 
 
 def _sea(plan: dict) -> set[str]:
@@ -45,8 +58,8 @@ def _register_more(saas_login, marker: str) -> list[str]:
     return ids
 
 
-def _create(platform_client: TestClient, lot_ids: list[str]):
-    return platform_client.post("/api/saas/platform/plans", json={"lot_ids": lot_ids})
+def _create(forwarder_client: TestClient, lot_ids: list[str]):
+    return forwarder_client.post("/api/saas/forwarder/plans", json={"lot_ids": lot_ids})
 
 
 def _plan_count() -> int:
@@ -54,11 +67,12 @@ def _plan_count() -> int:
         return db.scalar(select(func.count()).select_from(PlanRow)) or 0
 
 
-def _apply(platform_client: TestClient, plan_id: str, event: dict) -> dict:
-    response = platform_client.post(f"/api/plans/{plan_id}/events", json={"event": event})
+def _apply(forwarder_client: TestClient, plan_id: str, event: dict) -> dict:
+    _queue_event(plan_id, event)
+    response = forwarder_client.post(f"/api/plans/{plan_id}/events", json={"event": event})
     assert response.status_code == 200, response.text
     alternative = next(a["id"] for a in response.json()["alternatives"] if a["feasible"])
-    applied = platform_client.post(
+    applied = forwarder_client.post(
         f"/api/plans/{plan_id}/apply",
         json={"alternative_id": alternative, "replan_id": response.json()["replan_id"]},
     )
@@ -68,7 +82,7 @@ def _apply(platform_client: TestClient, plan_id: str, event: dict) -> dict:
 
 def test_parallel_plan_creates_only_one_succeeds(saas_login):
     ids = _register_all(saas_login)
-    clients = [saas_login(PLATFORM_ORG_ID) for _ in range(2)]
+    clients = [saas_login(FORWARDER_ORG_ID) for _ in range(2)]
     barrier = threading.Barrier(2)
     codes: list[int] = []
 
@@ -86,63 +100,84 @@ def test_parallel_plan_creates_only_one_succeeds(saas_login):
     assert {lot.status for lot in lot_store.get_many(ids, org_id=ANY_ORG)} == {"planned"}
 
 
-def test_create_rechecks_lot_status_inside_transaction(platform_client, saas_login):
+def test_create_rechecks_lot_status_inside_transaction(forwarder_client, saas_login):
     ids = _register_all(saas_login)
-    scenario, registered = tenant_plan_scenario(CreatePlanRequest(lot_ids=ids), PLATFORM_ORG_ID)
-    assert _create(platform_client, ids).status_code == 201
+    scenario, registered = tenant_plan_scenario(CreatePlanRequest(lot_ids=ids), FORWARDER_ORG_ID)
+    assert _create(forwarder_client, ids).status_code == 201
     with pytest.raises(LotUnavailable) as caught:
         store.create(
-            scenario, registered, org_id=PLATFORM_ORG_ID, lot_org_id=ANY_ORG, exclusive=True
+            scenario, registered, org_id=FORWARDER_ORG_ID, lot_org_id=ANY_ORG, exclusive=True
         )
     assert set(caught.value.lot_ids) == set(ids)
     assert _plan_count() == 1
 
 
-def test_create_rejects_lot_changed_after_solving(platform_client, saas_login, shipper_client):
+def test_create_rejects_lot_changed_after_solving(saas_login, shipper_client):
     ids = _register_all(saas_login)
-    scenario, registered = tenant_plan_scenario(CreatePlanRequest(lot_ids=ids), PLATFORM_ORG_ID)
+    scenario, registered = tenant_plan_scenario(CreatePlanRequest(lot_ids=ids), FORWARDER_ORG_ID)
     patched = shipper_client.patch("/api/saas/shipper/lots/lot-jinju-sb-1", json={"pallets": 3})
     assert patched.status_code == 200, patched.text
     with pytest.raises(LotUnavailable) as caught:
         store.create(
-            scenario, registered, org_id=PLATFORM_ORG_ID, lot_org_id=ANY_ORG, exclusive=True
+            scenario, registered, org_id=FORWARDER_ORG_ID, lot_org_id=ANY_ORG, exclusive=True
         )
     assert caught.value.lot_ids == ["lot-jinju-sb-1"]
     assert _plan_count() == 0
     assert {lot.status for lot in lot_store.get_many(ids, org_id=ANY_ORG)} == {"registered"}
 
 
-def _cancel_and_delete(platform_client, saas_login, victim: str, chosen: list[str]) -> str:
-    created = _create(platform_client, chosen)
+def _cancel_and_delete(saas_login, victim: str, chosen: list[str]) -> str:
+    forwarder = saas_login(FORWARDER_ORG_ID)
+    created = _create(forwarder, chosen)
     assert created.status_code == 201, created.text
     plan_id = created.json()["plan_id"]
-    order_id = _apply(platform_client, plan_id, {"type": "cancel", "lot_id": victim})[
-        "active_order_id"
-    ]
-    order = platform_client.get(f"/api/plans/{plan_id}/orders/{order_id}").json()
+    accept_plan(saas_login, plan_id)
+    order_id = _apply(forwarder, plan_id, {"type": "cancel", "lot_id": victim})["active_order_id"]
+    order = forwarder.get(f"/api/plans/{plan_id}/orders/{order_id}").json()
     for item in order["shipper_confirmations"]:
         client = saas_login(shipper_org_id(item["shipper_id"]))
         confirmed = client.post(
             f"/api/saas/shipper/plans/{plan_id}/orders/{order_id}/confirm", json={"accept": True}
         )
         assert confirmed.status_code == 200, confirmed.text
-    _assign(plan_id)
-    forwarder = saas_login("forwarder-dongnam")
     confirmed = forwarder.post(
         f"/api/saas/forwarder/plans/{plan_id}/orders/{order_id}/confirm", json={"accept": True}
     )
     assert confirmed.status_code == 200, confirmed.text
     owner = saas_login("shipper-sancheong")
     assert owner.get(f"/api/lots/{victim}").json()["status"] == "cancelled"
+    jinju = saas_login("shipper-jinju")
+    assert jinju.delete(f"/api/lots/{victim}").status_code == 404
+    jinju_lot = next(i for i in chosen if "jinju" in i)
+    assert jinju.patch(f"/api/lots/{jinju_lot}", json={"pallets": 1}).status_code == 409
+    refilling = owner.delete(f"/api/lots/{victim}")
+    assert refilling.status_code == 409
+    assert "빈자리를 충원" in refilling.json()["detail"]
+    with database.begin() as db:
+        [ledger] = [
+            ledger
+            for ledger in map(load_ledger, policy_rows(db, plan_id))
+            if victim in ledger.reservations
+        ]
+    assert ledger.reservations[victim].current_quantity == 0
+    open_quantity_window(ledger.policy.cutoff)
     assert owner.delete(f"/api/lots/{victim}").status_code == 204
+    with database.begin() as db:
+        assert db.get(LotRow, victim) is None
+        [kept] = [
+            row.reservations[victim]
+            for row in map(load_ledger, policy_rows(db, plan_id))
+            if victim in row.reservations
+        ]
+    assert kept == ledger.reservations[victim]
     return plan_id
 
 
-def test_reused_lot_id_does_not_grant_plan_access(platform_client, saas_login):
+def test_reused_lot_id_does_not_grant_plan_access(saas_login):
     ids = _register_all(saas_login)
     chosen = [i for i in ids if "jinju" in i or "sancheong" in i]
     victim = next(i for i in chosen if "sancheong" in i)
-    plan_id = _cancel_and_delete(platform_client, saas_login, victim, chosen)
+    plan_id = _cancel_and_delete(saas_login, victim, chosen)
 
     miryang = saas_login("shipper-miryang")
     lot = next(lot for lot in _scenario().lots if "miryang" in lot.id)
@@ -160,8 +195,10 @@ def test_reused_lot_id_does_not_grant_plan_access(platform_client, saas_login):
     assert original.get(f"/api/saas/shipper/plans/{plan_id}").status_code == 200
 
 
-def test_owner_snapshot_stays_out_of_responses(platform_client, saas_login, shipper_client):
-    plan = _create(platform_client, _register_all(saas_login)).json()
+def test_owner_snapshot_stays_out_of_responses(
+    platform_client, forwarder_client, saas_login, shipper_client
+):
+    plan = _create(forwarder_client, _register_all(saas_login)).json()
     detail = platform_client.get(f"/api/plans/{plan['plan_id']}").json()
     view = shipper_client.get(f"/api/saas/shipper/plans/{plan['plan_id']}").json()
     for body in (plan, detail, view):
@@ -172,30 +209,34 @@ def test_owner_snapshot_stays_out_of_responses(platform_client, saas_login, ship
     assert "shipper-jinju" in stored["shipper_org_ids"]
 
 
-def test_second_plan_uses_only_free_containers(platform_client, saas_login):
-    first = _create(platform_client, _register_all(saas_login))
+def test_second_plan_uses_only_free_containers(forwarder_client, saas_login):
+    first = _create(forwarder_client, _register_all(saas_login))
     assert first.status_code == 201, first.text
-    assert _sea(first.json()["plan"]) == {"CA-01", "CA-02"}
+    booked = _sea(first.json()["plan"])
+    assert len(booked) == 2
 
-    second = _create(platform_client, _register_more(saas_login, "-gr-"))
+    second = _create(forwarder_client, _register_more(saas_login, "-gr-"))
     assert second.status_code == 201, second.text
-    assert _sea(second.json()["plan"]) == {"CA-03"}
-    assert [c["id"] for c in second.json()["scenario"]["containers"]] == ["CA-03"]
+    spare = _sea(second.json()["plan"])
+    assert len(spare) == 1 and not spare & booked
+    assert [c["id"] for c in second.json()["scenario"]["containers"]] == sorted(spare)
 
-    third = _create(platform_client, _register_more(saas_login, "-gr-"))
+    third = _create(forwarder_client, _register_more(saas_login, "-gr-"))
     assert third.status_code == 422
-    assert "CA-01, CA-02, CA-03" in third.json()["detail"]
+    assert third.json()["detail"].startswith("가용 컨테이너가 없습니다")
 
 
-def test_replan_marks_alternatives_on_booked_containers(platform_client, saas_login):
-    first = _create(platform_client, _register_all(saas_login)).json()
-    assert _create(platform_client, _register_more(saas_login, "-gr-")).status_code == 201
-    response = platform_client.post(
-        f"/api/plans/{first['plan_id']}/events", json={"event": DELAY_A}
+def test_replan_marks_alternatives_on_booked_containers(forwarder_client, saas_login):
+    first = _create(forwarder_client, _register_all(saas_login)).json()
+    second = _create(forwarder_client, _register_more(saas_login, "-gr-"))
+    assert second.status_code == 201, second.text
+    taken = _sea(second.json()["plan"])
+    response = forwarder_client.post(
+        f"/api/plans/{first['plan_id']}/events", json={"event": _delay_a(first)}
     )
     assert response.status_code == 200, response.text
     body = response.json()
-    assert not [a for a in body["alternatives"] if "CA-03" in _sea(a["plan"])]
+    assert not [a for a in body["alternatives"] if taken & _sea(a["plan"])]
     assert body["recommended_id"] == "pull_forward"
     assert body["diff"] is not None
     assert "실행 가능한 대안이 없습니다" not in body["explanation"]["operator_summary"]
@@ -227,22 +268,26 @@ def test_mark_booked_moves_recommendation_diff_and_explanation(client):
     assert after.id == ranked[0].id
 
 
-def test_apply_rejects_alternative_booked_meanwhile(platform_client, saas_login):
-    first = _create(platform_client, _register_all(saas_login)).json()
-    response = platform_client.post(
-        f"/api/plans/{first['plan_id']}/events", json={"event": DELAY_A}
+def test_apply_rejects_alternative_booked_meanwhile(platform_client, forwarder_client, saas_login):
+    first = _create(forwarder_client, _register_all(saas_login)).json()
+    response = forwarder_client.post(
+        f"/api/plans/{first['plan_id']}/events", json={"event": _delay_a(first)}
     )
     assert response.status_code == 200, response.text
+    booked = _sea(first["plan"])
     chosen = next(
-        a for a in response.json()["alternatives"] if a["feasible"] and "CA-03" in _sea(a["plan"])
+        a for a in response.json()["alternatives"] if a["feasible"] and _sea(a["plan"]) - booked
     )
-    assert _create(platform_client, _register_more(saas_login, "-gr-")).status_code == 201
-    applied = platform_client.post(
+    extra = _sea(chosen["plan"]) - booked
+    second = _create(forwarder_client, _register_more(saas_login, "-gr-"))
+    assert second.status_code == 201, second.text
+    assert _sea(second.json()["plan"]) == extra
+    applied = forwarder_client.post(
         f"/api/plans/{first['plan_id']}/apply",
         json={"alternative_id": chosen["id"], "replan_id": response.json()["replan_id"]},
     )
     assert applied.status_code == 409
-    assert "CA-03" in applied.json()["detail"]
+    assert all(container in applied.json()["detail"] for container in extra)
     assert platform_client.get(f"/api/plans/{first['plan_id']}").json()["version"] == 1
 
 
@@ -270,13 +315,11 @@ def _resave(plan_id: str) -> dict:
         return db.scalar(select(PlanRow.payload).where(PlanRow.plan_id == plan_id))
 
 
-def test_legacy_plan_without_owner_snapshot_keeps_lot_id_guard(
-    platform_client, saas_login, monkeypatch
-):
+def test_legacy_plan_without_owner_snapshot_keeps_lot_id_guard(saas_login, monkeypatch):
     ids = _register_all(saas_login)
     chosen = [i for i in ids if "jinju" in i or "sancheong" in i]
     victim = next(i for i in chosen if "sancheong" in i)
-    plan_id = _cancel_and_delete(platform_client, saas_login, victim, chosen)
+    plan_id = _cancel_and_delete(saas_login, victim, chosen)
     _strip_owner_snapshot(plan_id)
     jinju = saas_login("shipper-jinju")
     assert jinju.get(f"/api/saas/shipper/plans/{plan_id}").status_code == 200
@@ -306,13 +349,13 @@ def test_legacy_plan_without_owner_snapshot_keeps_lot_id_guard(
 
 def test_claim_waits_for_row_lock_held_by_other_connection(saas_login):
     ids = _register_all(saas_login)
-    scenario, registered = tenant_plan_scenario(CreatePlanRequest(lot_ids=ids), PLATFORM_ORG_ID)
+    scenario, registered = tenant_plan_scenario(CreatePlanRequest(lot_ids=ids), FORWARDER_ORG_ID)
     errors: list[LotUnavailable] = []
 
     def create() -> None:
         try:
             store.create(
-                scenario, registered, org_id=PLATFORM_ORG_ID, lot_org_id=ANY_ORG, exclusive=True
+                scenario, registered, org_id=FORWARDER_ORG_ID, lot_org_id=ANY_ORG, exclusive=True
             )
         except LotUnavailable as exc:
             errors.append(exc)
@@ -345,14 +388,14 @@ def test_claim_rowcount_mismatch_raises(saas_login, monkeypatch):
         claim_lots(db, [lot.to_lot() for lot in lots], datetime.now(UTC))
 
 
-def test_create_reports_container_race_for_creation(platform_client, saas_login, monkeypatch):
+def test_create_reports_container_race_for_creation(forwarder_client, saas_login, monkeypatch):
     ids = _register_all(saas_login)
     grapes = _register_more(saas_login, "-gr-")
-    solved = tenant_plan_scenario(CreatePlanRequest(lot_ids=grapes), PLATFORM_ORG_ID)
-    assert _create(platform_client, ids).status_code == 201
+    solved = tenant_plan_scenario(CreatePlanRequest(lot_ids=grapes), FORWARDER_ORG_ID)
+    assert _create(forwarder_client, ids).status_code == 201
     monkeypatch.setattr(plans_api, "tenant_plan_scenario", lambda body, org_id: solved)
     with pytest.raises(HTTPException) as caught:
-        plans_api.create_tenant_plan(CreatePlanRequest(lot_ids=grapes), PLATFORM_ORG_ID)
+        plans_api.create_tenant_plan(CreatePlanRequest(lot_ids=grapes), FORWARDER_ORG_ID)
     assert caught.value.status_code == 409
     assert "다시 만드세요" in caught.value.detail
     assert "이벤트" not in caught.value.detail

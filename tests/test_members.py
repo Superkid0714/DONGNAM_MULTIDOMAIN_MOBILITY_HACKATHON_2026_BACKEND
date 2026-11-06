@@ -3,19 +3,19 @@ import time
 from datetime import UTC, datetime, timedelta
 
 from fastapi.testclient import TestClient
-from saas_fixtures import SAAS_CSRF, SHIPPER_ORG_ID, login_client
+from saas_fixtures import SAAS_CSRF, SHIPPER_ORG_ID, _mint_session, login_client, saas_app
 from sqlalchemy import select, update
 
-from freshswitch_backend.main import app
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.orgs import redeem_invitation
+from freshswitch_backend.persistence.seed import demo_orgs
 from freshswitch_backend.persistence.tables import MembershipRow, OrgInvitationRow, UserRow
 
 PASSWORD = "members-password"
 
 
 def _client() -> TestClient:
-    return TestClient(app, base_url="https://testserver", headers=SAAS_CSRF)
+    return TestClient(saas_app, base_url="https://testserver", headers=SAAS_CSRF)
 
 
 def _signup(email: str, org_name: str | None = None, org_type: str = "shipper", **extra):
@@ -149,17 +149,20 @@ def test_sandbox_orgs_cannot_invite_or_accept(demo_tenants) -> None:
     assert sandbox.post("/api/saas/org/invitations", json={}).status_code == 403
     members = sandbox.get("/api/saas/org/members")
     assert members.status_code == 200
-    assert [m["role"] for m in members.json()] == ["admin"]
+    assert [m["role"] for m in members.json()] == ["admin", "admin"]
 
     admin, real_org = _admin("boss@real.example.com", "실제 농장")
     invitation = _invite(admin)
-    refused = sandbox.post("/api/saas/invitations/accept", json={"code": invitation["code"]})
-    assert refused.status_code == 403
+    demo_user = next(org.user_id for org in demo_orgs() if org.id == SHIPPER_ORG_ID)
+    demo = _client()
+    _mint_session(demo, saas_app, demo_user, SHIPPER_ORG_ID)
+    refused = demo.post("/api/saas/invitations/accept", json={"code": invitation["code"]})
+    assert refused.status_code == 401
     with database.begin() as db:
         joined = db.scalars(select(MembershipRow.user_id).where(MembershipRow.org_id == real_org))
         assert len(list(joined)) == 1
 
-    anonymous = TestClient(app)
+    anonymous = TestClient(saas_app)
     assert anonymous.get("/api/saas/org/members").status_code == 401
     accept = anonymous.post("/api/saas/invitations/accept", json={"code": invitation["code"]})
     assert accept.status_code == 401

@@ -173,6 +173,8 @@ def frozen_clock():
 
 @pytest.fixture(autouse=True)
 def fresh_request_limits():
+    from saas_fixtures import saas_app
+
     for name in (
         "auth_rate_limiter",
         "login_failure_guard",
@@ -180,15 +182,20 @@ def fresh_request_limits():
         "replan_limiter",
         "analysis_limiter",
     ):
-        setattr(app.state, name, None)
+        for target in (app, saas_app):
+            setattr(target.state, name, None)
     yield
 
 
 @pytest.fixture(autouse=True)
 def no_live_ulsan():
-    app.dependency_overrides[ulsan_client_factory] = lambda: None
+    from saas_fixtures import saas_app
+
+    for target in (app, saas_app):
+        target.dependency_overrides[ulsan_client_factory] = lambda: None
     yield
-    app.dependency_overrides.pop(ulsan_client_factory, None)
+    for target in (app, saas_app):
+        target.dependency_overrides.pop(ulsan_client_factory, None)
 
 
 @pytest.fixture

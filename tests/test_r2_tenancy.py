@@ -1,9 +1,9 @@
 import pytest
 from fastapi.testclient import TestClient
-from saas_fixtures import FORWARDER_ORG_ID
+from saas_fixtures import FORWARDER_ORG_ID, accept_plan, open_quantity_window, queue_quantity
 from sqlalchemy import delete, select, update
 from test_add_lot import _reject_order
-from test_plan_confirm import PLATFORM, REDUCE, _decide, _lot_body, _plan, _state
+from test_plan_confirm import FORWARDER, PLATFORM, REDUCE, _decide, _lot_body, _plan, _state
 
 from freshswitch_backend.data.loader import get_scenario
 from freshswitch_backend.persistence import database
@@ -14,6 +14,7 @@ from freshswitch_backend.persistence.tables import (
     PlanForwarderRow,
     PlanRow,
 )
+from freshswitch_backend.planning.store import APPLY_BEFORE_CONFIRMATION
 
 SANGJU_LOT = "lot-sangju-gr-1"
 SHIPPER_NAMES = (
@@ -41,16 +42,23 @@ def _assign(platform_client: TestClient, plan_id: str):
     )
 
 
-def _reduce_and_apply(platform_client: TestClient, plan_id: str):
-    event = platform_client.post(f"/api/plans/{plan_id}/events", json={"event": REDUCE})
+def _queue_reduce(shipper_login, plan_id: str) -> None:
+    open_quantity_window()
+    queue_quantity(
+        shipper_login("shipper-sancheong"), plan_id, REDUCE["lot_id"], REDUCE["new_pallets"]
+    )
+
+
+def _reduce_and_apply(forwarder_client: TestClient, plan_id: str):
+    event = forwarder_client.post(f"/api/plans/{plan_id}/events", json={"event": REDUCE})
     assert event.status_code == 200, event.text
-    return platform_client.post(
+    return forwarder_client.post(
         f"/api/plans/{plan_id}/apply", json={"alternative_id": "pull_forward"}
     )
 
 
-def _accept_all(saas_login, platform_client: TestClient, plan_id: str) -> None:
-    for c in _state(platform_client, plan_id)["confirmations"]:
+def _accept_all(saas_login, forwarder_client: TestClient, plan_id: str) -> None:
+    for c in _state(forwarder_client, plan_id)["confirmations"]:
         if c["status"] == "pending":
             accepted = _decide(saas_login, plan_id, c["shipper_id"], {"accept": True})
             assert accepted.status_code == 200, accepted.text
@@ -67,8 +75,8 @@ def _register_sangju(saas_login) -> str:
     return response.json()["registered"]["id"]
 
 
-def _add_lot(platform_client: TestClient, plan_id: str, lot_id: str) -> str:
-    computed = platform_client.post(f"{PLATFORM}/{plan_id}/add-lot", json={"lot_id": lot_id})
+def _add_lot(forwarder_client: TestClient, plan_id: str, lot_id: str) -> str:
+    computed = forwarder_client.post(f"{FORWARDER}/{plan_id}/add-lot", json={"lot_id": lot_id})
     assert computed.status_code == 200, computed.text
     return next(a["id"] for a in computed.json()["alternatives"] if a["feasible"])
 
@@ -78,115 +86,103 @@ def _lot_status(saas_login, org_id: str, lot_id: str) -> str:
     return next(lot["status"] for lot in lots if lot["id"] == lot_id)
 
 
-def test_real_org_apply_waits_for_shippers_and_forwarder_stays_blocked(
-    platform_client: TestClient, saas_login
+def test_real_org_apply_waits_for_shippers_and_platform_cannot_assign(
+    forwarder_client: TestClient, platform_client: TestClient, saas_login
 ) -> None:
-    plan_id = _plan(platform_client, saas_login)["plan_id"]
+    plan_id = _plan(forwarder_client, saas_login)["plan_id"]
     real = _go_real(saas_login)
-    forwarder_client = real(FORWARDER_ORG_ID)
-    assert _assign(platform_client, plan_id).status_code == 409
+    owner = real(FORWARDER_ORG_ID)
+    assert _assign(platform_client, plan_id).status_code == 403
 
-    applied = _reduce_and_apply(platform_client, plan_id)
+    applied = _reduce_and_apply(owner, plan_id)
     assert applied.status_code == 409, applied.text
-    assert platform_client.get(f"/api/plans/{plan_id}").json()["status"] == (
-        "pending_shipper_confirmation"
-    )
-    blocked = _assign(platform_client, plan_id)
-    assert blocked.status_code == 409
-    assert blocked.json()["detail"] == "화주 확인이 끝난 뒤 배정할 수 있습니다"
-    hidden = forwarder_client.get(f"/api/saas/forwarder/plans/{plan_id}")
-    assert hidden.status_code == 404
-    assert not any(name in hidden.text for name in SHIPPER_NAMES)
+    assert applied.json()["detail"] == APPLY_BEFORE_CONFIRMATION
+    assert owner.get(f"/api/plans/{plan_id}").json()["status"] == ("pending_shipper_confirmation")
+    visible = owner.get(f"/api/saas/forwarder/plans/{plan_id}")
+    assert visible.status_code == 200, visible.text
 
-    _accept_all(real, platform_client, plan_id)
-    allowed = _assign(platform_client, plan_id)
+    _accept_all(real, owner, plan_id)
+    _queue_reduce(real, plan_id)
+    allowed = _reduce_and_apply(owner, plan_id)
     assert allowed.status_code == 200, allowed.text
-    assert allowed.json()["before_shipper_confirmation"] is False
+    assert allowed.json()["status"] == "pending_confirmation"
+    assert _assign(platform_client, plan_id).status_code == 403
 
 
-def test_assign_gate_reads_round_rows_not_plan_status(
-    platform_client: TestClient, saas_login
+def test_platform_assignment_is_retired_and_creator_stays_assigned(
+    forwarder_client: TestClient, platform_client: TestClient, saas_login
 ) -> None:
-    plan_id = _plan(platform_client, saas_login)["plan_id"]
+    plan_id = _plan(forwarder_client, saas_login)["plan_id"]
     _go_real(saas_login)
     with database.begin() as db:
         db.execute(
             update(PlanRow).where(PlanRow.plan_id == plan_id).values(status="pending_confirmation")
         )
-    assert _assign(platform_client, plan_id).status_code == 409
-    with database.begin() as db:
-        assert (
-            db.scalar(select(PlanForwarderRow).where(PlanForwarderRow.plan_id == plan_id)) is None
-        )
-
-
-def test_sandbox_apply_still_runs_and_assignment_is_flagged(
-    platform_client: TestClient, saas_login
-) -> None:
-    plan_id = _plan(platform_client, saas_login)["plan_id"]
-    applied = _reduce_and_apply(platform_client, plan_id)
-    assert applied.status_code == 200, applied.text
-    assert applied.json()["status"] == "pending_confirmation"
-    assigned = _assign(platform_client, plan_id)
-    assert assigned.status_code == 200, assigned.text
-    assert assigned.json()["before_shipper_confirmation"] is True
-
-
-def test_sandbox_auto_accept_plan_runs_replan_and_assignment(
-    platform_client: TestClient, saas_login
-) -> None:
-    plan_id = _plan(platform_client, saas_login, auto_accept=True)["plan_id"]
-    assigned = _assign(platform_client, plan_id)
-    assert assigned.status_code == 200, assigned.text
-    assert assigned.json()["before_shipper_confirmation"] is False
-    applied = _reduce_and_apply(platform_client, plan_id)
-    assert applied.status_code == 200, applied.text
-
-
-def test_real_org_add_lot_of_new_shipper_is_kept_from_assigned_forwarder(
-    platform_client: TestClient, saas_login
-) -> None:
-    plan_id = _plan(platform_client, saas_login, skip=("sh-sangju",))["plan_id"]
-    extra = _register_sangju(saas_login)
-    real = _go_real(saas_login)
-    forwarder_client = real(FORWARDER_ORG_ID)
-    _accept_all(real, platform_client, plan_id)
-    assert _assign(platform_client, plan_id).status_code == 200
-
-    alternative = _add_lot(platform_client, plan_id, extra)
-    blocked = platform_client.post(
-        f"/api/plans/{plan_id}/apply", json={"alternative_id": alternative}
-    )
-    assert blocked.status_code == 409, blocked.text
-    view = forwarder_client.get(f"/api/saas/forwarder/plans/{plan_id}").json()
-    assert extra not in {lot["id"] for lot in view["scenario"]["lots"]}
-    assert _lot_status(real, "shipper-sangju", extra) == "registered"
-
+    assert _assign(platform_client, plan_id).status_code == 403
     unassigned = platform_client.delete(f"{PLATFORM}/{plan_id}/forwarder")
-    assert unassigned.status_code == 204
-    applied = platform_client.post(
-        f"/api/plans/{plan_id}/apply", json={"alternative_id": alternative}
-    )
+    assert unassigned.status_code == 403
+    with database.begin() as db:
+        rows = db.scalars(select(PlanForwarderRow).where(PlanForwarderRow.plan_id == plan_id)).all()
+        assert [row.forwarder_org_id for row in rows] == [FORWARDER_ORG_ID]
+
+
+def test_sandbox_apply_runs_before_shipper_confirmation(
+    forwarder_client: TestClient, saas_login
+) -> None:
+    plan_id = _plan(forwarder_client, saas_login)["plan_id"]
+    _queue_reduce(saas_login, plan_id)
+    applied = _reduce_and_apply(forwarder_client, plan_id)
     assert applied.status_code == 200, applied.text
     assert applied.json()["status"] == "pending_confirmation"
-    waiting = _assign(platform_client, plan_id)
-    assert waiting.status_code == 409
-    assert forwarder_client.get(f"/api/saas/forwarder/plans/{plan_id}").status_code == 404
+    waiting = _state(forwarder_client, plan_id)["confirmations"]
+    assert waiting and all(c["status"] == "pending" for c in waiting)
+
+
+def test_accepted_sandbox_plan_runs_replan(
+    forwarder_client: TestClient, platform_client: TestClient, saas_login
+) -> None:
+    plan_id = _plan(forwarder_client, saas_login)["plan_id"]
+    accept_plan(saas_login, plan_id)
+    assert _state(forwarder_client, plan_id)["status"] == "committed"
+    assert _assign(platform_client, plan_id).status_code == 403
+    _queue_reduce(saas_login, plan_id)
+    applied = _reduce_and_apply(forwarder_client, plan_id)
+    assert applied.status_code == 200, applied.text
+
+
+def test_real_forwarder_add_lot_of_new_shipper_asks_them_to_confirm(
+    forwarder_client: TestClient, platform_client: TestClient, saas_login
+) -> None:
+    extra = _register_sangju(saas_login)
+    plan_id = _plan(forwarder_client, saas_login, skip=("sh-sangju",))["plan_id"]
+    real = _go_real(saas_login)
+    owner = real(FORWARDER_ORG_ID)
+    _accept_all(real, owner, plan_id)
+
+    alternative = _add_lot(owner, plan_id, extra)
+    applied = owner.post(f"/api/plans/{plan_id}/apply", json={"alternative_id": alternative})
+    assert applied.status_code == 200, applied.text
+    assert applied.json()["status"] == "pending_confirmation"
+    assert extra in applied.json()["registered_lot_ids"]
+    assert _lot_status(real, "shipper-sangju", extra) == "planned"
+    state = _state(owner, plan_id)
+    sangju = next(c for c in state["confirmations"] if c["shipper_id"] == "sh-sangju")
+    assert sangju["status"] == "pending"
+    assert sangju["lot_ids"] == [extra]
+    assert _assign(platform_client, plan_id).status_code == 403
 
     accepted = _decide(real, plan_id, "sh-sangju", {"accept": True})
     assert accepted.status_code == 200, accepted.text
-    allowed = _assign(platform_client, plan_id)
-    assert allowed.status_code == 200, allowed.text
-    assert allowed.json()["before_shipper_confirmation"] is False
+    assert all(c["status"] == "accepted" for c in _state(owner, plan_id)["confirmations"])
 
 
 def test_shipper_removed_by_recompute_loses_plan_access(
-    platform_client: TestClient, saas_login
+    forwarder_client: TestClient, saas_login
 ) -> None:
-    plan_id = _plan(platform_client, saas_login)["plan_id"]
+    plan_id = _plan(forwarder_client, saas_login)["plan_id"]
     rejected = _decide(saas_login, plan_id, "sh-pohang", {"accept": False, "reason": "가격"})
     assert rejected.status_code == 200, rejected.text
-    recomputed = platform_client.post(f"{PLATFORM}/{plan_id}/confirmation/recompute", json={})
+    recomputed = forwarder_client.post(f"{FORWARDER}/{plan_id}/confirmation/recompute", json={})
     assert recomputed.status_code == 200, recomputed.text
     assert "lot-pohang-gr-1" not in recomputed.json()["plan"]["registered_lot_ids"]
 
@@ -206,15 +202,14 @@ def test_shipper_removed_by_recompute_loses_plan_access(
         assert "lot-pohang-gr-1" not in row.payload["lot_owner_orgs"]
 
 
-def _rollback_added_sangju(platform_client: TestClient, saas_login, decision: dict | None) -> str:
-    plan_id = _plan(platform_client, saas_login, skip=("sh-sangju",), auto_accept=True)["plan_id"]
-    with database.begin() as db:
-        db.add(PlanForwarderRow(plan_id=plan_id, forwarder_org_id=FORWARDER_ORG_ID))
+def _rollback_added_sangju(forwarder_client: TestClient, saas_login, decision: dict | None) -> str:
+    extra = _register_sangju(saas_login)
+    plan_id = _plan(forwarder_client, saas_login, skip=("sh-sangju",))["plan_id"]
+    accept_plan(saas_login, plan_id)
     sangju = saas_login("shipper-sangju")
     assert sangju.get(f"/api/saas/shipper/plans/{plan_id}").status_code == 404
-    extra = _register_sangju(saas_login)
-    alternative = _add_lot(platform_client, plan_id, extra)
-    applied = platform_client.post(
+    alternative = _add_lot(forwarder_client, plan_id, extra)
+    applied = forwarder_client.post(
         f"/api/plans/{plan_id}/apply", json={"alternative_id": alternative}
     )
     assert applied.status_code == 200, applied.text
@@ -226,8 +221,8 @@ def _rollback_added_sangju(platform_client: TestClient, saas_login, decision: di
         decided = _decide(saas_login, plan_id, "sh-sangju", decision)
         assert decided.status_code == 200, decided.text
 
-    _reject_order(platform_client, saas_login, plan_id, order_id)
-    plan = platform_client.get(f"/api/plans/{plan_id}").json()
+    _reject_order(forwarder_client, saas_login, plan_id, order_id)
+    plan = forwarder_client.get(f"/api/plans/{plan_id}").json()
     assert extra not in plan["registered_lot_ids"]
     assert extra not in {lot["id"] for lot in plan["scenario"]["lots"]}
     assert _lot_status(saas_login, "shipper-sangju", extra) == "registered"
@@ -238,16 +233,16 @@ def _rollback_added_sangju(platform_client: TestClient, saas_login, decision: di
     "decision", [None, {"accept": True}, {"accept": False, "reason": "가격이 안 맞습니다"}]
 )
 def test_rolled_back_added_shipper_loses_access_and_invite(
-    platform_client: TestClient, saas_login, decision: dict | None
+    forwarder_client: TestClient, saas_login, decision: dict | None
 ) -> None:
-    plan_id = _rollback_added_sangju(platform_client, saas_login, decision)
+    plan_id = _rollback_added_sangju(forwarder_client, saas_login, decision)
     sangju = saas_login("shipper-sangju")
     assert sangju.get(f"/api/saas/shipper/plans/{plan_id}").status_code == 404
     assert plan_id not in {p["plan_id"] for p in sangju.get("/api/saas/shipper/plans").json()}
     assert sangju.get("/api/saas/shipper/plan-confirmations").json() == []
     late = _decide(saas_login, plan_id, "sh-sangju", {"accept": True})
     assert late.status_code == 404
-    state = _state(platform_client, plan_id)
+    state = _state(forwarder_client, plan_id)
     assert "sh-sangju" not in {c["shipper_id"] for c in state["confirmations"]}
     assert state["status"] == "committed"
     assert state["needs_replan"] is False
@@ -260,7 +255,7 @@ def test_rolled_back_added_shipper_loses_access_and_invite(
             )
         ).all()
         assert left == []
-    attention = platform_client.get("/api/saas/platform/plan-confirmations").json()
+    attention = forwarder_client.get("/api/saas/forwarder/plan-confirmations").json()
     assert plan_id not in {s["plan_id"] for s in attention}
 
 
@@ -284,53 +279,41 @@ def _register_extra_jinju(saas_login) -> str:
 
 
 def test_plan_without_round_gates_new_shipper_through_a_new_round(
-    platform_client: TestClient, saas_login
+    forwarder_client: TestClient, platform_client: TestClient, saas_login
 ) -> None:
-    plan_id = _plan(platform_client, saas_login, skip=("sh-sangju",))["plan_id"]
     extra = _register_sangju(saas_login)
+    plan_id = _plan(forwarder_client, saas_login, skip=("sh-sangju",))["plan_id"]
     real = _go_real(saas_login)
-    forwarder_client = real(FORWARDER_ORG_ID)
+    owner = real(FORWARDER_ORG_ID)
     _drop_round(plan_id)
-    assert _assign(platform_client, plan_id).status_code == 200
 
-    alternative = _add_lot(platform_client, plan_id, extra)
-    blocked = platform_client.post(
-        f"/api/plans/{plan_id}/apply", json={"alternative_id": alternative}
-    )
-    assert blocked.status_code == 409, blocked.text
-
-    assert platform_client.delete(f"{PLATFORM}/{plan_id}/forwarder").status_code == 204
-    applied = platform_client.post(
-        f"/api/plans/{plan_id}/apply", json={"alternative_id": alternative}
-    )
+    alternative = _add_lot(owner, plan_id, extra)
+    applied = owner.post(f"/api/plans/{plan_id}/apply", json={"alternative_id": alternative})
     assert applied.status_code == 200, applied.text
-    state = _state(platform_client, plan_id)
+    state = _state(owner, plan_id)
     assert state["round"] == 1
     statuses = {c["shipper_id"]: c["status"] for c in state["confirmations"]}
     assert statuses.pop("sh-sangju") == "pending"
     assert statuses and set(statuses.values()) == {"accepted"}
-    assert _assign(platform_client, plan_id).status_code == 409
-    assert forwarder_client.get(f"/api/saas/forwarder/plans/{plan_id}").status_code == 404
+    assert _assign(platform_client, plan_id).status_code == 403
 
     accepted = _decide(real, plan_id, "sh-sangju", {"accept": True})
     assert accepted.status_code == 200, accepted.text
-    assert _assign(platform_client, plan_id).status_code == 200
+    assert all(c["status"] == "accepted" for c in _state(owner, plan_id)["confirmations"])
 
 
 def test_plan_without_round_still_takes_lots_of_shippers_already_in_it(
-    platform_client: TestClient, saas_login
+    forwarder_client: TestClient, saas_login
 ) -> None:
-    plan_id = _plan(platform_client, saas_login, skip=("sh-sangju",))["plan_id"]
+    plan_id = _plan(forwarder_client, saas_login, skip=("sh-sangju",))["plan_id"]
     extra = _register_extra_jinju(saas_login)
-    _go_real(saas_login)
+    real = _go_real(saas_login)
+    owner = real(FORWARDER_ORG_ID)
     _drop_round(plan_id)
-    assert _assign(platform_client, plan_id).status_code == 200
 
-    alternative = _add_lot(platform_client, plan_id, extra)
-    applied = platform_client.post(
-        f"/api/plans/{plan_id}/apply", json={"alternative_id": alternative}
-    )
+    alternative = _add_lot(owner, plan_id, extra)
+    applied = owner.post(f"/api/plans/{plan_id}/apply", json={"alternative_id": alternative})
     assert applied.status_code == 200, applied.text
-    state = _state(platform_client, plan_id)
+    state = _state(owner, plan_id)
     assert all(c["status"] == "accepted" for c in state["confirmations"])
     assert "sh-jinju" in {c["shipper_id"] for c in state["confirmations"]}

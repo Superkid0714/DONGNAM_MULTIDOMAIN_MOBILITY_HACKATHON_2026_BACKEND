@@ -1,6 +1,7 @@
 from fastapi.testclient import TestClient
 from test_api_plans import FakeClient, fake_vessels  # noqa: F401
-from test_saas_api import REDUCE, _platform_plan
+from test_deep_review_views import _queue_event
+from test_saas_api import REDUCE, _forwarder_plan
 
 from freshswitch_backend.api import plans as plans_api
 from freshswitch_backend.integrations import VesselMovement
@@ -26,10 +27,10 @@ def _capture(monkeypatch) -> list[dict]:
     return calls
 
 
-def test_body_movements_are_never_trusted(platform_client: TestClient, saas_login, monkeypatch):
+def test_body_movements_are_never_trusted(forwarder_client: TestClient, saas_login, monkeypatch):
     calls = _capture(monkeypatch)
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
-    response = platform_client.post(
+    plan_id = _forwarder_plan(saas_login)["plan_id"]
+    response = forwarder_client.post(
         f"/api/plans/{plan_id}/schedule-check",
         json={"movements": [LATE.model_dump(mode="json")]},
     )
@@ -38,26 +39,27 @@ def test_body_movements_are_never_trusted(platform_client: TestClient, saas_logi
 
 
 def test_fetched_movements_are_trusted_and_demo_fixture_is_not(
-    platform_client: TestClient,
+    forwarder_client: TestClient,
     saas_login,
     monkeypatch,
     fake_vessels,  # noqa: F811
 ):
     calls = _capture(monkeypatch)
     fake_vessels(FakeClient([LATE]))
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
-    fetched = platform_client.post(f"/api/plans/{plan_id}/schedule-check")
+    plan_id = _forwarder_plan(saas_login)["plan_id"]
+    fetched = forwarder_client.post(f"/api/plans/{plan_id}/schedule-check")
     assert fetched.status_code == 200, fetched.text
-    demo = platform_client.post(f"/api/plans/{plan_id}/schedule-check", params={"demo": "true"})
+    demo = forwarder_client.post(f"/api/plans/{plan_id}/schedule-check", params={"demo": "true"})
     assert demo.status_code == 200, demo.text
     assert [c["trusted"] for c in calls] == [True, False]
 
 
-def test_apply_notifies_shippers_who_must_confirm(platform_client: TestClient, saas_login):
-    plan_id = _platform_plan(platform_client, saas_login)["plan_id"]
-    event = platform_client.post(f"/api/plans/{plan_id}/events", json={"event": REDUCE})
+def test_apply_notifies_shippers_who_must_confirm(forwarder_client: TestClient, saas_login):
+    plan_id = _forwarder_plan(saas_login)["plan_id"]
+    _queue_event(plan_id, REDUCE)
+    event = forwarder_client.post(f"/api/plans/{plan_id}/events", json={"event": REDUCE})
     assert event.status_code == 200, event.text
-    applied = platform_client.post(
+    applied = forwarder_client.post(
         f"/api/plans/{plan_id}/apply", json={"alternative_id": "pull_forward"}
     )
     assert applied.status_code == 200, applied.text
@@ -68,7 +70,7 @@ def test_apply_notifies_shippers_who_must_confirm(platform_client: TestClient, s
         return [n for n in sent if n.kind == "order_confirmation_requested"]
 
     assert [n.order_id for n in order_notices()] == [order_id]
-    again = platform_client.post(
+    again = forwarder_client.post(
         f"/api/plans/{plan_id}/apply", json={"alternative_id": "pull_forward"}
     )
     assert again.status_code in (200, 409)
