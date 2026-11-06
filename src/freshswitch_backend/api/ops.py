@@ -143,9 +143,7 @@ def _lot_counts(db: Session, ids: list[str]) -> tuple[Counter, Counter]:
     rows = db.execute(select(*columns).where(LotRow.shipper_org_id.in_(ids))).all()
     wanted = set(ids)
     seed = {
-        value["id"]: value
-        for value in expected_world_lots(db)
-        if value["shipper_org_id"] in wanted
+        value["id"]: value for value in expected_world_lots(db) if value["shipper_org_id"] in wanted
     }
     changed: Counter = Counter()
     for row in rows:

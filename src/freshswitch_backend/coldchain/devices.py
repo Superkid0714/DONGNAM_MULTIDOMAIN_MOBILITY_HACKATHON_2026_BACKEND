@@ -91,9 +91,7 @@ def rewrite_registered_id(device_id: str, world_id: str | None) -> str:
         return _limit(device_id)
     sim = _OTHER_SIM.match(device_id)
     dev = _OTHER_DEVICE.match(device_id)
-    if (sim is not None and sim.group(1) != token) or (
-        dev is not None and dev.group(1) != token
-    ):
+    if (sim is not None and sim.group(1) != token) or (dev is not None and dev.group(1) != token):
         raise DeviceIdError(OTHER_WORLD_DEVICE)
     slug = device_id
     if slug.lower().startswith(SANDBOX_DEVICE_PREFIX):

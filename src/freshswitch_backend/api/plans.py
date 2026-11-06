@@ -343,7 +343,11 @@ def create_tenant_plan(body: CreatePlanRequest, org_id: str) -> PlanSession:
     try:
         with compute_slot():
             return store.create(
-                scenario, registered_ids, org_id=org_id, lot_org_id=ANY_ORG, exclusive=True,
+                scenario,
+                registered_ids,
+                org_id=org_id,
+                lot_org_id=ANY_ORG,
+                exclusive=True,
                 quantity_policy_v1=True,
             )
     except LotUnavailable as exc:

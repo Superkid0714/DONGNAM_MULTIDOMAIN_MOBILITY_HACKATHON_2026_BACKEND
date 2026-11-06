@@ -480,7 +480,8 @@ class ChangeRequestRow(Base):
     __tablename__ = "plan_change_requests"
     __table_args__ = (
         CheckConstraint(
-            "type IN ('reduce', 'cancel', 'air_switch', 'increase')", name="plan_change_requests_type_check"
+            "type IN ('reduce', 'cancel', 'air_switch', 'increase')",
+            name="plan_change_requests_type_check",
         ),
         CheckConstraint(
             "status IN ('open', 'applied', 'rejected')", name="plan_change_requests_status_check"

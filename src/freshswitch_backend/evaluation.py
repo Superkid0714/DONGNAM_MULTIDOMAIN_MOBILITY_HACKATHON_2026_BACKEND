@@ -126,9 +126,7 @@ def plan_checks(scenario, plan: Plan, routes, fixed: dict[str, str]) -> list[str
         errors.append("pickup coverage: duplicate or missing sea lot")
     for truck_id, intervals in truck_intervals.items():
         intervals.sort()
-        if any(
-            start < previous_end for (_, previous_end), (start, _) in pairwise(intervals)
-        ):
+        if any(start < previous_end for (_, previous_end), (start, _) in pairwise(intervals)):
             errors.append(f"truck routes overlap: {truck_id}")
     return errors
 

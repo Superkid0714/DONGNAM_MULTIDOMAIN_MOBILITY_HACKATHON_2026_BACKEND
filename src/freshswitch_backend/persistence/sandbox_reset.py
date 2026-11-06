@@ -119,9 +119,7 @@ def _reset_all(scenario_id: str) -> SandboxResetResult:
 
     now = clock()
     with database.begin() as db:
-        ids = list(
-            db.scalars(select(SandboxWorldRow.id).where(SandboxWorldRow.id != SEED_ID))
-        )
+        ids = list(db.scalars(select(SandboxWorldRow.id).where(SandboxWorldRow.id != SEED_ID)))
     total = 0
     for world_id in ids:
         total += _reset_one(world_id, None, None, scenario_id).orgs

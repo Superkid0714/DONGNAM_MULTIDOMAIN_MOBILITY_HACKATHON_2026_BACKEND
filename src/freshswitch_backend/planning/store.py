@@ -450,8 +450,14 @@ def _cleared(db: Session, row: PlanRow, session: PlanSession) -> set[str]:
     return set(_participants(session, _current_owners(db, row, session)))
 
 
-def _guard_real_apply(db: Session, row: PlanRow, session: PlanSession, event: Event,
-                      *, refill_invitation: bool = False) -> None:
+def _guard_real_apply(
+    db: Session,
+    row: PlanRow,
+    session: PlanSession,
+    event: Event,
+    *,
+    refill_invitation: bool = False,
+) -> None:
     if row.org_id == DEMO_ORG or _sandbox(db, row.org_id):
         return
     if (
@@ -715,7 +721,10 @@ def _trusted_request_initiator(
     event: Event,
     scenario: Scenario,
 ) -> str | None:
-    if not isinstance(event, CancelEvent | AirSwitchEvent) and event.type not in {"reduce", "increase"}:
+    if not isinstance(event, CancelEvent | AirSwitchEvent) and event.type not in {
+        "reduce",
+        "increase",
+    }:
         return None
     request = db.scalar(
         select(ChangeRequestRow)
@@ -1521,7 +1530,9 @@ class SessionStore:
             _excuse(order, rejecting, now)
         if charges:
             _charge_payers(order, charges, ordered, (before.scenario, scenario))
-        if policy_v1 and (event.type in {"cancel", "reduce", "increase", "air_switch"} or refill_invitation):
+        if policy_v1 and (
+            event.type in {"cancel", "reduce", "increase", "air_switch"} or refill_invitation
+        ):
             from freshswitch_backend.planning.quantity_policy import policy_deadlines
 
             policy_deadlines(db, plan_id, order, ordered, now)

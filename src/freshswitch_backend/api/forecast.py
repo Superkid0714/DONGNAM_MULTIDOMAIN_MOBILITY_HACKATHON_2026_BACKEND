@@ -252,8 +252,13 @@ async def delay_forecast(
     proposals = air_switch_proposals(session.scenario, voyages, where)
     from freshswitch_backend.planning.quantity_policy import record_air_recommendations
 
-    await run_in_threadpool(record_air_recommendations, plan_id, session.version,
-                            sorted(set(air) | {p.lot_id for p in proposals if p.recommended_airport is not None}), store.clock())
+    await run_in_threadpool(
+        record_air_recommendations,
+        plan_id,
+        session.version,
+        sorted(set(air) | {p.lot_id for p in proposals if p.recommended_airport is not None}),
+        store.clock(),
+    )
     return DelayForecastResponse(
         plan_id=plan_id,
         options=options,

@@ -292,9 +292,7 @@ def _device_allowed(owner: str | None, org_id: str) -> bool:
 def _tick_lock(db: Session, run: _Run) -> bool:
     if run.world_id:
         locked = db.scalar(
-            select(
-                func.pg_try_advisory_xact_lock_shared(WORLD_LOCK, func.hashtext(run.world_id))
-            )
+            select(func.pg_try_advisory_xact_lock_shared(WORLD_LOCK, func.hashtext(run.world_id)))
         )
         return bool(locked)
     if run.watches_reset:

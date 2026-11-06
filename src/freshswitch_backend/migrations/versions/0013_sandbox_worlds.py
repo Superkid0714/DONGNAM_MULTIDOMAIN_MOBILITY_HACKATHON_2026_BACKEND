@@ -98,12 +98,8 @@ def downgrade() -> None:
     op.execute("DELETE FROM delay_observations WHERE world_id IS NOT NULL")
     op.execute("DELETE FROM organizations WHERE world_id IS NOT NULL")
     op.execute("DELETE FROM users WHERE world_id IS NOT NULL")
-    op.drop_constraint(
-        "delay_observations_world_check", "delay_observations", type_="check"
-    )
-    op.drop_constraint(
-        "quality_observations_world_check", "quality_observations", type_="check"
-    )
+    op.drop_constraint("delay_observations_world_check", "delay_observations", type_="check")
+    op.drop_constraint("quality_observations_world_check", "quality_observations", type_="check")
     for table in (
         "delay_observations",
         "quality_observations",

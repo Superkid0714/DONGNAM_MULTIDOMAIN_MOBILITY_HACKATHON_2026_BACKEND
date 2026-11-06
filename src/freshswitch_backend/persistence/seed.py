@@ -424,9 +424,7 @@ def main(argv: list[str] | None = None) -> None:
 
         if not args.world and not args.all:
             parser.exit(2, "world_id 또는 --all 이 필요합니다\n")
-        result = reset_sandbox(
-            world_id=args.world, all_worlds=args.all, scenario_id=args.scenario
-        )
+        result = reset_sandbox(world_id=args.world, all_worlds=args.all, scenario_id=args.scenario)
         print(
             f"scope=sandbox orgs={result.orgs} reset_at={result.reset_at.isoformat()} "
             f"world_id={result.world_id or ''}"

@@ -169,9 +169,7 @@ class QualityHistory:
         count = 0
         for item in self._seed:
             obs_id = f"{world_id}-{item.id}" if prefixed else _seed_id(item.id, "sandbox")
-            observation = self._from_input(
-                item, "seed", obs_id, scenario, _seed_recorded_at(item)
-            )
+            observation = self._from_input(item, "seed", obs_id, scenario, _seed_recorded_at(item))
             db.add(_row(observation, ref))
             count += 1
         world = db.get(SandboxWorldRow, world_id)
@@ -285,14 +283,18 @@ class QualityHistory:
                     set_meta(db, _seeded_key(ref.kind), True)
                 return cleared or 0, 0
             if ref.kind == "sandbox" and ref.world_id is not None:
-                return cleared or 0, self.seed_world(db, ref.world_id, prefixed=ref.world_id != "seed")
+                return cleared or 0, self.seed_world(
+                    db, ref.world_id, prefixed=ref.world_id != "seed"
+                )
             return cleared or 0, self._seed_rows(db, scenario, ref.kind)
 
     def observations(self, scope: ScopeRef | str = "demo") -> list[Observation]:
         ref = scope_ref(scope)
         with self._lock, self._db.begin() as db:
             rows = db.scalars(
-                select(ObservationRow).where(_in_scope(ref), _counted()).order_by(ObservationRow.seq)
+                select(ObservationRow)
+                .where(_in_scope(ref), _counted())
+                .order_by(ObservationRow.seq)
             )
             stored = [Observation.model_validate(row.payload) for row in rows]
             return [*stored, *self._pending_seeds(db, ref)]
