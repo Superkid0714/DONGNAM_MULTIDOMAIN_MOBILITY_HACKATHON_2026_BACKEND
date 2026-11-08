@@ -14,7 +14,7 @@ services:
       dockerfile: Dockerfile
       args:
         GIT_COMMIT: ${API_TAG:-}
-    env_file: .env.saas
+    env_file: .env
     environment:
       POSTGRES_HOST: db
       SAAS_MODE: "true"
@@ -33,7 +33,10 @@ services:
   db:
     image: postgres:17-alpine
     restart: unless-stopped
-    env_file: .env.saas
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-freshswitch}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-freshswitch}
+      POSTGRES_DB: ${POSTGRES_DB:-freshswitch}
     command:
       - postgres
       - -c

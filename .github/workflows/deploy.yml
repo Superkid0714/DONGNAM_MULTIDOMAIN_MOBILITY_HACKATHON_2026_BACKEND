@@ -50,11 +50,62 @@ jobs:
           docker compose logs --tail 100 api
           exit 1
 
+      - name: verify SaaS database settings before redeploy
+        if: github.ref == 'refs/heads/feat/saas'
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+
+          values = {}
+          for line in Path(".env").read_text().splitlines():
+              line = line.strip()
+              if not line or line.startswith("#") or "=" not in line:
+                  continue
+              key, value = line.split("=", 1)
+              value = value.strip()
+              if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                  value = value[1:-1]
+              values[key.strip()] = value
+
+          def container_env(name):
+              raw = subprocess.check_output(
+                  ["docker", "inspect", "--format", "{{json .Config.Env}}", name],
+                  text=True,
+              )
+              return dict(item.split("=", 1) for item in json.loads(raw) if "=" in item)
+
+          try:
+              current_db = container_env("freshswitch-saas-db-1")
+              current_api = container_env("freshswitch-saas-api-1")
+          except subprocess.CalledProcessError as exc:
+              raise SystemExit(
+                  "Refusing SaaS redeploy: existing SaaS API/DB container was not found."
+              ) from exc
+
+          mismatches = []
+          for key in ("POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"):
+              candidate = values.get(key, "freshswitch")
+              if current_db.get(key) != candidate or current_api.get(key, candidate) != candidate:
+                  mismatches.append(key)
+          candidate_url = values.get("DATABASE_URL", "")
+          if current_api.get("DATABASE_URL", "") != candidate_url:
+              mismatches.append("DATABASE_URL")
+          if mismatches:
+              raise SystemExit(
+                  "Refusing SaaS redeploy: existing database settings differ from .env for "
+                  + ", ".join(mismatches)
+                  + ". No credential values were printed."
+              )
+          print("saas_database_settings_match=true")
+          PY
+
       - name: build and deploy SaaS
         if: github.ref == 'refs/heads/feat/saas'
         env:
           API_TAG: ${{ github.sha }}
-        run: docker compose --env-file .env.saas -f docker-compose.saas.yml up -d --build --remove-orphans
+        run: docker compose --env-file .env -f docker-compose.saas.yml up -d --build --remove-orphans
 
       - name: health check SaaS
         if: github.ref == 'refs/heads/feat/saas'
@@ -71,14 +122,14 @@ jobs:
             sleep 2
           done
           if [ "$healthy" -ne 1 ]; then
-            docker compose --env-file .env.saas -f docker-compose.saas.yml logs --tail 100 api
+            docker compose --env-file .env -f docker-compose.saas.yml logs --tail 100 api
             exit 1
           fi
 
       - name: verify SaaS delay ML model
         if: github.ref == 'refs/heads/feat/saas'
         run: |
-          docker compose --env-file .env.saas -f docker-compose.saas.yml exec -T api \
+          docker compose --env-file .env -f docker-compose.saas.yml exec -T api \
             python -c 'from freshswitch_backend.config import Settings; from freshswitch_backend.forecast.ml.adapter import initialize_delay_model; s=Settings(); assert s.feature_p1_delay_ml, "FEATURE_P1_DELAY_ML is disabled"; assert initialize_delay_model(s), "delay ML model failed to load"; print("delay_ml_model_loaded=true")'
 
       - name: verify SaaS delay response schema
