@@ -9,6 +9,9 @@ concurrency:
   group: deploy
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
   deploy:
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feat/saas'
@@ -19,9 +22,16 @@ jobs:
         working-directory: /srv/freshswitch/backend
     steps:
       - name: checkout
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
           git fetch --depth 1 origin "$GITHUB_SHA"
           git checkout --force --detach "$GITHUB_SHA"
+          unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 GH_TOKEN
 
       - name: build and deploy main
         if: github.ref == 'refs/heads/main'
