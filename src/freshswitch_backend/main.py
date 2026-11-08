@@ -171,6 +171,15 @@ def _quantity_forever() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = app.state.settings
+    if settings.feature_p1_delay_ml:
+        try:
+            from freshswitch_backend.forecast.ml.adapter import initialize_delay_model
+
+            loaded = await run_in_threadpool(initialize_delay_model, settings)
+            if not loaded:
+                logger.warning("지연 ML 모델을 사용할 수 없어 기존 통계 예측기를 사용합니다")
+        except Exception:
+            logger.exception("지연 ML 초기화 실패. 기존 통계 예측기를 사용합니다")
     try:
         await run_in_threadpool(_startup, settings)
     except Exception:
