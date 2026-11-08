@@ -6,6 +6,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from freshswitch_backend.domain.models import KST, Lot, Plan, Scenario, Voyage
+from freshswitch_backend.forecast.ml.adapter import MLDelayPredictorAdapter, PredictionDetails
 from freshswitch_backend.forecast.port_congestion import PortCongestionSummary
 from freshswitch_backend.forecast.predictor import (
     CONGESTION_FACTOR,
@@ -25,6 +26,7 @@ from freshswitch_backend.integrations.kma_forecast import (
     WeatherFeed,
     WeatherSource,
 )
+from freshswitch_backend.integrations.mof_vessel import VesselMovement
 from freshswitch_backend.optimize.costs import CostModel, LotCost, haversine_km
 from freshswitch_backend.optimize.feasibility import air_rejection
 from freshswitch_backend.replan.engine import apply_event
@@ -143,6 +145,14 @@ class VoyageForecast(BaseModel):
     congestion_scope: CongestionScope
     forecast: DelayForecast
     lots: list[LotRisk]
+    delay_p50_h: float
+    delay_p90_h: float
+    departure_p50: datetime
+    departure_p90: datetime
+    strong_wind_rule: bool
+    mode: Literal["ops", "plan"]
+    source: Literal["model", "stat"]
+    assumptions: list[str]
 
 
 class AirportOption(BaseModel):
@@ -367,6 +377,10 @@ def forecast_voyages(
     options: ForecastOptions,
     port: PortCongestionSummary | None = None,
     weather_by_voyage: Mapping[str, Weather] | None = None,
+    *,
+    ml_history=None,
+    ml_movements: Mapping[str, VesselMovement] | None = None,
+    forecast_wsd_by_voyage: Mapping[str, float] | None = None,
 ) -> list[VoyageForecast]:
     options = options.resolved()
     model = CostModel(scenario)
@@ -378,8 +392,38 @@ def forecast_voyages(
     for voyage in sorted(voyages, key=lambda v: v.etd):
         congestion, scope = voyage_congestion(voyage, options, port)
         weather = (weather_by_voyage or {}).get(voyage.id, fixed)
-        forecast = predictor.predict(_query(voyage), weather, congestion)
-        raw = forecast.p90_hours if options.quantile == "p90" else forecast.p50_hours
+        query = _query(voyage)
+        movement = (ml_movements or {}).get(voyage.id)
+        mode: Literal["ops", "plan"] = (
+            "ops" if movement is not None and movement.arrival_at is not None else "plan"
+        )
+        if isinstance(predictor, MLDelayPredictorAdapter):
+            details = predictor.predict_voyage(
+                voyage,
+                query,
+                weather,
+                congestion,
+                ml_history,
+                movement,
+                (forecast_wsd_by_voyage or {}).get(voyage.id),
+            )
+        else:
+            forecast = predictor.predict(query, weather, congestion)
+            p50 = float(forecast.p50_hours)
+            p90 = max(p50, float(forecast.p90_hours))
+            details = PredictionDetails(
+                forecast=forecast,
+                delay_p50_h=p50,
+                delay_p90_h=p90,
+                departure_p50=voyage.etd + timedelta(hours=p50),
+                departure_p90=voyage.etd + timedelta(hours=p90),
+                strong_wind_rule=False,
+                mode=mode,
+                source="stat",
+                assumptions=[item.name for item in forecast.assumptions],
+            )
+        forecast = details.forecast
+        raw = details.delay_p90_h if options.quantile == "p90" else details.delay_p50_h
         delay = _round_hours(raw)
         predicted = voyage.model_copy(update={"etd": voyage.etd + timedelta(hours=delay)})
         result.append(
@@ -394,6 +438,14 @@ def forecast_voyages(
                 congestion_scope=scope,
                 forecast=forecast,
                 lots=_lot_risks(model, voyage, predicted, plan, lots, options.min_sell_days),
+                delay_p50_h=details.delay_p50_h,
+                delay_p90_h=details.delay_p90_h,
+                departure_p50=details.departure_p50,
+                departure_p90=details.departure_p90,
+                strong_wind_rule=details.strong_wind_rule,
+                mode=details.mode,
+                source=details.source,
+                assumptions=details.assumptions,
             )
         )
     return result

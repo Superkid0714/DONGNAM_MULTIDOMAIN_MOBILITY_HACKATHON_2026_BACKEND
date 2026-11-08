@@ -1,4 +1,5 @@
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -15,6 +16,8 @@ class Settings(BaseSettings):
     cors_origins: list[str] = ["*"]
     explain_use_llm: bool = False
     offline_mode: bool = False
+    feature_p1_delay_ml: bool = True
+    delay_ml_model_dir: Path = Path(__file__).resolve().parent / "forecast" / "ml"
     replan_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
     explain_timeout_seconds: float = Field(default=8.0, gt=0, le=10)
     demo_reset_token: SecretStr = SecretStr("")
