@@ -7,5 +7,3 @@ docs/
 __pycache__/
 .pytest_cache/
 .ruff_cache/
-data/local-training/
-src/freshswitch_backend/data/history/busan_container_voyages.csv
