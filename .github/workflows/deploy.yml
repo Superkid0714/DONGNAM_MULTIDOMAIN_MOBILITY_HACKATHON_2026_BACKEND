@@ -85,7 +85,7 @@ jobs:
         run: |
           set -euo pipefail
           healthy=0
-          for _ in $(seq 1 30); do
+          for _ in $(seq 1 60); do
             if curl -fsS http://127.0.0.1:18106/test/api/health -o /tmp/freshswitch-saas-health.json \
               && python3 -c 'import json; d=json.load(open("/tmp/freshswitch-saas-health.json")); assert d.get("status") == "ok" and d.get("db") == "ok"'; then
               cat /tmp/freshswitch-saas-health.json
