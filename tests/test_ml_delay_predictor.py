@@ -103,6 +103,18 @@ def test_feature_switch_off_uses_stat_predictor():
     assert selected is stat
 
 
+def test_default_settings_select_ml_predictor():
+    clear_delay_model_cache()
+    stat = DelayPredictor([])
+
+    selected = select_predictor(
+        stat,
+        Settings(delay_ml_model_dir=MODEL_DIR),
+    )
+
+    assert isinstance(selected, MLDelayPredictorAdapter)
+
+
 def test_adapter_returns_model_forecast_and_output_fields():
     predictor = MLDelayPredictor(MODEL_DIR)
     adapter = MLDelayPredictorAdapter(DelayPredictor([]), predictor)
