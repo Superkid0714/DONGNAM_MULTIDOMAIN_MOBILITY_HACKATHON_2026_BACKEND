@@ -12,7 +12,6 @@ from freshswitch_backend.integrations import (
     MovementFeed,
     MovementProvider,
     MovementsUnavailable,
-    SourcedMovementFeed,
     VesselMovement,
 )
 from freshswitch_backend.integrations.mof_provider import LIVE_REQUEST_TIMEOUT_SECONDS
@@ -48,21 +47,6 @@ def movement_provider(factory: VesselClientFactory) -> MovementProvider:
     return MovementProvider(factory, offline_mode=get_settings().offline_mode)
 
 
-async def fetch_busan_sourced(
-    factory: VesselClientFactory,
-    start: date,
-    end: date,
-    direction: Literal["I", "O"] | None,
-    demo: bool = False,
-) -> SourcedMovementFeed:
-    try:
-        return await movement_provider(factory).get_sourced(start, end, direction, demo=demo)
-    except MovementsUnavailable as exc:
-        raise HTTPException(
-            status_code=503, detail=f"해수부 선박입출항 정보를 가져오지 못했습니다: {exc}"
-        ) from exc
-
-
 async def load_busan_feed(
     factory: VesselClientFactory,
     start: date,
@@ -70,7 +54,12 @@ async def load_busan_feed(
     direction: Literal["I", "O"] | None,
     demo: bool = False,
 ) -> MovementFeed:
-    return (await fetch_busan_sourced(factory, start, end, direction, demo=demo)).feed
+    try:
+        return await movement_provider(factory).get(start, end, direction, demo=demo)
+    except MovementsUnavailable as exc:
+        raise HTTPException(
+            status_code=503, detail=f"해수부 선박입출항 정보를 가져오지 못했습니다: {exc}"
+        ) from exc
 
 
 async def fetch_busan_movements(

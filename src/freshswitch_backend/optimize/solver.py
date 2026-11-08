@@ -4,15 +4,7 @@ from collections.abc import Iterable, Mapping
 
 from ortools.sat.python import cp_model
 
-from freshswitch_backend.domain.models import (
-    Assignment,
-    AssignmentReason,
-    AssignmentReasonCode,
-    Lot,
-    Plan,
-    Scenario,
-    UnassignedLot,
-)
+from freshswitch_backend.domain.models import Assignment, Lot, Plan, Scenario, UnassignedLot
 from freshswitch_backend.optimize.costs import CostModel
 from freshswitch_backend.optimize.feasibility import (
     SeaOption,
@@ -28,31 +20,6 @@ from freshswitch_backend.optimize.settlement import (
 
 AIR = "AIR"
 COST_SCALE = 1000
-SEA_CODES: dict[str, AssignmentReasonCode] = {
-    "목적지 불일치": "destination_mismatch",
-    "로트가 컨테이너 용량보다 큼": "over_capacity",
-    "CA 미지원 컨테이너": "ca_unsupported",
-    "출하일이 선적 마감 이후": "sea_deadline_miss",
-    "도착일이 판매기한 초과": "sea_sell_by_miss",
-    "신선 유지 기간 초과": "sea_shelf_life_miss",
-}
-SEA_PRIORITY: tuple[AssignmentReasonCode, ...] = (
-    "sea_forbidden",
-    "sea_shelf_life_miss",
-    "sea_sell_by_miss",
-    "sea_deadline_miss",
-    "ca_unsupported",
-    "over_capacity",
-    "destination_mismatch",
-    "other",
-)
-AIR_CODES: dict[str, AssignmentReasonCode] = {
-    "항공 미허용": "air_not_allowed",
-    "항공도 판매기한 초과": "air_sell_by_miss",
-    "항공도 신선 유지 기간 초과": "air_shelf_life_miss",
-}
-CAPACITY_OR_COST = "용량·혼적 제약 또는 절감 조건(해상 총비용이 항공보다 큼)으로 배정되지 않음"
-SeaRejection = tuple[AssignmentReasonCode, str, str]
 
 
 def solve_plan(
@@ -84,8 +51,6 @@ def solve_plan(
 
     options: dict[str, dict[str, SeaOption]] = {}
     rejections: dict[str, list[str]] = defaultdict(list)
-    sea_rejections: dict[str, list[SeaRejection]] = defaultdict(list)
-    air_codes: dict[str, AssignmentReasonCode] = {}
     air_ok: dict[str, bool] = {}
     for lot in lots:
         target = fixed.get(lot.id)
@@ -94,7 +59,6 @@ def solve_plan(
             if (lot.id, container.id) in forbidden_set:
                 why = forbidden_reasons.get((lot.id, container.id), "배정 금지")
                 rejections[lot.id].append(f"{container.id}: {why}")
-                sea_rejections[lot.id].append(("sea_forbidden", why, container.id))
                 continue
             option, reason = sea_option(model, lot, container, max_pull_forward_days)
             if option is None and target == container.id:
@@ -102,9 +66,6 @@ def solve_plan(
                 option = SeaOption(container.id, max(0, late))
             if option is None:
                 rejections[lot.id].append(f"{container.id}: {reason}")
-                sea_rejections[lot.id].append(
-                    (SEA_CODES.get(reason, "other"), reason, container.id)
-                )
             else:
                 options[lot.id][container.id] = option
         reason = None if allow_air else "항공 미허용"
@@ -112,8 +73,6 @@ def solve_plan(
             reason = forbidden_reasons.get((lot.id, AIR), "항공 배정 금지")
         if reason is None:
             reason = air_rejection(model, lot)
-        if reason is not None:
-            air_codes[lot.id] = AIR_CODES.get(reason, "air_forbidden")
         air_ok[lot.id] = reason is None or target == AIR
         if not air_ok[lot.id]:
             rejections[lot.id].append(f"항공: {reason}")
@@ -230,10 +189,7 @@ def solve_plan(
                 )
             )
         elif lot.id in y and solver.value(y[lot.id]):
-            reason = _air_reason(
-                sea_rejections[lot.id], bool(options[lot.id]), fixed.get(lot.id) == AIR
-            )
-            assignments.append(_assignment(lot, "air", None, None, 0, reason))
+            assignments.append(_assignment(lot, "air", None, None, 0))
         else:
             unassigned.append(
                 UnassignedLot(
@@ -241,11 +197,6 @@ def solve_plan(
                     shipper_id=lot.shipper_id,
                     pallets=lot.pallets,
                     reason=_unassigned_reason(lot, options, air_ok, rejections),
-                    reason_code=_unassigned_code(
-                        sea_rejections[lot.id],
-                        bool(options[lot.id]) or air_ok[lot.id],
-                        air_codes.get(lot.id),
-                    ),
                 )
             )
     return _build_plan(
@@ -261,12 +212,7 @@ def solve_plan(
 
 
 def _assignment(
-    lot: Lot,
-    mode: str,
-    container_id: str | None,
-    voyage_id: str | None,
-    pull: int,
-    reason: AssignmentReason | None = None,
+    lot: Lot, mode: str, container_id: str | None, voyage_id: str | None, pull: int
 ) -> Assignment:
     return Assignment(
         lot_id=lot.id,
@@ -277,44 +223,7 @@ def _assignment(
         container_id=container_id,
         voyage_id=voyage_id,
         pull_forward_days=pull,
-        reason=reason,
     )
-
-
-def _sea_reason(rejected: list[SeaRejection]) -> AssignmentReason | None:
-    if not rejected:
-        return None
-    code = min((c for c, _, _ in rejected), key=SEA_PRIORITY.index)
-    label = next(text for c, text, _ in rejected if c == code)
-    containers = ", ".join(cid for c, text, cid in rejected if c == code and text == label)
-    return AssignmentReason(code=code, message=f"해상 배정 불가: {label}({containers})")
-
-
-def _air_reason(rejected: list[SeaRejection], has_sea: bool, is_fixed: bool) -> AssignmentReason:
-    if not has_sea:
-        sea = _sea_reason(rejected)
-        if sea is None:
-            return AssignmentReason(
-                code="no_feasible_mode", message="해상 컨테이너가 없어 항공 배정"
-            )
-        return sea.model_copy(update={"message": f"{sea.message}. 항공 배정"})
-    if is_fixed:
-        return AssignmentReason(code="fixed", message="재계획에서 항공 배정을 그대로 유지")
-    return AssignmentReason(
-        code="capacity_or_cost",
-        message="해상 선택지가 있었지만 용량·혼적 제약 또는 해상 총비용이 항공보다 커서 항공 배정",
-    )
-
-
-def _unassigned_code(
-    rejected: list[SeaRejection], has_option: bool, air_code: AssignmentReasonCode | None
-) -> AssignmentReasonCode:
-    if has_option:
-        return "capacity_or_cost"
-    sea = _sea_reason(rejected)
-    if sea is not None:
-        return sea.code
-    return air_code or "no_feasible_mode"
 
 
 def _unassigned_reason(
@@ -324,7 +233,7 @@ def _unassigned_reason(
     rejections: dict[str, list[str]],
 ) -> str:
     if options[lot.id] or air_ok[lot.id]:
-        return CAPACITY_OR_COST
+        return "용량·혼적 제약 또는 절감 조건(해상 총비용이 항공보다 큼)으로 배정되지 않음"
     return "; ".join(rejections[lot.id]) or "배정 가능한 수단 없음"
 
 
@@ -394,7 +303,6 @@ def _empty_plan(
             shipper_id=lot.shipper_id,
             pallets=lot.pallets,
             reason=f"해 없음({status}): 고정 배정이 제약과 충돌",
-            reason_code="no_solution",
         )
         for lot in lots
     ]

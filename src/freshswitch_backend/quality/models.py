@@ -3,30 +3,28 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from freshswitch_backend.domain.inputs import FiniteFloat, StorableStr
 from freshswitch_backend.domain.models import LossAdjustment, Mode
 
 OutageBucket = Literal["none", "short", "long", "unknown"]
 MixKind = Literal["solo", "shared_same_product", "mixed_products"]
 ObservationOrigin = Literal["seed", "arrival", "manual"]
-MAX_OUTAGE_MINUTES = 60 * 24 * 60
 
 
 class ObservationIn(BaseModel):
-    product_id: StorableStr
-    destination: StorableStr = "HKHKG"
+    product_id: str
+    destination: str = "HKHKG"
     mode: Mode = "sea"
     pallets: int = Field(gt=0, le=1000)
     actual_loss_pct: float = Field(ge=0, le=100)
     planned_loss_pct: float | None = Field(default=None, ge=0, le=100)
     wait_days: int = Field(default=0, ge=0, le=60)
-    outage_minutes: FiniteFloat | None = Field(default=None, ge=0, le=MAX_OUTAGE_MINUTES)
+    outage_minutes: float | None = Field(default=None, ge=0)
     mix: MixKind = "solo"
     so2_in_container: bool = False
-    co_loaded_product_ids: list[StorableStr] = Field(default_factory=list)
+    co_loaded_product_ids: list[str] = Field(default_factory=list)
     observed_on: date | None = None
-    note: StorableStr | None = Field(default=None, max_length=500)
-    source: StorableStr = Field(default="수동 입력", max_length=300)
+    note: str | None = Field(default=None, max_length=500)
+    source: str = Field(default="수동 입력", max_length=300)
 
 
 class SeedObservation(ObservationIn):
@@ -105,14 +103,6 @@ class LossTable(BaseModel):
     total_observations: int
     cells: list[LossCell]
     adjustments: list[LossAdjustment]
-
-
-class ExpectedLoss(BaseModel):
-    rate: float
-    mode: Mode
-    basis: str
-    n_observations: int
-    source: str | None = None
 
 
 class ObservationList(BaseModel):

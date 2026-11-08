@@ -30,13 +30,6 @@ def _shipper_message(ctx: ExplainContext, shipper: ShipperImpact) -> str:
             f"{format_krw(shipper.cost_after_krw)}으로 {format_amount_krw(shipper.delta_krw)} "
             f"{change_verb(shipper.delta_krw)}."
         )
-    adjustment = shipper.cancellation_adjustment_krw
-    if adjustment > 0:
-        parts.append(f"취소 부담금 {format_krw(adjustment)}을 별도로 부담합니다.")
-    elif adjustment < 0:
-        parts.append(f"취소 보전금 {format_krw(-adjustment)}을 받습니다.")
-        if shipper.delta_krw + adjustment == 0:
-            parts.append("보전금을 받으면 실제 부담 변화는 없습니다.")
     if shipper.moved:
         parts.append(f"화물은 {shipper.moved}(으)로 옮겨집니다.")
     if shipper.pull_forward_days:
@@ -64,16 +57,11 @@ def _operator_summary(ctx: ExplainContext) -> str:
         parts.append(line + (f" 적재: {fills}." if fills else ""))
     else:
         parts.append("실행 가능한 대안이 없습니다.")
-    parts.extend(f"주의: {warning.rstrip('.')}." for warning in ctx.warnings)
     infeasible = [alt for alt in ctx.alternatives if not alt.feasible]
     for alt in infeasible:
         reason = alt.reason or "사유 미기재"
         parts.append(f"'{alt.label}' 불가: {reason}.")
-    affected = [
-        s.shipper_name
-        for s in ctx.shippers
-        if s.delta_krw != 0 or s.moved or s.cancellation_adjustment_krw
-    ]
+    affected = [s.shipper_name for s in ctx.shippers if s.delta_krw != 0 or s.moved]
     if affected:
         parts.append(f"영향 화주: {', '.join(affected)}.")
     return " ".join(parts)

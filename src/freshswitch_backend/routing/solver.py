@@ -47,11 +47,6 @@ def _assumptions(req: PickupRequest) -> list[str]:
             f"가정: 항만 게이트 혼잡 시간({spans})에는 도착하지 않도록 출발을 늦춘다. "
             "피하면 cut-off 전 집하를 못 하는 정차지가 생길 때만 혼잡 시간 도착을 허용한다"
         )
-    if req.locked_routes:
-        lines.append(
-            f"고정: 이미 출발했거나 배차가 실행된 트럭 운행 {len(req.locked_routes)}건은 "
-            "경로·적재를 바꾸지 않고, 그 트럭은 항만 복귀 뒤에만 다시 배차한다"
-        )
     if req.incompatible_groups:
         lines.append(
             "규칙: 컨테이너 혼적 규칙(SO2 처리 여부·온도·CA 조건)이 맞지 않는 품목은 "
@@ -64,60 +59,9 @@ def _floor_min(dt: datetime) -> datetime:
     return dt.replace(second=0, microsecond=0)
 
 
-def _release_locked(req: PickupRequest) -> PickupRequest:
-    turnaround = timedelta(minutes=req.service_minutes)
-    free_at: dict[str, datetime] = {}
-    until: dict[str, datetime] = {}
-
-    def after(truck_id: str, at: datetime) -> None:
-        free_at[truck_id] = max(at, free_at.get(truck_id, at))
-
-    for route in req.locked_routes:
-        after(route.truck_id, route.port_eta + turnaround)
-    for route in [*req.blocking_routes, *req.reserved_routes]:
-        leave, back = route.earliest_departure - turnaround, route.port_eta + turnaround
-        if leave >= req.deadline:
-            continue
-        if back >= req.deadline:
-            until[route.truck_id] = min(leave, until.get(route.truck_id, leave))
-        else:
-            after(route.truck_id, back)
-    trucks = [
-        t.model_copy(
-            update={
-                "available_from": max(
-                    [x for x in (t.available_from, free_at.get(t.id)) if x is not None],
-                    default=None,
-                ),
-                "available_until": min(
-                    [x for x in (t.available_until, until.get(t.id)) if x is not None],
-                    default=None,
-                ),
-            }
-        )
-        for t in req.trucks
-    ]
-    return req.model_copy(update={"trucks": trucks})
-
-
-def _merge_locked(req: PickupRequest, routes: list[TruckRoute]) -> list[TruckRoute]:
-    last: dict[str, int] = {}
-    for route in [*req.locked_routes, *req.reserved_routes]:
-        last[route.truck_id] = max(route.trip, last.get(route.truck_id, 0))
-    shifted = []
-    for route in sorted(routes, key=lambda r: (r.earliest_departure, r.trip)):
-        trip = last.get(route.truck_id, 0) + 1
-        last[route.truck_id] = trip
-        shifted.append(route.model_copy(update={"trip": trip}))
-    order = {t.id: i for i, t in enumerate(req.trucks)}
-    merged = [*req.locked_routes, *shifted]
-    return sorted(merged, key=lambda r: (order.get(r.truck_id, len(order)), r.trip))
-
-
 def solve_pickup(request: PickupRequest, time_limit_s: float = 5.0) -> PickupPlan:
     started = time.perf_counter()
-    pinned = request.locked_routes or request.blocking_routes or request.reserved_routes
-    req = _release_locked(request) if pinned else request
+    req = request
     points = [(req.depot.lat, req.depot.lon)] + [(s.lat, s.lon) for s in req.stops]
     n = len(points)
     km = [
@@ -136,10 +80,6 @@ def solve_pickup(request: PickupRequest, time_limit_s: float = 5.0) -> PickupPla
     if req.trucks_available_from is not None:
         t0_candidates.append(req.trucks_available_from)
     t0 = _floor_min(min(t0_candidates, default=req.deadline))
-    if req.not_before is not None and req.not_before > t0:
-        available = max(req.not_before, req.trucks_available_from or req.not_before)
-        req = req.model_copy(update={"trucks_available_from": available})
-        t0 = _floor_min(min([*t0_candidates, available], default=req.deadline))
 
     def to_min(dt: datetime) -> int:
         return math.floor((dt - t0).total_seconds() / 60)
@@ -169,13 +109,9 @@ def solve_pickup(request: PickupRequest, time_limit_s: float = 5.0) -> PickupPla
     blocked = _blocked_intervals(req, t0, to_min)
     gate_mode: GateMode = "none"
     truck_start = [_truck_start(t.available_from, start_min, to_min) for t in req.trucks]
-    truck_end = [
-        min(horizon, to_min(t.available_until)) if t.available_until else horizon
-        for t in req.trucks
-    ]
 
     if windows and req.trucks:
-        args = (req, windows, km, travel, service, (truck_start, truck_end), horizon, time_limit_s)
+        args = (req, windows, km, travel, service, truck_start, horizon, time_limit_s)
         outcome = _run(*args, blocked) if blocked else None
         if blocked:
             gate_mode = "avoid"
@@ -203,7 +139,7 @@ def solve_pickup(request: PickupRequest, time_limit_s: float = 5.0) -> PickupPla
                         travel,
                         service,
                         truck_start[t],
-                        min(deadline, truck_end[t]),
+                        deadline,
                         to_dt,
                         blocked,
                     )
@@ -212,10 +148,6 @@ def solve_pickup(request: PickupRequest, time_limit_s: float = 5.0) -> PickupPla
         status = "NO_TRUCKS"
         dropped.extend(req.stops[node - 1].id for node in windows)
 
-    if req.locked_routes or req.reserved_routes:
-        routes = _merge_locked(req, routes)
-    if req.locked_routes and status == "NO_STOPS":
-        status = "OK"
     if dropped and status == "OK":
         status = "PARTIAL"
     order = {s.id: i for i, s in enumerate(req.stops)}
@@ -288,12 +220,11 @@ def _run(
     km: list[list[float]],
     travel: list[list[int]],
     service: list[int],
-    availability: tuple[list[int], list[int]],
+    truck_start: list[int],
     horizon: int,
     time_limit_s: float,
     blocked: list[Interval],
 ) -> tuple[list[list[list[int]]], list[str]] | None:
-    truck_start, truck_end = availability
     active = sorted(windows)
     nodes = [0] + active
     m = len(nodes)
@@ -343,35 +274,19 @@ def _run(
         index = manager.NodeToIndex(pos)
         time_dim.CumulVar(index).SetRange(*windows[node])
         routing.AddDisjunction([index], DROP_PENALTY)
-    usable = [
-        v
-        for v in range(vehicles)
-        if truck_start[v % n_trucks] + (v // n_trucks) * req.service_minutes
-        <= truck_end[v % n_trucks]
-    ]
-    if not usable:
-        return None
-    for v in sorted(set(range(vehicles)) - set(usable)):
-        for pos in range(1, m):
-            routing.VehicleVar(manager.NodeToIndex(pos)).RemoveValue(v)
-    for v in usable:
-        begin, end = truck_start[v % n_trucks], truck_end[v % n_trucks]
+    for v in range(vehicles):
+        begin = min(truck_start[v % n_trucks], horizon)
         time_dim.CumulVar(routing.Start(v)).SetRange(begin, horizon)
         time_dim.CumulVar(routing.End(v)).SetRange(begin, horizon)
         for lo, hi, _ in blocked:
             lo, hi = max(lo, begin), min(hi - 1, horizon)
             if lo <= hi:
                 time_dim.CumulVar(routing.End(v)).RemoveInterval(lo, hi)
-        if end < horizon:
-            routing.solver().Add(
-                time_dim.CumulVar(routing.End(v))
-                <= end + (horizon - end) * (1 - routing.ActiveVehicleVar(v))
-            )
-        if v >= n_trucks:
-            routing.solver().Add(
-                time_dim.CumulVar(routing.End(v - n_trucks)) + req.service_minutes
-                <= time_dim.CumulVar(routing.Start(v))
-            )
+    for v in range(n_trucks, vehicles):
+        routing.solver().Add(
+            time_dim.CumulVar(routing.End(v - n_trucks)) + req.service_minutes
+            <= time_dim.CumulVar(routing.Start(v))
+        )
 
     groups = sorted({req.stops[node - 1].cargo_group for node in active} - {None})
     type_of = {g: i for i, g in enumerate(groups)}

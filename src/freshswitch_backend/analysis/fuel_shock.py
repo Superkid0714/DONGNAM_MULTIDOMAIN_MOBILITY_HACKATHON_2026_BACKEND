@@ -50,7 +50,7 @@ def with_surcharge(scenario: Scenario, surcharge: float) -> Scenario:
 def _pallet_kg(scenario: Scenario) -> float:
     products = {p.id: p for p in scenario.products}
     anchor = products.get(ANCHOR_PRODUCT) or next(iter(products.values()), None)
-    return anchor.net_pallet_kg if anchor is not None else PALLET_KG
+    return anchor.pallet_kg if anchor is not None else PALLET_KG
 
 
 def _mode(location: str) -> str:

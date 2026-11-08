@@ -7,21 +7,8 @@ from collections import Counter
 from pathlib import Path
 
 from freshswitch_backend.data.loader import get_scenario
-from freshswitch_backend.integrations.kma_forecast import (
-    FORECAST_DATASET,
-    FORECAST_DATASET_URL,
-    KMA_SNAPSHOT_PATH,
-    WARNING_DATASET,
-    WARNING_DATASET_URL,
-)
 
 DATA_ROOT = Path(__file__).parent
-ASSET_SOURCES = {
-    KMA_SNAPSHOT_PATH.relative_to(DATA_ROOT).as_posix(): {
-        "source": f"{FORECAST_DATASET}·{WARNING_DATASET} (공공데이터포털, 부산신항 격자·부산 특보구역)",
-        "source_url": [FORECAST_DATASET_URL, WARNING_DATASET_URL],
-    },
-}
 
 
 def source_kind(source: str) -> str:
@@ -71,18 +58,9 @@ def asset_inventory() -> list[dict]:
         document = json.loads(content)
         relative = path.relative_to(DATA_ROOT).as_posix()
         simulated = relative.startswith(("scenarios/", "quality/", "snapshots/demo/"))
-        metadata = dict(ASSET_SOURCES.get(relative, {})) | {
+        metadata = {
             key: document[key]
-            for key in (
-                "source",
-                "label",
-                "source_url",
-                "fetched_at",
-                "updated_at",
-                "start",
-                "end",
-                "count",
-            )
+            for key in ("source", "label", "fetched_at", "updated_at", "start", "end", "count")
             if key in document
         }
         assets.append(
@@ -114,7 +92,5 @@ def provenance_catalog(scenario_id: str = "default") -> dict:
             "Quality seed observations are not actual arrival inspection records.",
             "Published figures, converted estimates and contractual assumptions must not be presented as one measured dataset.",
             "Recorded dates are publication/reference dates, not proof that a price is currently valid.",
-            "Terminal berth snapshots are published plans at fetch time, not actual departures.",
-            "KMA weather snapshots are forecasts and warnings as issued at fetch time, not observed conditions.",
         ],
     }

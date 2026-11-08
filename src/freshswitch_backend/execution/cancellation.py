@@ -13,10 +13,9 @@ from freshswitch_backend.replan.models import (
 )
 
 RULE = (
-    "취소·감량 화주는 같은 컨테이너에 남은 화물의 운임·부대비 몫 증가분(데드프레이트)을 "
-    "부담한다. 빈자리를 다른 화물로 채워 몫이 오르지 않으면 0원. 운영비 분담 화주는 실제로 "
-    "늘어난 몫만큼 돌려받는다. 정산표 단가 화주는 단가가 그대로라 보전이 없고, 그 몫은 빈칸 "
-    "비용을 떠안는 혼재 주관자(플랫폼)가 받는다"
+    "취소·감량 화주는 같은 컨테이너에 남은 다른 화주의 운임·부대비 몫 증가분(데드프레이트)을 "
+    "부담한다. 빈자리를 다른 화물로 채워 몫이 오르지 않으면 0원. 부담액은 늘어난 몫만큼 "
+    "남은 화주에게 돌려준다"
 )
 
 
@@ -40,17 +39,6 @@ def _container_pallets(plan: Plan, container_id: str) -> dict[str, int]:
     return dict(by_shipper)
 
 
-def _recipient_kind(transfers: list[CancellationTransfer], consolidator_amount: int) -> str | None:
-    received = any(t.amount > 0 for t in transfers)
-    if received and consolidator_amount:
-        return "mixed"
-    if received:
-        return "shippers"
-    if consolidator_amount:
-        return "consolidator"
-    return None
-
-
 def cancellation_charge(
     scenario_before: Scenario,
     plan_before: Plan,
@@ -59,8 +47,6 @@ def cancellation_charge(
     event: CancelEvent | ReduceEvent,
     params: ExecutionParams | None = None,
 ) -> CancellationCharge | None:
-    if event.type == "increase":
-        return None
     params = params or ExecutionParams()
     lot = next((x for x in scenario_before.lots if x.id == event.lot_id), None)
     assignment = next((a for a in plan_before.assignments if a.lot_id == event.lot_id), None)
@@ -74,38 +60,24 @@ def cancellation_charge(
     after_total = sum(after.values())
     model = CostModel(scenario_after)
     container = model.containers[container_id]
-    plug = model.container_plug_cost(container)
-    cost = model.container_fixed_cost + plug
+    cost = model.container_total_fixed_cost(container)
     per_before = cost / before_total
     per_after = cost / after_total if after_total else 0.0
-    step = 1 / after_total - 1 / before_total if after_total else 0.0
     refilled = max(0, min(cancelled, after_total - (before_total - cancelled)))
     rate = params.cancellation_fee_rate.value
-    lots = {x.id: x for x in scenario_after.lots}
-    shipper_increase: dict[str, float] = defaultdict(float)
-    consolidator_increase = 0.0
-    for a in alternative.plan.assignments:
-        sid = a.shipper_id
-        if a.mode != "sea" or a.container_id != container_id:
-            continue
-        if sid == lot.shipper_id or sid not in before:
-            continue
-        rise = max(0.0, a.pallets * step)
-        tariff = a.lot_id in lots and model.tariff(lots[a.lot_id]) is not None
-        if tariff:
-            shipper_increase[sid] += rise * plug
-            consolidator_increase += rise * model.container_fixed_cost
-        else:
-            shipper_increase[sid] += rise * cost
-    others = sorted(shipper_increase)
-    increases = [shipper_increase[sid] for sid in others]
-    fee = round((sum(increases) + consolidator_increase) * rate)
-    *amounts, consolidator_amount = split_amount(fee, [*increases, consolidator_increase])
+    others = [
+        (sid, pallets)
+        for sid, pallets in sorted(after.items())
+        if sid != lot.shipper_id and sid in before
+    ]
+    increases = [max(0.0, pallets * (per_after - per_before)) for _, pallets in others]
+    fee = round(sum(increases) * rate)
+    amounts = split_amount(fee, increases)
     transfers = [
         CancellationTransfer(
-            shipper_id=sid, pallets=after[sid], share_increase=round(increase), amount=amount
+            shipper_id=sid, pallets=pallets, share_increase=round(increase), amount=amount
         )
-        for sid, increase, amount in zip(others, increases, amounts, strict=True)
+        for (sid, pallets), increase, amount in zip(others, increases, amounts, strict=True)
         if increase > 0
     ]
     return CancellationCharge(
@@ -124,11 +96,8 @@ def cancellation_charge(
         fee_rate=rate,
         fee=fee,
         transfers=transfers,
-        recipient_kind=_recipient_kind(transfers, consolidator_amount),
-        consolidator=params.cancellation_consolidator,
-        consolidator_amount=consolidator_amount,
         rule=RULE,
-        source=f"{params.cancellation_fee_rate.source}. {params.cancellation_consolidator_source}",
+        source=params.cancellation_fee_rate.source,
     )
 
 

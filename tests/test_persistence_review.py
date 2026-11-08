@@ -164,16 +164,16 @@ def test_auto_lot_id_skips_ids_embedded_in_plans(client: TestClient) -> None:
 def test_stream_thread_failure_marks_run_done(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    original = coldchain_store._ingest
+    original = coldchain_store.ingest
     calls = {"n": 0}
 
-    def flaky(db, items, *args, **kwargs):
+    def flaky(items):
         calls["n"] += 1
         if calls["n"] == 2:
             raise OperationalError("SELECT 1", {}, Exception("connection lost"))
-        return original(db, items, *args, **kwargs)
+        return original(items)
 
-    monkeypatch.setattr(coldchain_store, "_ingest", flaky)
+    monkeypatch.setattr(coldchain_store, "ingest", flaky)
     run = client.post(
         "/api/coldchain/simulate", json={"preset": "normal", "interval_seconds": 0.01}
     ).json()

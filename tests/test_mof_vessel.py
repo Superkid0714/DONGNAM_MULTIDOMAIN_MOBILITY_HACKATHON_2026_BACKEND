@@ -1,6 +1,6 @@
 import asyncio
 import os
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 
 import httpx
 import pytest
@@ -9,10 +9,8 @@ from freshswitch_backend.integrations import (
     MofVesselApiError,
     MofVesselClient,
     PlannedVoyage,
-    SnapshotStore,
     VesselMovement,
     detect_schedule_changes,
-    match_departures,
     normalize_vessel_name,
     parse_movements,
 )
@@ -262,73 +260,6 @@ def test_detect_negative_delta():
         [("V9", "다누리", datetime(2026, 10, 30, 12, 0, tzinfo=KST))], movements
     )
     assert changes[0].delta_hours == -6.0
-
-
-def _real_movements() -> list[VesselMovement]:
-    snapshot = SnapshotStore().load(date(2026, 10, 29), "O")
-    assert snapshot is not None
-    return snapshot.movements
-
-
-def test_detect_matches_real_snapshot_record_by_call_sign():
-    movements = _real_movements()
-    real = next(m for m in movements if m.call_sign == "5LYK5")
-    assert real.vessel_name == "MSC SALERNO" and real.departure_at is not None
-    planned = datetime(2026, 10, 28, 18, 0, tzinfo=KST)
-    voyage = PlannedVoyage(
-        voyage_id="V-REAL", vessel_name="MV FRESH HARMONY", etd=planned, call_sign="5lyk5"
-    )
-    changes = detect_schedule_changes([voyage], movements)
-    assert len(changes) == 1
-    change = changes[0]
-    assert change.matched_by == "call_sign" and change.call_sign == "5LYK5"
-    assert change.observed_etd == real.departure_at
-    assert change.delta_hours == round((real.departure_at - planned).total_seconds() / 3600, 2)
-    unnamed = voyage.model_copy(update={"call_sign": None})
-    assert detect_schedule_changes([unnamed], movements) == []
-
-
-def test_call_sign_wins_over_name_and_name_is_fallback():
-    when = datetime(2026, 11, 18, 18, 0, tzinfo=KST)
-    movements = [
-        VesselMovement(
-            port_code="020",
-            call_sign="AAA1",
-            vessel_name="SAME NAME",
-            departure_at=when + timedelta(hours=10),
-        ),
-        VesselMovement(
-            port_code="020",
-            call_sign="BBB2",
-            vessel_name="SAME NAME",
-            departure_at=when + timedelta(hours=4),
-        ),
-    ]
-    by_call = match_departures(
-        [PlannedVoyage(voyage_id="V1", vessel_name="SAME NAME", etd=when, call_sign="AAA1")],
-        movements,
-    )
-    assert [(m.matched_by, m.movement.call_sign) for m in by_call] == [("call_sign", "AAA1")]
-    other_ship = match_departures(
-        [PlannedVoyage(voyage_id="V1", vessel_name="SAME NAME", etd=when, call_sign="ZZZ9")],
-        movements,
-    )
-    assert other_ship == []
-    unsigned = VesselMovement(
-        port_code="020",
-        call_sign="",
-        vessel_name="SAME NAME",
-        departure_at=when + timedelta(hours=6),
-    )
-    fallback = match_departures(
-        [PlannedVoyage(voyage_id="V1", vessel_name="SAME NAME", etd=when, call_sign="ZZZ9")],
-        [*movements, unsigned],
-    )
-    assert [(m.matched_by, m.movement.call_sign) for m in fallback] == [("vessel_name", "")]
-    no_sign = match_departures(
-        [PlannedVoyage(voyage_id="V1", vessel_name="SAME NAME", etd=when)], movements
-    )
-    assert [(m.matched_by, m.movement.call_sign) for m in no_sign] == [("vessel_name", "BBB2")]
 
 
 @pytest.mark.skipif(

@@ -142,11 +142,6 @@ def build_context(
     if ctx.products:
         ctx.band_max_c = min(p.temp_max_c for p in ctx.products)
         ctx.band_min_c = min(max(p.temp_min_c for p in ctx.products), ctx.band_max_c)
-        if ctx.band_max_c <= ctx.band_min_c:
-            tolerance = params.point_band_tolerance_c.value
-            point = ctx.band_max_c
-            ctx.band_min_c = round(point - tolerance, 2)
-            ctx.band_max_c = round(point + tolerance, 2)
     return ctx
 
 
@@ -417,9 +412,9 @@ def evaluate(
                     kind="power_cut",
                     title=f"{cid} 리퍼 전원 차단",
                     message=(
-                        f"{fmt(r.ts)} 전원 차단 감지. 품온 {r.temp_c:.1f}°C "
-                        f"(적정 {ctx.band_min_c:g}~{ctx.band_max_c:g}°C)"
-                        + (f", 이전 누적 단전 {cumulative:.0f}분" if round(cumulative) else "")
+                        f"{fmt(r.ts)} 전원이 끊겼습니다. 품온 {r.temp_c:.1f}°C "
+                        f"(적정 {ctx.band_min_c:g}~{ctx.band_max_c:g}°C), "
+                        f"누적 단전 {cumulative:.0f}분"
                     ),
                     at=r.ts,
                 ),
@@ -459,8 +454,7 @@ def evaluate(
                     message=(
                         f"품온 {r.temp_c:.1f}°C(적정 {ctx.band_min_c:g}~{ctx.band_max_c:g}°C, "
                         f"이탈 {excursion:+.1f}°C), 전원 {'켜짐' if r.power_on else '꺼짐'}, "
-                        + (f"누적 단전 {cumulative:.0f}분, " if round(cumulative) else "")
-                        + f"예상 손실률 {_pct(shown)}"
+                        f"누적 단전 {cumulative:.0f}분, 예상 손실률 {_pct(shown)}"
                     ),
                     at=r.ts,
                 )

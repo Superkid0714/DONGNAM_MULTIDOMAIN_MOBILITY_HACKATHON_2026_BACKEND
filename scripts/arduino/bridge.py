@@ -2,7 +2,6 @@
 import argparse
 import json
 import math
-import os
 import sys
 import threading
 import time
@@ -11,12 +10,9 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 
 KST = timezone(timedelta(hours=9))
-TOKEN_ENV = "FRESHSWITCH_DEVICE_TOKEN"
-TOKEN_HEADER = "X-Device-Token"
-DEFAULT_CONTAINER = "CA-01"
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="아두이노 시리얼 JSON 줄 → FreshSwitch 수집 API")
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--port", help="시리얼 포트 (예: /dev/ttyACM0, COM3). pyserial 필요")
@@ -26,11 +22,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--baud", type=int, default=9600)
     parser.add_argument("--api", default="http://127.0.0.1:8000/api", help="API 기본 주소")
-    parser.add_argument(
-        "--container",
-        default=None,
-        help=f"계획의 컨테이너 ID. 기본 {DEFAULT_CONTAINER}, 기기 토큰이 있으면 바인딩이 정한다",
-    )
+    parser.add_argument("--container", default="CA-01", help="계획의 컨테이너 ID")
     parser.add_argument("--plan-id", default=None, help="계획 ID (손실액 계산용)")
     parser.add_argument("--device-id", default=None, help="장치 ID 덮어쓰기")
     parser.add_argument("--stage", default=None, choices=["trucking", "gate", "terminal", "vessel"])
@@ -41,13 +33,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="시각 가속 배율. 60이면 실제 1초가 1분 (전원 4분 차단 = 4시간 단전)",
     )
     parser.add_argument("--interval", type=float, default=2.0, help="--fake 측정 간격(초)")
-    parser.add_argument(
-        "--device-token",
-        default=os.environ.get(TOKEN_ENV),
-        help=f"SaaS 등록 기기 토큰. {TOKEN_HEADER} 헤더로 보낸다 (env {TOKEN_ENV})",
-    )
     parser.add_argument("--dry-run", action="store_true", help="보내지 않고 출력만")
-    return parser.parse_args(argv)
+    return parser.parse_args()
 
 
 class Clock:
@@ -61,20 +48,14 @@ class Clock:
         return self.sim_start + timedelta(seconds=elapsed)
 
 
-def build_request(api: str, payload: dict, token: str | None = None) -> urllib.request.Request:
-    headers = {"content-type": "application/json"}
-    if token:
-        headers[TOKEN_HEADER] = token
-    return urllib.request.Request(
+def post(api: str, payload: dict) -> dict:
+    request = urllib.request.Request(
         f"{api.rstrip('/')}/coldchain/readings",
         data=json.dumps(payload).encode(),
-        headers=headers,
+        headers={"content-type": "application/json"},
         method="POST",
     )
-
-
-def post(api: str, payload: dict, token: str | None = None) -> dict:
-    with urllib.request.urlopen(build_request(api, payload, token), timeout=10) as response:
+    with urllib.request.urlopen(request, timeout=10) as response:
         return json.loads(response.read())
 
 
@@ -83,13 +64,11 @@ def to_payload(raw: dict, args: argparse.Namespace, clock: Clock) -> dict | None
         return None
     payload = {
         "device_id": args.device_id or raw.get("device_id") or "arduino-01",
+        "container_id": args.container,
         "ts": clock.now().isoformat(),
         "temp_c": float(raw["temp_c"]),
         "power_on": bool(raw["power_on"]),
     }
-    container = args.container or (None if args.device_token else DEFAULT_CONTAINER)
-    if container:
-        payload["container_id"] = container
     for key in ("humidity_pct", "door_open"):
         if raw.get(key) is not None:
             payload[key] = raw[key]
@@ -154,10 +133,7 @@ def main() -> None:
             print(json.dumps(payload, ensure_ascii=False), flush=True)
             continue
         try:
-            result = post(args.api, payload, args.device_token)
-        except urllib.error.HTTPError as exc:
-            print(f"전송 거부 {exc.code}: {exc.read().decode(errors='ignore')}", file=sys.stderr)
-            continue
+            result = post(args.api, payload)
         except (urllib.error.URLError, TimeoutError) as exc:
             print(f"전송 실패: {exc}", file=sys.stderr)
             continue

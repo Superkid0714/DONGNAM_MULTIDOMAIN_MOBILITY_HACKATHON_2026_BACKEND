@@ -49,14 +49,14 @@ def test_cancellation_fee_on_sail_as_is_and_zero_when_refilled(client: TestClien
     assert charge["share_per_pallet_after"] == round(9_060_000 / 15)
     expected = round(12 * (9_060_000 / 15 - 9_060_000 / 17))
     assert charge["fee"] == expected
-    assert charge["transfers"] == []
-    assert charge["recipient_kind"] == "consolidator"
-    assert charge["consolidator"] == "platform"
-    assert charge["consolidator_amount"] == charge["fee"]
+    transfers = {t["shipper_id"]: t["amount"] for t in charge["transfers"]}
+    assert set(transfers) == {"sh-jinju", "sh-miryang"}
+    assert sum(transfers.values()) == charge["fee"]
     shippers = {s["shipper_id"]: s for s in alternatives["sail_as_is"]["diff"]["shippers"]}
     assert shippers["sh-sancheong"]["cancellation_adjustment"] == charge["fee"]
-    assert shippers["sh-jinju"]["cancellation_adjustment"] == 0
-    assert shippers["sh-miryang"]["cancellation_adjustment"] == 0
+    assert shippers["sh-jinju"]["cancellation_adjustment"] == -transfers["sh-jinju"]
+    jinju = shippers["sh-jinju"]
+    assert transfers["sh-jinju"] == jinju["container_share_after"] - jinju["container_share_before"]
 
 
 def test_apply_creates_order_with_split_actions(client: TestClient) -> None:
@@ -108,10 +108,8 @@ def test_sail_as_is_requests_and_fee_confirmation(client: TestClient) -> None:
     assert confirmations["sh-sancheong"]["reasons"] == ["cancellation_fee"]
     assert confirmations["sh-sancheong"]["cancellation_adjustment"] == order["cancellation"]["fee"]
     assert set(confirmations) == {"sh-sancheong"}
-    assert order["notified_shipper_ids"] == []
-    assert "플랫폼(혼재 주관)" in next(
-        a["description"] for a in order["automatic"] if a["kind"] == "settlement_recompute"
-    )
+    assert {"sh-jinju", "sh-miryang"} <= set(order["notified_shipper_ids"])
+    assert "sh-miryang" in order["notified_shipper_ids"]
     amendment = next(r for r in order["requests"] if r["kind"] == "booking_amendment")
     assert amendment["pallets_before"] == 17 and amendment["pallets_after"] == 15
     assert "17→15파렛트" in amendment["text"]

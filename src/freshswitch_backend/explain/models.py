@@ -27,7 +27,6 @@ class ShipperImpact(BaseModel):
     delta_krw: int
     moved: str | None = None
     pull_forward_days: int = 0
-    cancellation_adjustment_krw: int = 0
 
 
 class ExplainContext(BaseModel):
@@ -36,7 +35,6 @@ class ExplainContext(BaseModel):
     recommended_alternative_id: str | None
     alternatives: list[AlternativeInput]
     shippers: list[ShipperImpact]
-    warnings: list[str] = Field(default_factory=list)
 
 
 class ShipperMessage(BaseModel):

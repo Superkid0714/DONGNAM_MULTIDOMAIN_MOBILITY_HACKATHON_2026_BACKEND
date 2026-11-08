@@ -1,19 +1,15 @@
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Annotated, Literal
 
-from pydantic import AfterValidator, BaseModel, Field, model_validator
+from pydantic import AfterValidator, BaseModel, Field
 
 KST = timezone(timedelta(hours=9))
-DEFAULT_PALLET_KG = 415.0
 
 
 def to_kst(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=KST)
-    try:
-        return value.astimezone(KST)
-    except OverflowError as exc:
-        raise ValueError("시각 범위를 벗어났습니다") from exc
+    return value.astimezone(KST)
 
 
 KstDatetime = Annotated[datetime, AfterValidator(to_kst)]
@@ -32,22 +28,7 @@ class Product(Sourced):
     co2_pct: float | None = None
     shelf_life_days: int
     so2_treated: bool = False
-    pallet_kg: float = DEFAULT_PALLET_KG
-    pallet_kg_assumed: bool = False
-
-    @model_validator(mode="before")
-    @classmethod
-    def _mark_default_pallet_kg(cls, data: object) -> object:
-        if not isinstance(data, dict) or "pallet_kg_assumed" in data:
-            return data
-        if data.get("pallet_kg") is None:
-            rest = {k: v for k, v in data.items() if k != "pallet_kg"}
-            return {**rest, "pallet_kg_assumed": True}
-        return data
-
-    @property
-    def net_pallet_kg(self) -> float:
-        return self.pallet_kg
+    pallet_kg: float = 415
 
 
 class Packhouse(Sourced):
@@ -82,7 +63,6 @@ class Shipper(Sourced):
 class Lot(Sourced):
     id: str
     shipper_id: str
-    packhouse_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     product_id: str
     pallets: int = Field(gt=0)
     ready_date: date
@@ -101,20 +81,13 @@ class Voyage(Sourced):
     cy_cutoff: KstDatetime
     transit_days: float
     original_etd: KstDatetime | None = None
-    original_cy_cutoff: KstDatetime | None = Field(default=None, exclude_if=lambda v: v is None)
-    call_sign: str | None = None
 
 
 class Container(Sourced):
     id: str
-    name: str | None = None
     voyage_id: str
     kind: str = "40RH-CA"
     capacity_pallets: int = 20
-    temp_min_c: float | None = None
-    temp_max_c: float | None = None
-    forwarder_org_id: str | None = None
-    resource_revision: int | None = None
 
 
 class Truck(Sourced):
@@ -172,28 +145,6 @@ class PalletTariff(BaseModel):
     air_rate_basis_per_kg: Quantity
 
 
-BillingRule = Literal["performance", "usage_fee"]
-BaselineKind = Literal["air_solo", "sea_solo"]
-SettlementBillingRule = Literal["performance", "usage_fee", "mixed"]
-SettlementBaselineKind = Literal["air_solo", "sea_solo", "mixed"]
-
-
-class BillingParams(BaseModel):
-    usage_fee_per_pallet_krw: Quantity = _q(
-        20_000,
-        "원/파렛트",
-        "가정: 기획서 ㅍ3 8-1 파렛트 이용료 2만 원(이미 배로 가는 품목은 성과보수 대신 이용료)",
-    )
-    usage_fee_products: list[str] = Field(default_factory=lambda: ["grape_so2"])
-    usage_fee_source: str = (
-        "기획서 ㅍ3 8-1: 포도처럼 이미 배로 가는 품목은 성과보수 없이 파렛트 이용료만 받는다"
-    )
-    pilot: bool = False
-    pilot_source: str = (
-        "기획서 ㅍ3 8-1: 첫 항차 무료 시범. 켜면 수수료 0원, 원래 금액은 함께 싣는다"
-    )
-
-
 class CostParams(BaseModel):
     sea_freight_per_container_krw: Quantity = _q(4_560_000, "원/컨테이너")
     sea_ancillary_per_container_krw: Quantity = _q(4_500_000, "원/컨테이너")
@@ -214,7 +165,6 @@ class CostParams(BaseModel):
     default_product_cost: ProductCostParams = Field(default_factory=_default_product_cost)
     loss_adjustments: list[LossAdjustment] = Field(default_factory=list)
     pallet_tariffs: dict[str, PalletTariff] = Field(default_factory=dict)
-    billing: BillingParams = Field(default_factory=BillingParams)
 
     def for_product(self, product_id: str) -> ProductCostParams:
         return self.product_costs.get(product_id, self.default_product_cost)
@@ -251,32 +201,6 @@ class ScenarioSummary(BaseModel):
 Mode = Literal["sea", "air"]
 
 
-AssignmentReasonCode = Literal[
-    "fixed",
-    "capacity_or_cost",
-    "destination_mismatch",
-    "over_capacity",
-    "ca_unsupported",
-    "sea_deadline_miss",
-    "sea_sell_by_miss",
-    "sea_shelf_life_miss",
-    "sea_forbidden",
-    "pickup_cutoff_miss",
-    "air_not_allowed",
-    "air_forbidden",
-    "air_sell_by_miss",
-    "air_shelf_life_miss",
-    "no_feasible_mode",
-    "no_solution",
-    "other",
-]
-
-
-class AssignmentReason(BaseModel):
-    code: AssignmentReasonCode
-    message: str
-
-
 class Assignment(BaseModel):
     lot_id: str
     shipper_id: str
@@ -286,7 +210,6 @@ class Assignment(BaseModel):
     container_id: str | None = None
     voyage_id: str | None = None
     pull_forward_days: int = 0
-    reason: AssignmentReason | None = None
 
 
 class UnassignedLot(BaseModel):
@@ -294,7 +217,6 @@ class UnassignedLot(BaseModel):
     shipper_id: str
     pallets: int
     reason: str
-    reason_code: AssignmentReasonCode = "other"
 
 
 class ContainerLoad(BaseModel):
@@ -338,12 +260,6 @@ class ShipperCost(BaseModel):
 SettlementBasis = Literal["tariff", "operational", "mixed"]
 
 
-def backfill_fee_split[T: "Settlement | ContainerShipperSettlement"](row: T) -> T:
-    if row.performance_fee == 0 and row.usage_fee == 0 and row.fee > 0 and not row.pilot:
-        row.performance_fee = row.fee
-    return row
-
-
 class Settlement(BaseModel):
     shipper_id: str
     baseline_cost: int
@@ -354,15 +270,6 @@ class Settlement(BaseModel):
     sea_pallets: int = 0
     air_pallets: int = 0
     basis: SettlementBasis = "operational"
-    billing_rule: SettlementBillingRule = "performance"
-    performance_fee: int = 0
-    usage_fee: int = 0
-    baseline_kind: SettlementBaselineKind = "air_solo"
-    baseline_label: str = "단독 항공 대비"
-    savings_baseline_label: str = "단독 항공 대비"
-    pilot: bool = False
-
-    _legacy_fee_split = model_validator(mode="after")(backfill_fee_split)
 
 
 class ContainerShipperSettlement(BaseModel):
@@ -374,15 +281,6 @@ class ContainerShipperSettlement(BaseModel):
     fee: int
     shipper_gain: int
     basis: SettlementBasis
-    billing_rule: SettlementBillingRule = "performance"
-    performance_fee: int = 0
-    usage_fee: int = 0
-    baseline_kind: SettlementBaselineKind = "air_solo"
-    baseline_label: str = "단독 항공 대비"
-    savings_baseline_label: str = "단독 항공 대비"
-    pilot: bool = False
-
-    _legacy_fee_split = model_validator(mode="after")(backfill_fee_split)
 
 
 class ContainerSettlement(BaseModel):
@@ -417,8 +315,6 @@ class TariffSheet(BaseModel):
     fee_rate: float
     fee_per_pallet: int
     shipper_share_per_pallet: int
-    billing_rule: BillingRule = "performance"
-    pilot: bool = False
     sea_loss_risk_short_window: int
     sea_total_short_window: int
     short_window_rule: str

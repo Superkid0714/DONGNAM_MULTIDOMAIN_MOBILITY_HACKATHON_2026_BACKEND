@@ -1,13 +1,8 @@
 from freshswitch_backend.integrations.mof_provider import (
     MissingServiceKey,
     MovementFeed,
-    MovementOrigin,
-    MovementProvenance,
     MovementProvider,
     MovementsUnavailable,
-    SourcedMovementFeed,
-    origin_provenance,
-    provided_provenance,
 )
 from freshswitch_backend.integrations.mof_snapshot import (
     MovementSnapshot,
@@ -18,15 +13,12 @@ from freshswitch_backend.integrations.mof_snapshot import (
 from freshswitch_backend.integrations.mof_vessel import (
     BUSAN_PORT_CODE,
     MAX_GAP_HOURS,
-    DepartureMatch,
     MofVesselApiError,
     MofVesselClient,
     PlannedVoyage,
     ScheduleChange,
     VesselMovement,
     detect_schedule_changes,
-    match_departures,
-    normalize_call_sign,
     normalize_vessel_name,
     parse_movements,
 )
@@ -34,13 +26,10 @@ from freshswitch_backend.integrations.mof_vessel import (
 __all__ = [
     "BUSAN_PORT_CODE",
     "MAX_GAP_HOURS",
-    "DepartureMatch",
     "MissingServiceKey",
     "MofVesselApiError",
     "MofVesselClient",
     "MovementFeed",
-    "MovementOrigin",
-    "MovementProvenance",
     "MovementProvider",
     "MovementSnapshot",
     "MovementsUnavailable",
@@ -48,14 +37,9 @@ __all__ = [
     "ScheduleChange",
     "SnapshotDate",
     "SnapshotStore",
-    "SourcedMovementFeed",
     "VesselMovement",
     "demo_movements",
     "detect_schedule_changes",
-    "match_departures",
-    "normalize_call_sign",
     "normalize_vessel_name",
-    "origin_provenance",
     "parse_movements",
-    "provided_provenance",
 ]

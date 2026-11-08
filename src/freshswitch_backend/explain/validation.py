@@ -29,7 +29,6 @@ def shipper_error(ctx: ExplainContext, shipper: ShipperImpact, text: str) -> str
         _money(format_krw(shipper.cost_before_krw)),
         _money(format_krw(shipper.cost_after_krw)),
         _money(format_amount_krw(shipper.delta_krw)),
-        _money(format_krw(abs(shipper.cancellation_adjustment_krw))),
     }
     if any(_money(m[0]) not in amounts for m in MONEY.finditer(text)):
         return "다른 화주의 금액 또는 입력에 없는 금액"

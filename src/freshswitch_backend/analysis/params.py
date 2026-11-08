@@ -55,7 +55,7 @@ SPECS: tuple[ParamSpec, ...] = (
         per_product=True,
         low_factor=0.5,
         high_factor=1.5,
-        source="가정 ±50%. 조기 수확 손실 실측 없음",
+        source="가정 ±50%",
     ),
     ParamSpec(
         key="sea_ancillary_per_container_krw",
@@ -65,9 +65,7 @@ SPECS: tuple[ParamSpec, ...] = (
         per_product=False,
         low_factor=0.7,
         high_factor=1.3,
-        source="가정 ±30%. 기준 450만 원은 CA 장비 할증·THC·리퍼 전원·CFS 적입·통관·홍콩 하역 묶음으로, "
-        "항목별 참고 단가·가정 합(약 240만~410만 원, 공개 단가 확인 항목은 THC뿐)보다 높아 "
-        "CA 할증·홍콩 현지 견적이 이 범위 안이면 해상에 불리한 쪽. "
+        source="가정 ±30%. 기준 450만 원은 제안서 파렛트당 절감 24.9만 원에 맞춘 보정값. "
         "딸기 정산표 해상 내륙·장비·보관도 같은 배율",
         tariff_fields=("sea_inland",),
     ),
@@ -104,8 +102,7 @@ SPECS: tuple[ParamSpec, ...] = (
         per_product=False,
         low_factor=0.7,
         high_factor=1.3,
-        source="가정 ±30%. 냉장 탑차 공개 요율 없음(안전운임은 수출입 컨테이너 대상). "
-        "해상 집하와 항공 인천공항 운송에 같이 적용",
+        source="가정 ±30%. 해상 집하와 항공 인천공항 운송에 같이 적용",
     ),
     ParamSpec(
         key="storage_per_pallet_day_krw",

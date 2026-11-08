@@ -40,7 +40,22 @@ class PickupTruck(BaseModel):
     id: str
     capacity_pallets: int = Field(gt=0)
     available_from: datetime | None = None
-    available_until: datetime | None = None
+
+
+class PickupRequest(BaseModel):
+    depot: Depot
+    stops: list[PickupStop]
+    trucks: list[PickupTruck]
+    deadline: datetime
+    trucks_available_from: datetime | None = None
+    service_minutes: int = Field(default=30, ge=0)
+    speed_kmh: float = Field(default=60.0, gt=0)
+    road_factor: float = Field(default=1.3, gt=0)
+    cost_per_km: float = Field(default=2500.0, ge=0)
+    truck_fixed_cost: float = Field(default=0.0, ge=0)
+    max_trips_per_truck: int = Field(default=2, ge=1)
+    incompatible_groups: list[tuple[str, str]] = Field(default_factory=list)
+    gate_windows: list[GateWindow] = Field(default_factory=list)
 
 
 class StopVisit(BaseModel):
@@ -75,26 +90,6 @@ class TruckRoute(BaseModel):
     gate_delay_minutes: int = 0
     gate_slot_start: datetime | None = None
     gate_slot_end: datetime | None = None
-
-
-class PickupRequest(BaseModel):
-    depot: Depot
-    stops: list[PickupStop]
-    trucks: list[PickupTruck]
-    deadline: datetime
-    trucks_available_from: datetime | None = None
-    service_minutes: int = Field(default=30, ge=0)
-    speed_kmh: float = Field(default=60.0, gt=0)
-    road_factor: float = Field(default=1.3, gt=0)
-    cost_per_km: float = Field(default=2500.0, ge=0)
-    truck_fixed_cost: float = Field(default=0.0, ge=0)
-    max_trips_per_truck: int = Field(default=2, ge=1)
-    incompatible_groups: list[tuple[str, str]] = Field(default_factory=list)
-    gate_windows: list[GateWindow] = Field(default_factory=list)
-    locked_routes: list[TruckRoute] = Field(default_factory=list)
-    blocking_routes: list[TruckRoute] = Field(default_factory=list)
-    reserved_routes: list[TruckRoute] = Field(default_factory=list)
-    not_before: datetime | None = None
 
 
 class PickupPlan(BaseModel):

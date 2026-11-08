@@ -1,5 +1,4 @@
 import math
-from collections.abc import Collection, Mapping
 from datetime import date, datetime, timedelta
 from typing import Literal
 
@@ -15,36 +14,21 @@ from freshswitch_backend.forecast.predictor import (
     DelayQuery,
     Weather,
 )
-from freshswitch_backend.integrations.kma_forecast import (
-    FORECAST_DATASET,
-    HIGH_WAVE_M,
-    STRONG_WIND_MS,
-    WARNING_DATASET,
-    WARNING_STANDARD_URL,
-    WeatherAssessment,
-    WeatherFeed,
-    WeatherSource,
-)
 from freshswitch_backend.optimize.costs import CostModel, LotCost, haversine_km
 from freshswitch_backend.optimize.feasibility import air_rejection
-from freshswitch_backend.replan.engine import apply_event
-from freshswitch_backend.replan.models import DelayEvent, ReplanError, VoyageDelay
+from freshswitch_backend.replan.models import DelayEvent
 
 Quantile = Literal["p50", "p90"]
 Preset = Literal["typhoon"]
 CongestionOption = Literal["auto", "normal", "elevated", "high"]
 CongestionMode = Literal["auto", "manual", "preset"]
 CongestionScope = Literal["manual", "ulsan_direct", "ulsan_proxy", "unavailable"]
-WeatherOption = Literal["auto", "normal", "strong_wind", "typhoon"]
-WeatherMode = Literal["auto", "manual", "preset"]
 ULSAN_PORT_CODES = ("KRUSN", "KRONS")
 PROXY_NOTE = (
     "부산항은 이 프로젝트에서 쓸 수 있는 공개 실시간 선박위치 API가 없어, "
     "울산항 묘박 대기 비율을 동남권 항만 혼잡의 대리 지표로 부산 항차에도 적용한다. "
     "울산 대기선은 유조선·케미컬선 비중이 커서 부산신항 컨테이너 선석 혼잡과 다를 수 있다"
 )
-PROXY_LABEL = "보정 신호(가정): 울산항 묘박 대기 비율을 부산 항차 혼잡의 대리 지표로 씀"
-NOT_REPLANNED = "이번 재계획에 반영하지 않음"
 
 GIMHAE_LAT = 35.1795
 GIMHAE_LON = 128.9382
@@ -53,7 +37,7 @@ GIMHAE_MAX_PALLETS = 6
 
 
 class ForecastOptions(BaseModel):
-    weather: WeatherOption = "normal"
+    weather: Weather = "normal"
     congestion: CongestionOption = "auto"
     quantile: Quantile = "p90"
     min_sell_days: int = Field(default=0, ge=0, le=14)
@@ -83,36 +67,6 @@ class CongestionUse(BaseModel):
     unavailable_reason: str | None = None
     effects: list[CongestionEffect]
     note: str
-    proxy_indicator: bool = False
-    proxy_label: str | None = None
-
-
-class WeatherUse(BaseModel):
-    mode: WeatherMode
-    level: Weather
-    source: WeatherSource | None = None
-    issued_at: datetime | None = None
-    warning_checked_at: datetime | None = None
-    grid: str | None = None
-    covered: bool | None = None
-    horizon_end: datetime | None = None
-    max_wind_speed_ms: float | None = None
-    max_wave_height_m: float | None = None
-    active_warnings: list[str] = []
-    reasons: list[str] = []
-    fallback_reason: str | None = None
-    note: str
-
-
-class RemainingRisk(BaseModel):
-    voyage_id: str
-    vessel_name: str
-    planned_etd: datetime
-    predicted_etd: datetime
-    delay_hours: float
-    at_risk_lot_ids: list[str]
-    at_risk_pallets: int
-    reason: str = NOT_REPLANNED
 
 
 class LotRisk(BaseModel):
@@ -285,79 +239,11 @@ def congestion_use(
             effects=effects,
             note="울산항 선박위치(실시간·스냅샷)를 못 읽어 평시(normal)로 계산",
         )
-    proxy = "ulsan_proxy" in {e.scope for e in effects}
+    scopes = {e.scope for e in effects}
     note = port.basis
-    if proxy:
+    if "ulsan_proxy" in scopes:
         note += ". " + PROXY_NOTE
-    return CongestionUse(
-        mode=mode,
-        level=port.level,
-        indicator=port,
-        effects=effects,
-        note=note,
-        proxy_indicator=proxy,
-        proxy_label=PROXY_LABEL if proxy else None,
-    )
-
-
-def weather_mode(options: ForecastOptions) -> WeatherMode:
-    if options.preset:
-        return "preset"
-    return "auto" if options.weather == "auto" else "manual"
-
-
-def weather_use(
-    options: ForecastOptions,
-    feed: WeatherFeed | None = None,
-    assessment: WeatherAssessment | None = None,
-) -> WeatherUse:
-    mode = weather_mode(options)
-    resolved = options.resolved()
-    if mode != "auto" or feed is None or assessment is None:
-        level: Weather = resolved.weather if resolved.weather != "auto" else "normal"
-        label = "시연 프리셋" if mode == "preset" else "입력값"
-        return WeatherUse(
-            mode=mode,
-            level=level,
-            note=f"기상을 {label}({level})으로 고정. 기상청 예보는 조회하지 않음",
-        )
-    basis = (
-        f"{FORECAST_DATASET}(부산신항 격자 {feed.nx},{feed.ny}"
-        + (f", {feed.issued_at.astimezone(KST):%Y-%m-%d %H:%M} 발표" if feed.issued_at else "")
-        + f")·{WARNING_DATASET}(부산 {feed.stn_id})"
-    )
-    rule = (
-        f"풍속 {STRONG_WIND_MS:g}m/s·파고 {HIGH_WAVE_M:g}m 이상 또는 풍랑·강풍 특보 → strong_wind, "
-        f"태풍 특보 → typhoon (기상청 특보 기준 {WARNING_STANDARD_URL})"
-    )
-    if feed.source == "unavailable":
-        note = "기상청 예보·스냅샷을 못 읽어 평시(normal)로 계산"
-    elif assessment.horizon_end is None and not assessment.reasons:
-        note = f"{basis} 기준. 단기예보 자료가 없어 평시(normal)로 계산"
-    elif not assessment.covered and not assessment.reasons:
-        note = f"{basis} 기준. 출항 예정이 단기예보 범위 밖이라 평시(normal)로 계산"
-    else:
-        found = "; ".join(assessment.reasons) or "기준 넘는 예보·특보 없음"
-        source = "스냅샷" if feed.source == "snapshot" else "실시간"
-        note = f"{basis} {source} 기준: {found} → {assessment.level}. {rule}"
-    if assessment.warning_note:
-        note += f". {assessment.warning_note}"
-    return WeatherUse(
-        mode=mode,
-        level=assessment.level,
-        source=feed.source,
-        issued_at=feed.issued_at,
-        warning_checked_at=feed.warning_checked_at,
-        grid=f"{feed.nx},{feed.ny}",
-        covered=assessment.covered,
-        horizon_end=assessment.horizon_end,
-        max_wind_speed_ms=assessment.max_wind_speed_ms,
-        max_wave_height_m=assessment.max_wave_height_m,
-        active_warnings=assessment.active_warnings,
-        reasons=assessment.reasons,
-        fallback_reason=feed.fallback_reason,
-        note=note,
-    )
+    return CongestionUse(mode=mode, level=port.level, indicator=port, effects=effects, note=note)
 
 
 def forecast_voyages(
@@ -366,7 +252,6 @@ def forecast_voyages(
     plan: Plan,
     options: ForecastOptions,
     port: PortCongestionSummary | None = None,
-    weather_by_voyage: Mapping[str, Weather] | None = None,
 ) -> list[VoyageForecast]:
     options = options.resolved()
     model = CostModel(scenario)
@@ -374,11 +259,9 @@ def forecast_voyages(
     used = {c.voyage_id for c in plan.containers if c.used}
     voyages = [v for v in scenario.voyages if v.id in used] or scenario.voyages
     result = []
-    fixed: Weather = options.weather if options.weather != "auto" else "normal"
     for voyage in sorted(voyages, key=lambda v: v.etd):
         congestion, scope = voyage_congestion(voyage, options, port)
-        weather = (weather_by_voyage or {}).get(voyage.id, fixed)
-        forecast = predictor.predict(_query(voyage), weather, congestion)
+        forecast = predictor.predict(_query(voyage), options.weather, congestion)
         raw = forecast.p90_hours if options.quantile == "p90" else forecast.p50_hours
         delay = _round_hours(raw)
         predicted = voyage.model_copy(update={"etd": voyage.etd + timedelta(hours=delay)})
@@ -399,60 +282,18 @@ def forecast_voyages(
     return result
 
 
-def _risky(forecasts: list[VoyageForecast]) -> list[VoyageForecast]:
-    return [f for f in forecasts if any(lot.at_risk for lot in f.lots)]
-
-
-def _severity(f: VoyageForecast) -> tuple[int, float]:
-    return sum(lot.pallets for lot in f.lots if lot.at_risk), -f.planned_etd.timestamp()
-
-
-def delay_event(forecasts: list[VoyageForecast], skip: Collection[str] = ()) -> DelayEvent | None:
-    risky = [f for f in _risky(forecasts) if f.voyage_id not in skip]
+def delay_event(forecasts: list[VoyageForecast]) -> DelayEvent | None:
+    risky = [f for f in forecasts if any(lot.at_risk for lot in f.lots)]
     if not risky:
         return None
-    worst = max(risky, key=_severity)
-    others = sorted((f for f in risky if f is not worst), key=lambda f: f.planned_etd)
-    return DelayEvent(
-        voyage_id=worst.voyage_id,
-        new_etd=worst.predicted_etd,
-        additional_voyages=[
-            VoyageDelay(voyage_id=f.voyage_id, new_etd=f.predicted_etd) for f in others
-        ],
-        source="예측",
+    worst = max(
+        risky,
+        key=lambda f: (
+            sum(lot.pallets for lot in f.lots if lot.at_risk),
+            -f.planned_etd.timestamp(),
+        ),
     )
-
-
-def unreplannable(scenario: Scenario, forecasts: list[VoyageForecast]) -> dict[str, str]:
-    reasons = {}
-    for f in _risky(forecasts):
-        try:
-            apply_event(scenario, DelayEvent(voyage_id=f.voyage_id, new_etd=f.predicted_etd))
-        except ReplanError as exc:
-            reasons[f.voyage_id] = f"재계획에 넣을 수 없음: {exc}"
-    return reasons
-
-
-def remaining_risks(
-    forecasts: list[VoyageForecast],
-    event: DelayEvent | None,
-    reasons: Mapping[str, str] | None = None,
-) -> list[RemainingRisk]:
-    handled = set(event.voyage_ids) if event is not None else set()
-    return [
-        RemainingRisk(
-            voyage_id=f.voyage_id,
-            vessel_name=f.vessel_name,
-            planned_etd=f.planned_etd,
-            predicted_etd=f.predicted_etd,
-            delay_hours=f.delay_hours,
-            at_risk_lot_ids=[lot.lot_id for lot in f.lots if lot.at_risk],
-            at_risk_pallets=sum(lot.pallets for lot in f.lots if lot.at_risk),
-            reason=(reasons or {}).get(f.voyage_id, NOT_REPLANNED),
-        )
-        for f in _risky(forecasts)
-        if f.voyage_id not in handled
-    ]
+    return DelayEvent(voyage_id=worst.voyage_id, new_etd=worst.predicted_etd, source="예측")
 
 
 def _option(
@@ -469,8 +310,7 @@ def _option(
         name = "김해공항"
         base = CostModel(scenario)
         shipper = base.shippers.get(lot.shipper_id)
-        packhouse_id = lot.packhouse_id or (shipper.packhouse_id if shipper else None)
-        packhouse = base.packhouses.get(packhouse_id)
+        packhouse = base.packhouses.get(shipper.packhouse_id) if shipper else None
         km = (
             haversine_km(packhouse.lat, packhouse.lon, GIMHAE_LAT, GIMHAE_LON)
             * params.road_distance_factor.value
