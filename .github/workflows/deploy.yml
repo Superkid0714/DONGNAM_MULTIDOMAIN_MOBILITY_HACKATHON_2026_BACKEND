@@ -2,7 +2,7 @@ name: deploy
 
 on:
   push:
-    branches: [main]
+    branches: [main, feat/saas]
   workflow_dispatch:
 
 concurrency:
@@ -11,6 +11,7 @@ concurrency:
 
 jobs:
   deploy:
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feat/saas'
     runs-on: [self-hosted, freshswitch-backend]
     timeout-minutes: 20
     defaults:
@@ -22,10 +23,12 @@ jobs:
           git fetch --depth 1 origin "$GITHUB_SHA"
           git checkout --force --detach "$GITHUB_SHA"
 
-      - name: build and up
+      - name: build and deploy main
+        if: github.ref == 'refs/heads/main'
         run: docker compose up -d --build --remove-orphans
 
-      - name: health
+      - name: health check main
+        if: github.ref == 'refs/heads/main'
         run: |
           port=$(sed -n 's/^HOST_PORT=//p' .env)
           for _ in $(seq 1 30); do
@@ -37,6 +40,56 @@ jobs:
           docker compose logs --tail 100 api
           exit 1
 
-      - name: prune
+      - name: build and deploy SaaS
+        if: github.ref == 'refs/heads/feat/saas'
+        env:
+          API_TAG: ${{ github.sha }}
+        run: docker compose --env-file .env.saas -f docker-compose.saas.yml up -d --build --remove-orphans
+
+      - name: health check SaaS
+        if: github.ref == 'refs/heads/feat/saas'
+        run: |
+          set -euo pipefail
+          healthy=0
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18106/test/api/health -o /tmp/freshswitch-saas-health.json \
+              && python3 -c 'import json; d=json.load(open("/tmp/freshswitch-saas-health.json")); assert d.get("status") == "ok" and d.get("db") == "ok"'; then
+              cat /tmp/freshswitch-saas-health.json
+              healthy=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$healthy" -ne 1 ]; then
+            docker compose --env-file .env.saas -f docker-compose.saas.yml logs --tail 100 api
+            exit 1
+          fi
+
+      - name: verify SaaS delay ML model
+        if: github.ref == 'refs/heads/feat/saas'
+        run: |
+          docker compose --env-file .env.saas -f docker-compose.saas.yml exec -T api \
+            python -c 'from freshswitch_backend.config import Settings; from freshswitch_backend.forecast.ml.adapter import initialize_delay_model; s=Settings(); assert s.feature_p1_delay_ml, "FEATURE_P1_DELAY_ML is disabled"; assert initialize_delay_model(s), "delay ML model failed to load"; print("delay_ml_model_loaded=true")'
+
+      - name: verify SaaS delay response schema
+        if: github.ref == 'refs/heads/feat/saas'
+        run: |
+          python3 - <<'PY'
+          import json
+          import urllib.request
+
+          with urllib.request.urlopen(
+              "http://127.0.0.1:18106/test/api/openapi.json", timeout=10
+          ) as response:
+              spec = json.load(response)
+          fields = spec["components"]["schemas"]["VoyageForecast"]["properties"]
+          required = {"delay_p50_h", "delay_p90_h", "departure_p50", "departure_p90", "strong_wind_rule", "mode", "source", "assumptions"}
+          missing = sorted(required - fields.keys())
+          if missing:
+              raise SystemExit(f"SaaS delay response schema missing fields: {missing}")
+          print("delay_response_schema=ok")
+          PY
+
+      - name: prune unused images
         if: always()
         run: docker image prune -f
