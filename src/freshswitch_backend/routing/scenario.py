@@ -1,7 +1,11 @@
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from datetime import datetime, time
 from itertools import combinations
 
-from freshswitch_backend.domain.models import KST, Lot, Port, Product, Scenario
+from freshswitch_backend.domain.models import KST, Lot, Port, Product, Scenario, Voyage
 from freshswitch_backend.optimize.feasibility import products_compatible
 from freshswitch_backend.routing.models import (
     Depot,
@@ -9,9 +13,138 @@ from freshswitch_backend.routing.models import (
     PickupRequest,
     PickupStop,
     PickupTruck,
+    TruckRoute,
 )
 
 DEFAULT_READY_TIME = time(8, 0)
+
+
+@dataclass(frozen=True)
+class _Locks:
+    routes: Mapping[str, list[TruckRoute]] = field(default_factory=dict)
+    not_before: datetime | None = None
+
+
+_LOCKED: ContextVar[_Locks | None] = ContextVar("locked_routes", default=None)
+
+
+@contextmanager
+def locked_routes(
+    by_voyage: Mapping[str, list[TruckRoute]], not_before: datetime | None = None
+) -> Iterator[None]:
+    token = _LOCKED.set(_Locks(dict(by_voyage), not_before))
+    try:
+        yield
+    finally:
+        _LOCKED.reset(token)
+
+
+def route_lot_ids(routes: list[TruckRoute]) -> set[str]:
+    return {lid for route in routes for stop in route.stops for lid in stop.lot_ids}
+
+
+def _carrying(
+    routes: list[TruckRoute], lots: Mapping[str, Lot], keep: set[str]
+) -> list[TruckRoute]:
+    kept = []
+    for route in routes:
+        stops, load = [], 0
+        for stop in route.stops:
+            ids = [lid for lid in stop.lot_ids if lid in keep]
+            if not ids:
+                continue
+            pallets = sum(lots[lid].pallets for lid in ids)
+            load += pallets
+            stops.append(stop.model_copy(update={"lot_ids": ids, "pallets": pallets}))
+        if stops:
+            stops = [
+                s.model_copy(update={"load_after": sum(x.pallets for x in stops[: i + 1])})
+                for i, s in enumerate(stops)
+            ]
+            kept.append(route.model_copy(update={"stops": stops, "load_pallets": load}))
+    return kept
+
+
+def _carried(route: TruckRoute, origin: Voyage, target: Voyage | None) -> bool:
+    if target is None:
+        return False
+    if target.id == origin.id:
+        return True
+    return target.origin == origin.origin and route.port_eta <= target.cy_cutoff
+
+
+def _renumbered(routes: list[TruckRoute]) -> list[TruckRoute]:
+    trips: dict[str, list[int]] = {}
+    for route in routes:
+        trips.setdefault(route.truck_id, []).append(route.trip)
+    clashing = {truck for truck, numbers in trips.items() if len(set(numbers)) < len(numbers)}
+    order = {
+        id(route): trip
+        for truck in clashing
+        for trip, route in enumerate(
+            sorted(
+                (r for r in routes if r.truck_id == truck),
+                key=lambda r: (r.earliest_departure, r.trip),
+            ),
+            start=1,
+        )
+    }
+    return [
+        route.model_copy(update={"trip": order[id(route)]}) if id(route) in order else route
+        for route in routes
+    ]
+
+
+def _share(routes: list[TruckRoute], lots: Mapping[str, Lot], riding: set[str]) -> list[TruckRoute]:
+    total = sum(lots[lid].pallets for lid in riding)
+    shared = []
+    for route in routes:
+        if total <= route.load_pallets:
+            shared.append(route)
+            continue
+        part = route.load_pallets / total
+        shared.append(
+            route.model_copy(
+                update={"km": round(route.km * part, 1), "cost": float(round(route.cost * part))}
+            )
+        )
+    return shared
+
+
+def _pinned(
+    by_voyage: Mapping[str, list[TruckRoute]],
+    voyages: Mapping[str, Voyage],
+    voyage_id: str,
+    lots: Mapping[str, Lot],
+    here: set[str],
+    placed: Mapping[str, str] | None,
+) -> tuple[list[TruckRoute], list[TruckRoute], list[TruckRoute]]:
+    voyage = voyages[voyage_id]
+    kept: list[TruckRoute] = []
+    carried: list[TruckRoute] = []
+    reserved: list[TruckRoute] = []
+    elsewhere: list[TruckRoute] = []
+    for origin_id, routes in by_voyage.items():
+        origin = voyages.get(origin_id)
+        if origin is None:
+            continue
+        for route in routes:
+            members = route_lot_ids([route]) & set(lots)
+            riding = members
+            if placed is not None:
+                riding = {
+                    lid for lid in members if _carried(route, origin, voyages.get(placed.get(lid)))
+                }
+            own = _carrying([route], lots, here) if _carried(route, origin, voyage) else []
+            shared = own if placed is None else _share(own, lots, riding)
+            if origin_id == voyage_id:
+                kept.extend(shared)
+                reserved.extend([] if own else [route])
+                continue
+            carried.extend(shared)
+            rest = _carrying([route], lots, riding - here)
+            elsewhere.extend(rest if rest or own else [route])
+    return _renumbered([*kept, *carried]), reserved, elsewhere
 
 
 def cargo_groups(products: list[Product]) -> tuple[dict[str, str], list[tuple[str, str]]]:
@@ -66,9 +199,29 @@ def build_pickup_request(
     if voyage_id not in voyages:
         raise KeyError(f"unknown voyage: {voyage_id}")
     voyage = voyages[voyage_id]
+    context = _LOCKED.get() or _Locks()
+    lots = {lot.id: lot for lot in scenario.lots}
+    here = set(lot_ids) & set(lots)
+    placed = options.pop("placed", None)
+    locked = options.pop("locked_routes", None)
+    blocking = options.pop("blocking_routes", None)
+    not_before = options.pop("not_before", context.not_before)
+    if locked is not None:
+        kept = _carrying(locked, lots, here)
+        kept_trips = {(r.truck_id, r.trip) for r in kept}
+        reserved = [r for r in locked if (r.truck_id, r.trip) not in kept_trips]
+    else:
+        kept, reserved, pinned_elsewhere = _pinned(
+            context.routes, voyages, voyage_id, lots, here, placed
+        )
+        if blocking is None:
+            blocking = pinned_elsewhere
+    if blocking is None:
+        blocking = [r for v, trips in context.routes.items() if v != voyage_id for r in trips]
+    locked = kept
+    held = route_lot_ids(locked)
     ports = {p.id: p for p in scenario.ports}
     port = ports[voyage.origin]
-    lots = {lot.id: lot for lot in scenario.lots}
     shippers = {s.id: s for s in scenario.shippers}
     packhouses = {p.id: p for p in scenario.packhouses}
     group_of, conflicts = cargo_groups(scenario.products)
@@ -77,8 +230,13 @@ def build_pickup_request(
     for lot_id in lot_ids:
         if lot_id not in lots:
             raise KeyError(f"unknown lot: {lot_id}")
+        if lot_id in held:
+            continue
         lot = lots[lot_id]
-        key = (shippers[lot.shipper_id].packhouse_id, group_of.get(lot.product_id, lot.product_id))
+        key = (
+            lot.packhouse_id or shippers[lot.shipper_id].packhouse_id,
+            group_of.get(lot.product_id, lot.product_id),
+        )
         grouped.setdefault(key, []).append(lot)
     split = {ph for ph, _ in grouped if sum(1 for other, _ in grouped if other == ph) > 1}
 
@@ -118,5 +276,9 @@ def build_pickup_request(
         trucks=trucks,
         deadline=voyage.cy_cutoff,
         incompatible_groups=[(a, b) for a, b in conflicts if a in used and b in used],
+        locked_routes=locked,
+        blocking_routes=blocking,
+        reserved_routes=reserved,
+        not_before=not_before,
         **{"gate_windows": gate_windows(port), **options},
     )

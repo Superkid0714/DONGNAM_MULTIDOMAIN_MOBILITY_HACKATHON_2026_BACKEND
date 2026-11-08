@@ -4,7 +4,9 @@ from collections.abc import Callable
 from typing import Any
 
 from fastapi import HTTPException
+from fastapi.concurrency import run_in_threadpool
 
+from freshswitch_backend.api import compute_limits
 from freshswitch_backend.config import get_settings
 from freshswitch_backend.observability import record_event
 from freshswitch_backend.planning.budget import remaining
@@ -18,11 +20,12 @@ async def compute_replan(fn: Callable, *args: Any, deadline: float, **kwargs: An
     started = time.perf_counter()
     event_type = getattr(args[2], "type", None) if len(args) > 2 else None
     try:
-        timeout = remaining(deadline, get_settings().replan_timeout_seconds)
-        result = await asyncio.wait_for(
-            asyncio.to_thread(fn, *args, deadline=deadline, **kwargs),
-            timeout=timeout,
+        remaining(deadline, get_settings().replan_timeout_seconds)
+        future = await run_in_threadpool(
+            compute_limits.gate.submit, fn, *args, deadline=deadline, **kwargs
         )
+        timeout = remaining(deadline, get_settings().replan_timeout_seconds)
+        result = await asyncio.wait_for(asyncio.wrap_future(future), timeout=timeout)
         record_event(
             "ai.replan",
             event_type=event_type,

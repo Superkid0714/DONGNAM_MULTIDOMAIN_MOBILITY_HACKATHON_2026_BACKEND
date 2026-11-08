@@ -1,3 +1,4 @@
+import time
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timedelta
@@ -5,12 +6,16 @@ from datetime import datetime, timedelta
 from pydantic import BaseModel, Field
 
 from freshswitch_backend.domain.models import (
+    Assignment,
+    AssignmentReason,
     CollectionReassignment,
     Lot,
     LotCollection,
     Plan,
     Scenario,
+    UnassignedLot,
 )
+from freshswitch_backend.observability import record_event
 from freshswitch_backend.optimize import AIR, solve_plan
 from freshswitch_backend.optimize.costs import CostModel
 from freshswitch_backend.optimize.solver import resettle_plan
@@ -57,12 +62,15 @@ def _effective_scenario(scenario: Scenario, plan: Plan) -> Scenario:
     )
 
 
-def _pickup_request(scenario: Scenario, lot_ids: list[str], voyage_id: str) -> PickupRequest:
+def _pickup_request(
+    scenario: Scenario, lot_ids: list[str], voyage_id: str, placed: Mapping[str, str]
+) -> PickupRequest:
     p = scenario.cost_params
     return build_pickup_request(
         scenario,
         lot_ids,
         voyage_id,
+        placed=placed,
         cost_per_km=p.reefer_truck_cost_per_km_krw.value,
         road_factor=p.road_distance_factor.value,
         truck_fixed_cost=p.reefer_truck_fixed_per_route_krw.value,
@@ -81,6 +89,7 @@ def build_routes(
     for a in plan.assignments:
         if a.mode == "sea" and a.voyage_id:
             by_voyage[a.voyage_id].append(a.lot_id)
+    placed = {lid: voyage_id for voyage_id, ids in by_voyage.items() for lid in ids}
     order = {v.id: i for i, v in enumerate(scenario.voyages)}
     cutoff = {v.id: v.cy_cutoff for v in scenario.voyages}
     busy_until: dict[str, datetime] = {}
@@ -88,7 +97,7 @@ def build_routes(
     for voyage_id, lot_ids in sorted(
         by_voyage.items(), key=lambda kv: (cutoff[kv[0]], order[kv[0]])
     ):
-        request = _pickup_request(effective, lot_ids, voyage_id)
+        request = _pickup_request(effective, lot_ids, voyage_id, placed)
         request = request.model_copy(
             update={
                 "trucks": [
@@ -235,6 +244,7 @@ def solve_with_routes(
             for cid in containers_of[voyage_id]:
                 forbidden.append((lid, cid))
                 reasons[(lid, cid)] = CUTOFF_REASON
+    carried: dict[str, AssignmentReason | None] = {}
     still = _dropped(routes)
     if still:
         kept = {
@@ -242,6 +252,7 @@ def solve_with_routes(
             for a in plan.assignments
             if a.lot_id not in still
         }
+        carried = {a.lot_id: a.reason for a in plan.assignments if a.lot_id in kept}
         for lid, (voyage_id, stop_id) in still.items():
             dropped_at.setdefault(lid, (voyage_id, stop_id))
             for c in scenario.containers:
@@ -269,16 +280,56 @@ def solve_with_routes(
         )
         for lid, (voyage_id, stop_id) in {**dropped_at, **still}.items()
     ]
-    unassigned = [
-        u.model_copy(update={"reason": f"{CUTOFF_REASON}; {u.reason}"})
-        if u.lot_id in dropped_at and CUTOFF_REASON not in u.reason
-        else u
-        for u in plan.unassigned
-    ]
+    unassigned = [_cutoff_unassigned(u) if u.lot_id in dropped_at else u for u in plan.unassigned]
+    assignments = [_final_reason(a, dropped_at, carried) for a in plan.assignments]
     return with_routes(
-        scenario, plan, routes, collection_reassigned=reassigned, unassigned=unassigned
+        scenario,
+        plan,
+        routes,
+        collection_reassigned=reassigned,
+        unassigned=unassigned,
+        assignments=assignments,
     )
 
 
+def _cutoff_unassigned(lot: UnassignedLot) -> UnassignedLot:
+    reason = lot.reason if CUTOFF_REASON in lot.reason else f"{CUTOFF_REASON}; {lot.reason}"
+    return lot.model_copy(update={"reason": reason, "reason_code": "pickup_cutoff_miss"})
+
+
+def _final_reason(
+    assignment: Assignment,
+    dropped_at: Mapping[str, tuple[str, str]],
+    carried: Mapping[str, AssignmentReason | None],
+) -> Assignment:
+    if assignment.mode != "air":
+        return assignment
+    if assignment.lot_id in dropped_at:
+        return _cutoff_air(assignment, dropped_at[assignment.lot_id][0])
+    if assignment.lot_id in carried:
+        return assignment.model_copy(update={"reason": carried[assignment.lot_id]})
+    return assignment
+
+
+def _cutoff_air(assignment: Assignment, voyage_id: str) -> Assignment:
+    reason = AssignmentReason(
+        code="pickup_cutoff_miss",
+        message=f"{CUTOFF_REASON}: {voyage_id} 집하 경로에 넣을 수 없어 항공 배정",
+    )
+    return assignment.model_copy(update={"reason": reason})
+
+
 def build_plan(scenario: Scenario, **options) -> PlanWithRoutes:
-    return solve_with_routes(scenario, **options)
+    started = time.perf_counter()
+    status = "error"
+    try:
+        built = solve_with_routes(scenario, **options)
+        status = built.plan.status
+        return built
+    finally:
+        record_event(
+            "plan.build",
+            status=status,
+            lot_count=len(scenario.lots),
+            elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
+        )

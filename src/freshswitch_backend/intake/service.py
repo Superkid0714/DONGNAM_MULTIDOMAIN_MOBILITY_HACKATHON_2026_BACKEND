@@ -1,7 +1,7 @@
 from collections import defaultdict
-from datetime import timedelta
+from datetime import date, datetime, timedelta
 
-from freshswitch_backend.domain.models import Lot, Plan, Scenario
+from freshswitch_backend.domain.models import KST, Lot, Plan, Product, Scenario
 from freshswitch_backend.intake.models import (
     AirHint,
     FeasibilityHints,
@@ -10,6 +10,7 @@ from freshswitch_backend.intake.models import (
     IntakeRequest,
     Resolved,
     SeaHint,
+    SeasonCheck,
 )
 from freshswitch_backend.optimize.costs import CostModel
 from freshswitch_backend.optimize.feasibility import air_rejection, products_compatible, sea_option
@@ -17,16 +18,71 @@ from freshswitch_backend.optimize.settlement import tariff_sheet
 from freshswitch_backend.replan.models import AddLotEvent
 
 MAX_PULL_FORWARD_DAYS = 2
+READY_DATE_MAX_PAST_DAYS = 45
+READY_DATE_MAX_FUTURE_DAYS = 366
+SELL_BY_MAX_DAYS = 366
 SO2_WARNING = (
     "SO2 처리 품목은 딸기 등 비처리 품목과 같은 컨테이너에 실을 수 없어 별도 CA 컨테이너가 "
     "필요합니다(WFLO, 제안서 나-1)"
 )
+
+SEASON_SOURCE = "가정(공식 품목별 수출 시기 자료 확인 필요)"
+EXPORT_SEASONS: dict[str, tuple[str, tuple[str, ...], tuple[int, ...]]] = {
+    "strawberry": ("딸기", ("strawberry", "딸기"), (11, 12, 1, 2, 3, 4, 5)),
+    "grape": ("포도", ("grape", "포도", "머스캣"), (10, 11, 12, 1, 2, 3)),
+}
 
 
 class IntakeError(ValueError):
     def __init__(self, errors: list[FieldError]) -> None:
         super().__init__("; ".join(f"{e.field}: {e.message}" for e in errors))
         self.errors = errors
+
+
+def ready_date_window(scenario: Scenario | None, today: date) -> tuple[date, date]:
+    sailings = [v.etd.astimezone(KST).date() for v in scenario.voyages] if scenario else []
+    earliest = min([today, *sailings])
+    latest = max([today, *sailings])
+    return (
+        earliest - timedelta(days=READY_DATE_MAX_PAST_DAYS),
+        latest + timedelta(days=READY_DATE_MAX_FUTURE_DAYS),
+    )
+
+
+def date_range_errors(
+    scenario: Scenario | None,
+    today: date,
+    ready_date: date | None = None,
+    sell_by_date: date | None = None,
+    sell_by_base: date | None = None,
+) -> list[FieldError]:
+    errors: list[FieldError] = []
+    if ready_date is not None:
+        earliest, latest = ready_date_window(scenario, today)
+        if not earliest <= ready_date <= latest:
+            errors.append(
+                FieldError(
+                    field="ready_date",
+                    message=(
+                        f"출하 가능일은 {earliest.isoformat()}부터 {latest.isoformat()}까지만 "
+                        "받습니다"
+                    ),
+                )
+            )
+            return errors
+    base = ready_date or sell_by_base
+    if (
+        sell_by_date is not None
+        and base is not None
+        and (sell_by_date - base).days > SELL_BY_MAX_DAYS
+    ):
+        errors.append(
+            FieldError(
+                field="sell_by_date",
+                message=f"판매기한은 출하 가능일로부터 {SELL_BY_MAX_DAYS}일 안이어야 합니다",
+            )
+        )
+    return errors
 
 
 def _match(query: str, candidates: list[tuple[str, list[str]]]) -> list[str]:
@@ -82,15 +138,20 @@ def _resolve(scenario: Scenario, body: IntakeRequest) -> tuple[Resolved | None, 
     product = next(p for p in scenario.products if p.id == products[0])
     shipper = next(s for s in scenario.shippers if s.id == shippers[0])
     port = next(p for p in scenario.ports if p.id == ports[0])
-    packhouse = packhouses.get(shipper.packhouse_id)
+    packhouse_id = body.packhouse_id or shipper.packhouse_id
+    packhouse = packhouses.get(packhouse_id)
+    if body.packhouse_id is not None and packhouse is None:
+        return None, [
+            FieldError(field="packhouse_id", message="선택한 출하 장소를 찾을 수 없습니다")
+        ]
     return (
         Resolved(
             product_id=product.id,
             product_name=product.name,
             shipper_id=shipper.id,
             shipper_name=shipper.name,
-            packhouse_id=shipper.packhouse_id,
-            packhouse_name=packhouse.name if packhouse else shipper.packhouse_id,
+            packhouse_id=packhouse_id,
+            packhouse_name=packhouse.name if packhouse else packhouse_id,
             destination_port_id=port.id,
             destination_name=port.name,
         ),
@@ -131,6 +192,10 @@ def preview_lot(
     plan: Plan | None = None,
     taken_ids: set[str] | None = None,
     reserved_ids: set[str] | None = None,
+    *,
+    check_season: bool = False,
+    today: date | None = None,
+    ignore_client_lot_id: bool = False,
 ) -> IntakePreview:
     taken = {lot.id for lot in scenario.lots} | (taken_ids or set())
     resolved, errors = _resolve(scenario, body)
@@ -144,12 +209,20 @@ def preview_lot(
                 message=f"컨테이너 1대 용량({max_capacity}파렛트)을 넘습니다. 나눠서 등록하세요",
             )
         )
-    if body.lot_id and body.lot_id in taken:
+    if body.lot_id and not ignore_client_lot_id and body.lot_id in taken:
         errors.append(FieldError(field="lot_id", message=f"이미 있는 로트 ID입니다: {body.lot_id}"))
     if body.sell_by_date and body.sell_by_date < body.ready_date:
         errors.append(
             FieldError(field="sell_by_date", message="판매기한이 출하 가능일보다 빠릅니다")
         )
+    errors.extend(
+        date_range_errors(
+            scenario,
+            today or datetime.now(KST).date(),
+            ready_date=body.ready_date,
+            sell_by_date=body.sell_by_date,
+        )
+    )
     if errors or resolved is None:
         raise IntakeError(errors)
     products = {p.id: p for p in scenario.products}
@@ -162,12 +235,15 @@ def preview_lot(
             f"sell_by_date = 출하 가능일 + {product.name} 신선 유지 기간 "
             f"{product.shelf_life_days}일 = {sell_by.isoformat()} (출처: {product.source})"
         )
-    lot_id = body.lot_id or _lot_id(taken | (reserved_ids or set()), resolved)
-    if body.lot_id is None:
+    if ignore_client_lot_id or body.lot_id is None:
+        lot_id = _lot_id(taken | (reserved_ids or set()), resolved)
         defaults.append(f"lot_id 자동 생성: {lot_id}")
+    else:
+        lot_id = body.lot_id
     lot = Lot(
         id=lot_id,
         shipper_id=resolved.shipper_id,
+        packhouse_id=body.packhouse_id,
         product_id=resolved.product_id,
         pallets=body.pallets,
         ready_date=body.ready_date,
@@ -176,7 +252,7 @@ def preview_lot(
         sell_window=body.sell_window,
         source="화주 간편 등록",
     )
-    hints = _hints(scenario, lot, plan)
+    hints = _hints(scenario, lot, plan, check_season=check_season)
     return IntakePreview(
         lot=lot,
         event=AddLotEvent(lot=lot),
@@ -190,13 +266,46 @@ def preview_lot(
     )
 
 
-def _hints(scenario: Scenario, lot: Lot, plan: Plan | None) -> FeasibilityHints:
+def season_check(product: Product, lot: Lot) -> SeasonCheck | None:
+    text = f"{product.id} {product.name}".lower()
+    for label, keys, months in EXPORT_SEASONS.values():
+        if any(key in text for key in keys):
+            return SeasonCheck(
+                product_id=product.id,
+                label=label,
+                months=list(months),
+                in_season=lot.ready_date.month in months,
+                source=SEASON_SOURCE,
+            )
+    return None
+
+
+def _season_warning(season: SeasonCheck, lot: Lot, action: str = "등록") -> str:
+    return (
+        f"{season.label} 수출 시기({season.months[0]}~{season.months[-1]}월) 밖의 출하일입니다"
+        f"({lot.ready_date.isoformat()}). {action}은 그대로 됩니다(출처: {season.source})"
+    )
+
+
+def season_warnings(product: Product, lot: Lot, action: str = "등록") -> list[str]:
+    season = season_check(product, lot)
+    if season is None or season.in_season:
+        return []
+    return [_season_warning(season, lot, action)]
+
+
+def _hints(
+    scenario: Scenario, lot: Lot, plan: Plan | None, *, check_season: bool = False
+) -> FeasibilityHints:
     model = CostModel(scenario)
     product = model.product(lot)
     pallets, loaded = _loads(plan)
     products = {p.id: p for p in scenario.products}
     options: list[SeaHint] = []
     warnings: list[str] = []
+    season = season_check(product, lot) if check_season else None
+    if season is not None and not season.in_season:
+        warnings.append(_season_warning(season, lot))
     if product.so2_treated:
         warnings.append(SO2_WARNING)
     for container in sorted(scenario.containers, key=lambda c: (model.voyage_of(c).etd, c.id)):
@@ -266,4 +375,5 @@ def _hints(scenario: Scenario, lot: Lot, plan: Plan | None) -> FeasibilityHints:
             reason=air_reason,
         ),
         warnings=warnings,
+        season=season,
     )

@@ -17,6 +17,9 @@ RUN uv sync --frozen --no-dev
 
 ENV PATH="/app/.venv/bin:$PATH"
 
+ARG GIT_COMMIT=""
+ENV GIT_COMMIT=$GIT_COMMIT
+
 EXPOSE 8000
 
 CMD ["uvicorn", "freshswitch_backend.main:app", "--host", "0.0.0.0", "--port", "8000"]

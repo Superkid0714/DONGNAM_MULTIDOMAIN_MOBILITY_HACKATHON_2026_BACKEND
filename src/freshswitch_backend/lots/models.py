@@ -23,11 +23,13 @@ class RegisteredLot(BaseModel):
     status: LotStatus
     created_at: datetime
     updated_at: datetime
+    warnings: list[str] = Field(default_factory=list, exclude_if=lambda value: not value)
 
     def to_lot(self) -> Lot:
         return Lot(
             id=self.id,
             shipper_id=self.shipper_id,
+            packhouse_id=self.packhouse,
             product_id=self.product_id,
             pallets=self.pallets,
             ready_date=self.ready_date,

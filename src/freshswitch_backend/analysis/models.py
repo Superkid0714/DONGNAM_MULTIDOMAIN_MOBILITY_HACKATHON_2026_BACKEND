@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class ParamRange(BaseModel):
@@ -150,11 +150,44 @@ class ReplanBenchmark(BaseModel):
     improvement_vs_manual: int
 
 
+BenchmarkBasisKey = Literal["operational", "settlement"]
+
+
+class BenchmarkBasis(BaseModel):
+    key: BenchmarkBasisKey
+    label: str
+    fields: list[str]
+    definition: str
+    source: str
+
+
+class MethodBasisGap(BaseModel):
+    method: str
+    settlement_savings: int
+    operational_savings: int
+    savings_gap: int
+    baseline_gap: int
+    settlement_cost_gap: int
+    tariff_pallets: int
+    tariff_sea_pallets: int
+    settlement_cost_gap_per_tariff_pallet: int | None
+    empty_slot_cost: int
+    tariff_settlement_savings: int = 0
+    tariff_empty_slot_cost: int = 0
+
+
 class BenchmarkResult(BaseModel):
     scenario_id: str
     methods: list[MethodResult]
     replan: ReplanBenchmark | None
     solve_ms: int
+    comparison_basis: BenchmarkBasisKey = "operational"
+    bases: list[BenchmarkBasis] = Field(default_factory=list)
+    basis_gaps: list[MethodBasisGap] = Field(default_factory=list)
+    settlement_fcfs_explanation: str = ""
+
+
+PlatformBasis = Literal["performance", "tariff", "usage_fee", "mixed"]
 
 
 class ContainerEconomics(BaseModel):
@@ -164,7 +197,10 @@ class ContainerEconomics(BaseModel):
     fill: float
     container_cost: int
     savings: int
+    operational_savings: int = 0
     margin_per_pallet: int
+    margin_basis: Literal["operational"] = "operational"
+    platform_basis: PlatformBasis = "performance"
     breakeven_savings_pallets: float | None
     breakeven_platform_pallets: float | None
     breakeven_platform_fill: float | None
@@ -206,6 +242,7 @@ class SeasonProjection(BaseModel):
     lines: list[SeasonLine]
     revenue: int
     forwarder_share: int
+    variable_cost: int = 0
     fixed_cost: int
     platform_net: int
     breakeven_pallets: int | None
@@ -233,6 +270,7 @@ class BasisComparison(BaseModel):
     fee_rate: float
     season_revenue_performance: int
     season_revenue_proposal_rule: int
+    variable_cost_per_pallet: int = 0
     breakeven_pallets: int | None
 
 

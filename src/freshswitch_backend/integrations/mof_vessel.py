@@ -74,6 +74,10 @@ class PlannedVoyage(BaseModel):
     voyage_id: str
     vessel_name: str
     etd: datetime
+    call_sign: str | None = None
+
+
+MatchedBy = Literal["call_sign", "vessel_name"]
 
 
 class ScheduleChange(BaseModel):
@@ -83,6 +87,7 @@ class ScheduleChange(BaseModel):
     planned_etd: datetime
     observed_etd: datetime
     delta_hours: float
+    matched_by: MatchedBy | None = None
     source: str = SOURCE_NAME
 
 
@@ -239,6 +244,10 @@ def normalize_vessel_name(name: str) -> str:
     return _PREFIX.sub("", collapsed).replace(" ", "")
 
 
+def normalize_call_sign(value: str) -> str:
+    return "".join(value.upper().split())
+
+
 def _as_voyage(entry: PlannedVoyage | tuple[str, str, datetime]) -> PlannedVoyage:
     if isinstance(entry, PlannedVoyage):
         return entry
@@ -250,41 +259,103 @@ def _aware(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=KST)
 
 
+class DepartureMatch(BaseModel):
+    voyage: PlannedVoyage
+    movement: VesselMovement
+    matched_by: MatchedBy
+    planned_etd: datetime
+    observed_etd: datetime
+
+    @property
+    def delta_hours(self) -> float:
+        return (self.observed_etd - self.planned_etd).total_seconds() / 3600
+
+
+def _index(
+    movements: Sequence[VesselMovement],
+) -> tuple[dict[str, list[VesselMovement]], dict[str, list[VesselMovement]]]:
+    by_call: dict[str, list[VesselMovement]] = {}
+    by_name: dict[str, list[VesselMovement]] = {}
+    for movement in movements:
+        if movement.observed_departure_at is None:
+            continue
+        if movement.call_sign:
+            by_call.setdefault(normalize_call_sign(movement.call_sign), []).append(movement)
+        if movement.vessel_name:
+            by_name.setdefault(normalize_vessel_name(movement.vessel_name), []).append(movement)
+    return by_call, by_name
+
+
+def _near(
+    pool: list[VesselMovement], planned: datetime, taken: set[int], max_gap: timedelta
+) -> list[tuple[timedelta, datetime, VesselMovement]]:
+    aware = [
+        (_aware(m.observed_departure_at), m)
+        for m in pool
+        if id(m) not in taken and m.observed_departure_at is not None
+    ]
+    return [
+        (abs(observed - planned), observed, m)
+        for observed, m in aware
+        if abs(observed - planned) <= max_gap
+    ]
+
+
+def match_departures(
+    voyages: Iterable[PlannedVoyage | tuple[str, str, datetime]],
+    movements: Sequence[VesselMovement],
+    max_gap_hours: float = MAX_GAP_HOURS,
+) -> list[DepartureMatch]:
+    by_call, by_name = _index(movements)
+    taken: set[int] = set()
+    max_gap = timedelta(hours=max_gap_hours)
+    matches: list[DepartureMatch] = []
+    for voyage in sorted(map(_as_voyage, voyages), key=lambda v: _aware(v.etd)):
+        planned = _aware(voyage.etd)
+        matched_by: MatchedBy = "call_sign"
+        own = normalize_call_sign(voyage.call_sign) if voyage.call_sign else None
+        pool = by_call.get(own, []) if own else []
+        candidates = _near(pool, planned, taken, max_gap)
+        if not candidates:
+            matched_by = "vessel_name"
+            pool = [
+                m
+                for m in by_name.get(normalize_vessel_name(voyage.vessel_name), [])
+                if own is None or not m.call_sign or normalize_call_sign(m.call_sign) == own
+            ]
+            candidates = _near(pool, planned, taken, max_gap)
+        if not candidates:
+            continue
+        _, observed, best = min(candidates, key=lambda c: c[0])
+        taken.add(id(best))
+        matches.append(
+            DepartureMatch(
+                voyage=voyage,
+                movement=best,
+                matched_by=matched_by,
+                planned_etd=planned,
+                observed_etd=observed,
+            )
+        )
+    return matches
+
+
 def detect_schedule_changes(
     voyages: Iterable[PlannedVoyage | tuple[str, str, datetime]],
     movements: Sequence[VesselMovement],
     threshold_hours: float = 3.0,
     max_gap_hours: float = MAX_GAP_HOURS,
 ) -> list[ScheduleChange]:
-    by_name: dict[str, list[VesselMovement]] = {}
-    for movement in movements:
-        if movement.vessel_name and movement.observed_departure_at is not None:
-            by_name.setdefault(normalize_vessel_name(movement.vessel_name), []).append(movement)
-    changes: list[ScheduleChange] = []
-    taken: set[int] = set()
-    max_gap = timedelta(hours=max_gap_hours)
-    for voyage in sorted(map(_as_voyage, voyages), key=lambda v: _aware(v.etd)):
-        planned = _aware(voyage.etd)
-        candidates = [
-            m
-            for m in by_name.get(normalize_vessel_name(voyage.vessel_name), [])
-            if id(m) not in taken and abs(m.observed_departure_at - planned) <= max_gap
-        ]
-        if not candidates:
-            continue
-        best = min(candidates, key=lambda m: abs(m.observed_departure_at - planned))
-        taken.add(id(best))
-        observed = best.observed_departure_at
-        delta = (observed - planned).total_seconds() / 3600
-        if abs(delta) >= threshold_hours:
-            changes.append(
-                ScheduleChange(
-                    voyage_id=voyage.voyage_id,
-                    vessel_name=voyage.vessel_name,
-                    call_sign=best.call_sign or None,
-                    planned_etd=planned,
-                    observed_etd=observed,
-                    delta_hours=round(delta, 2),
-                )
-            )
-    return changes
+    return [
+        ScheduleChange(
+            voyage_id=match.voyage.voyage_id,
+            vessel_name=match.voyage.vessel_name,
+            call_sign=match.movement.call_sign or None,
+            planned_etd=match.planned_etd,
+            observed_etd=match.observed_etd,
+            delta_hours=round(match.delta_hours, 2),
+            matched_by=match.matched_by,
+        )
+        for match in match_departures(voyages, movements, max_gap_hours)
+        if abs(match.delta_hours) >= threshold_hours
+    ]

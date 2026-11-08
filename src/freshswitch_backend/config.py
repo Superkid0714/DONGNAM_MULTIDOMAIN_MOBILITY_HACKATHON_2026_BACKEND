@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL
 
@@ -24,6 +24,23 @@ class Settings(BaseSettings):
     postgres_user: str = "freshswitch"
     postgres_password: str = "freshswitch"
     postgres_db: str = "freshswitch"
+    api_prefix: str = "/api"
+    session_cookie_name: str = "fs_session"
+    session_cookie_path: str = "/"
+    session_ttl: int = Field(default=14 * 24 * 3600, gt=0)
+    session_cookie_secure: bool = True
+    saas_mode: bool = False
+    sandbox_purge_interval_seconds: int = Field(default=600, ge=0)
+
+    @field_validator("api_prefix", "session_cookie_path")
+    @classmethod
+    def _normalize_path(cls, value: str) -> str:
+        trimmed = value.strip().strip("/")
+        return f"/{trimmed}" if trimmed else ""
+
+    @property
+    def cookie_path(self) -> str:
+        return self.session_cookie_path or "/"
 
     def resolved_database_url(self) -> str:
         if self.database_url or not self.postgres_host:

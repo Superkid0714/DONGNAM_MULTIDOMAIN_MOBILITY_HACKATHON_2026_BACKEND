@@ -44,6 +44,26 @@ def container_fill(plan: Plan) -> dict[str, int]:
     return {c.container_id: c.pallets for c in plan.containers if c.used}
 
 
+def proposal_lot_id(scenario: Scenario) -> str | None:
+    lot = next(
+        (
+            item
+            for item in scenario.lots
+            if item.id == "lot-sancheong-sb-1" or item.id.endswith("-lot-sancheong-sb-1")
+        ),
+        None,
+    )
+    if lot is None or lot.pallets <= PROPOSAL_EVENT.new_pallets:
+        return None
+    return lot.id
+
+
+def proposal_event(scenario: Scenario) -> ReduceEvent | None:
+    lot_id = proposal_lot_id(scenario)
+    if lot_id is None:
+        return None
+    return ReduceEvent(lot_id=lot_id, new_pallets=PROPOSAL_EVENT.new_pallets)
+
+
 def proposal_event_applies(scenario: Scenario) -> bool:
-    lot = next((x for x in scenario.lots if x.id == PROPOSAL_EVENT.lot_id), None)
-    return lot is not None and lot.pallets > PROPOSAL_EVENT.new_pallets
+    return proposal_lot_id(scenario) is not None

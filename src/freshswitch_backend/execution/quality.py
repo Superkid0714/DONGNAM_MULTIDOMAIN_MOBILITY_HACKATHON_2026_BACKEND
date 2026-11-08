@@ -2,6 +2,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
+from freshswitch_backend.domain.inputs import Note, StorableStr
 from freshswitch_backend.domain.models import Plan, Scenario, Settlement
 from freshswitch_backend.optimize.costs import CostModel
 from freshswitch_backend.optimize.settlement import lot_settle_cost
@@ -17,9 +18,9 @@ SOURCE = (
 
 
 class ArrivalRequest(BaseModel):
-    lot_id: str
+    lot_id: StorableStr
     inspected_loss_pct: float = Field(ge=0, le=100)
-    note: str | None = None
+    note: Note | None = None
 
 
 class ArrivalInspection(BaseModel):

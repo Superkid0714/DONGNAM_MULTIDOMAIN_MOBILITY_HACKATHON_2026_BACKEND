@@ -1,18 +1,22 @@
 from collections import defaultdict
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 from freshswitch_backend.domain.models import (
     Assignment,
+    BillingRule,
     ContainerLoad,
     ContainerSettlement,
     ContainerShipperSettlement,
     CostBreakdown,
+    CostParams,
     Lot,
     PalletTariff,
     Scenario,
     Settlement,
+    SettlementBaselineKind,
     SettlementBasis,
+    SettlementBillingRule,
     ShipperCost,
     TariffLine,
     TariffSheet,
@@ -25,6 +29,100 @@ def settle(savings: int, fee_rate: float) -> tuple[int, int]:
         return 0, savings
     fee = round(savings * fee_rate)
     return fee, savings - fee
+
+
+BASELINE_KINDS: dict[SettlementBillingRule, SettlementBaselineKind] = {
+    "performance": "air_solo",
+    "usage_fee": "sea_solo",
+    "mixed": "mixed",
+}
+BASELINE_LABELS: dict[SettlementBaselineKind, str] = {
+    "air_solo": "단독 항공 대비",
+    "sea_solo": "단독 해상 대비",
+    "mixed": "품목별 기준선(단독 항공·단독 해상)",
+}
+SAVINGS_BASELINE_LABEL = "단독 항공 대비"
+
+
+def uses_usage_fee(params: CostParams, product_id: str) -> bool:
+    return product_id in params.billing.usage_fee_products
+
+
+def billing_rule(params: CostParams, product_id: str) -> BillingRule:
+    return "usage_fee" if uses_usage_fee(params, product_id) else "performance"
+
+
+def usage_fee(params: CostParams, pallets: float) -> int:
+    return round(pallets * params.billing.usage_fee_per_pallet_krw.value)
+
+
+@dataclass(frozen=True)
+class Charge:
+    billing_rule: SettlementBillingRule
+    performance_fee: int
+    usage_fee: int
+    fee: int
+    shipper_gain: int
+    baseline_kind: SettlementBaselineKind
+    baseline_label: str
+    savings_baseline_label: str
+    pilot: bool
+
+    def fields(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class _Billing:
+    rules: set[BillingRule] = field(default_factory=set)
+    performance_baseline: float = 0.0
+    performance_plan: float = 0.0
+    usage_pallets: int = 0
+
+    def add(self, rule: BillingRule, pallets: int, sea: bool, baseline: float, plan: float) -> None:
+        self.rules.add(rule)
+        if rule == "usage_fee":
+            self.usage_pallets += pallets if sea else 0
+            return
+        self.performance_baseline += baseline
+        self.performance_plan += plan
+
+    def rule(self) -> SettlementBillingRule:
+        if len(self.rules) == 1:
+            return next(iter(self.rules))
+        return "mixed" if self.rules else "performance"
+
+    def charge(self, params: CostParams, savings: int) -> Charge:
+        rule = self.rule()
+        performance_savings = savings
+        if rule != "performance":
+            performance_savings = round(self.performance_baseline) - round(self.performance_plan)
+        return charge(params, rule, savings, performance_savings, self.usage_pallets)
+
+
+def charge(
+    params: CostParams,
+    rule: SettlementBillingRule,
+    savings: int,
+    performance_savings: int,
+    usage_pallets: int,
+) -> Charge:
+    performance_fee, _ = settle(performance_savings, params.platform_fee_rate.value)
+    usage = usage_fee(params, usage_pallets)
+    pilot = params.billing.pilot
+    fee = 0 if pilot else performance_fee + usage
+    kind = BASELINE_KINDS[rule]
+    return Charge(
+        billing_rule=rule,
+        performance_fee=performance_fee,
+        usage_fee=usage,
+        fee=fee,
+        shipper_gain=savings - fee,
+        baseline_kind=kind,
+        baseline_label=BASELINE_LABELS[kind],
+        savings_baseline_label=SAVINGS_BASELINE_LABEL,
+        pilot=pilot,
+    )
 
 
 PARTS = ("freight", "inland", "handling", "collection", "storage", "loss_risk")
@@ -146,7 +244,7 @@ def _assumed(source: str) -> bool:
 def tariff_sheet(model: CostModel, product_id: str, tariff: PalletTariff) -> TariffSheet:
     product = model.products[product_id]
     rate_shift = model.air_rate_per_kg - tariff.air_rate_basis_per_kg.value
-    air_freight = round(tariff.air_freight.value + rate_shift * product.pallet_kg)
+    air_freight = round(tariff.air_freight.value + rate_shift * product.net_pallet_kg)
     rows = (
         ("freight", "운임", tariff.air_freight, air_freight, tariff.sea_freight),
         ("inland", "내륙·장비·보관", tariff.air_inland, None, tariff.sea_inland),
@@ -168,8 +266,10 @@ def tariff_sheet(model: CostModel, product_id: str, tariff: PalletTariff) -> Tar
     air_total = sum(line.air for line in lines)
     sea_total = sum(line.sea for line in lines)
     savings = air_total - sea_total
-    fee_rate = model.params.platform_fee_rate.value
-    fee, gain = settle(savings, fee_rate)
+    rule = billing_rule(model.params, product_id)
+    usage = rule == "usage_fee"
+    bill = charge(model.params, rule, savings, 0 if usage else savings, 1 if usage else 0)
+    fee_rate = 0.0 if usage else model.params.platform_fee_rate.value
     short = round(tariff.sea_loss_risk_short_window.value)
     short_total = sea_total - lines[2].sea + short
     assumed = [f"air.{line.key}" for line in lines if line.air_assumed]
@@ -183,8 +283,10 @@ def tariff_sheet(model: CostModel, product_id: str, tariff: PalletTariff) -> Tar
         sea_total=sea_total,
         savings_per_pallet=savings,
         fee_rate=fee_rate,
-        fee_per_pallet=fee,
-        shipper_share_per_pallet=gain,
+        fee_per_pallet=bill.fee,
+        shipper_share_per_pallet=bill.shipper_gain,
+        billing_rule=rule,
+        pilot=bill.pilot,
         sea_loss_risk_short_window=short,
         sea_total_short_window=short_total,
         short_window_rule=(
@@ -217,7 +319,11 @@ def shipper_costs_and_settlements(
     estimates: dict[str, float] = defaultdict(float)
     pallets: dict[str, list[int]] = {}
     kinds: dict[str, set[bool]] = defaultdict(set)
+    row_kinds: dict[tuple[str, str], set[bool]] = defaultdict(set)
     rows: dict[tuple[str, str], list[float]] = {}
+    billing: dict[str, _Billing] = defaultdict(_Billing)
+    row_billing: dict[tuple[str, str], _Billing] = defaultdict(_Billing)
+    params = model.params
     routed = route_collection is not None
     for a in assignments:
         lot = lots[a.lot_id]
@@ -237,12 +343,18 @@ def shipper_costs_and_settlements(
         _add(base_acc[sid], baseline)
         kinds[sid].add(model.tariff(lot) is not None)
         pallets[sid][0 if a.mode == "sea" else 1] += lot.pallets
-        if a.mode == "sea" and a.container_id:
+        rule = billing_rule(params, lot.product_id)
+        sea = a.mode == "sea"
+        billing[sid].add(rule, lot.pallets, sea, baseline.total, settled.total)
+        if sea and a.container_id:
             row = rows.setdefault((a.container_id, sid), [0, 0.0, 0.0])
             row[0] += lot.pallets
             row[1] += baseline.total
             row[2] += settled.total
-    fee_rate = model.params.platform_fee_rate.value
+            row_kinds[(a.container_id, sid)].add(model.tariff(lot) is not None)
+            row_billing[(a.container_id, sid)].add(
+                rule, lot.pallets, sea, baseline.total, settled.total
+            )
     costs: list[ShipperCost] = []
     settlements: list[Settlement] = []
     for shipper in model.scenario.shippers:
@@ -272,18 +384,16 @@ def shipper_costs_and_settlements(
             )
         )
         savings = baseline.total - plan.total
-        fee, gain = settle(savings, fee_rate)
         settlements.append(
             Settlement(
                 shipper_id=sid,
                 baseline_cost=baseline.total,
                 shared_cost=plan.total,
                 savings=savings,
-                fee=fee,
-                shipper_gain=gain,
                 sea_pallets=sea,
                 air_pallets=air,
                 basis=_basis(kinds[sid]),
+                **billing[sid].charge(params, savings).fields(),
             )
         )
     containers = []
@@ -298,7 +408,7 @@ def shipper_costs_and_settlements(
         shippers = []
         for sid, (count, base_total, plan_total) in entries:
             base_cost, shared = round(base_total), round(plan_total)
-            fee, gain = settle(base_cost - shared, fee_rate)
+            bill = row_billing[(container.id, sid)].charge(params, base_cost - shared)
             shippers.append(
                 ContainerShipperSettlement(
                     shipper_id=sid,
@@ -306,9 +416,8 @@ def shipper_costs_and_settlements(
                     baseline_cost=base_cost,
                     shared_cost=shared,
                     savings=base_cost - shared,
-                    fee=fee,
-                    shipper_gain=gain,
-                    basis=_basis(kinds[sid]),
+                    basis=_basis(row_kinds[(container.id, sid)]),
+                    **bill.fields(),
                 )
             )
         containers.append(

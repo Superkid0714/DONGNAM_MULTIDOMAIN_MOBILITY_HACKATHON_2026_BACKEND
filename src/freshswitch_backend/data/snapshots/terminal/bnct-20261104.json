@@ -1,0 +1,206 @@
+{
+ "source": "BNCT(비엔씨티) e-Service 선석배정현황(T)·모선별 Route 조회·모선 제원 조회",
+ "label": "터미널 공개 선석 계획(예정값). 실제 출항은 해수부 출항 신고로 확인한다",
+ "terminal": {
+  "code": "BNCT",
+  "name": "비엔씨티(BNCT)",
+  "mof_terminal": "신항 5부두",
+  "scenario_terminal": "부산신항 5부두"
+ },
+ "source_url": "https://www.bnctkorea.com/esvc/vessel/berthScheduleT/list?VVD=&StrDate=2026-11-15&EndDate=2026-11-24",
+ "fetched_at": "2026-11-03T15:32:31Z",
+ "query": {
+  "start": "2026-11-15",
+  "end": "2026-11-24",
+  "target_window": "2026-11-18 ~ 2026-11-21"
+ },
+ "vessels": [
+  {
+   "role": "alternate",
+   "vessel_name": "ASL HONG KONG",
+   "call_sign": "VRUX4",
+   "call_sign_source": "https://www.bnctkorea.com/esvc/codeChk/vesselSrch/data?vslCode=CNHK (해수부 이력 2026-09-26 출항 기록 VRUX4와 같다)",
+   "terminal_vessel_code": "CNHK005",
+   "operator": "APC",
+   "voyage": "JTV0I0S89",
+   "route": "JTVS",
+   "berth": "1",
+   "berthing_side": "S",
+   "etb": "2026-11-19T03:00:00+09:00",
+   "etd": "2026-11-19T20:00:00+09:00",
+   "cy_cutoff": "2026-11-18T17:00:00+09:00",
+   "next_port": "KRKAN",
+   "next_port_basis": "BNCT 모선별 Route 조회 목록에서 부산 다음 항구(목록 순서가 기항 순서인지는 확인 필요)",
+   "port_rotation": [
+    {
+     "seq": 1,
+     "code": "JPTYO",
+     "name": "TOKYO"
+    },
+    {
+     "seq": 2,
+     "code": "JPYOK",
+     "name": "YOKOHAMA"
+    },
+    {
+     "seq": 3,
+     "code": "JPNGO",
+     "name": "NAGOYA"
+    },
+    {
+     "seq": 4,
+     "code": "JPUKB",
+     "name": "KOBE"
+    },
+    {
+     "seq": 5,
+     "code": "KRPUS",
+     "name": "PUSAN, KOREA"
+    },
+    {
+     "seq": 6,
+     "code": "KRKAN",
+     "name": "KWANGYANG"
+    },
+    {
+     "seq": 7,
+     "code": "CNSHK",
+     "name": "SHEKOU"
+    },
+    {
+     "seq": 8,
+     "code": "THLCH",
+     "name": "LAMCHABANG"
+    },
+    {
+     "seq": 9,
+     "code": "VNC8Q",
+     "name": "CHU LAI"
+    },
+    {
+     "seq": 10,
+     "code": "VNSGN",
+     "name": "HO CHI MINH"
+    },
+    {
+     "seq": 11,
+     "code": "HKHKG",
+     "name": "HONG KONG"
+    },
+    {
+     "seq": 12,
+     "code": "XXOPT",
+     "name": "FAL3 OPTION"
+    },
+    {
+     "seq": 13,
+     "code": "TWKHH",
+     "name": "KAOHSIUNG HMM"
+    },
+    {
+     "seq": 14,
+     "code": "TWTXG",
+     "name": "TTAICHUNG"
+    },
+    {
+     "seq": 15,
+     "code": "TWKEL",
+     "name": "KEELUNG"
+    },
+    {
+     "seq": 16,
+     "code": "CNXMN",
+     "name": "XIAMEN"
+    },
+    {
+     "seq": 17,
+     "code": "SGSIN",
+     "name": "SINGAPORE"
+    },
+    {
+     "seq": 18,
+     "code": "VNVUT",
+     "name": "VUNG TAU"
+    },
+    {
+     "seq": 19,
+     "code": "PHMNS",
+     "name": "SOUTH MANILA"
+    },
+    {
+     "seq": 20,
+     "code": "CNNSA",
+     "name": "NAN SHA"
+    },
+    {
+     "seq": 21,
+     "code": "CNSHK",
+     "name": "SHEKOU"
+    }
+   ],
+   "port_rotation_url": "https://www.bnctkorea.com/esvc/codeChk/vesselRouteSrch/data?VVD_YEAR=2026&VVD=CNHK005",
+   "hong_kong_call": {
+    "order_after_busan": 6,
+    "via": [
+     "KRKAN",
+     "CNSHK",
+     "THLCH",
+     "VNC8Q",
+     "VNSGN"
+    ]
+   },
+   "transit_days_to_hkhkg": null,
+   "gaps": [
+    "홍콩은 목록상 부산 뒤 6번째(광양·서커우·람차방·쭈라이·호찌민 경유)라 신선 화물 직항으로 쓰기 어렵다. 실제 기항 순서는 확인 필요",
+    "Route 목록에 중복·옵션 코드(XXOPT)가 있어 양하 가능 항구 목록일 수 있다. 확인 필요",
+    "BNCT 반입마감시한 칸은 CCTDATE를 보여 준다(CUTOFFDATE 2026-11-19 03:00은 별도 값)"
+   ],
+   "vessel_particulars": {
+    "LLOYD_COD": "9958860",
+    "NAT": "HK",
+    "GRS_TON": "18724",
+    "LOA": "171.9",
+    "CAPA": "1781"
+   },
+   "terminal_row": {
+    "VSLGROSSTON": "",
+    "STARTPOS": "",
+    "ROUTE": "JTVS",
+    "REMARK": "",
+    "CCTDATE": "2026/11/18 17:00",
+    "OPERATOR": "APC",
+    "SHIFTVAN": "0",
+    "OPERVSL": "",
+    "BRIGEPOS": "3870",
+    "VSLNAME": "ASL HONG KONG",
+    "VSLLENGTH": "17190",
+    "ETADATE": "",
+    "VVD": "CNHK005",
+    "CUTOFFDATE": "2026/11/19 03:00",
+    "QCQTY": "",
+    "VSLSTATE": "",
+    "VSLSTERN": "3870",
+    "ATBDATE": "",
+    "OPERVSLVVDIN": "JTV0I0S89",
+    "OPERVSLVVDOUT": "JTV0I0S89",
+    "TSVAN": "",
+    "ATADATE": "",
+    "HEAD_LINE_BTT": "02",
+    "ATDDATE": "",
+    "VVD_YEAR": "2026",
+    "BERTHNO": "1",
+    "ETDDATE": "2026/11/19 20:00",
+    "STRN_LINE_BTT": "12",
+    "BERTHSIDE": "S",
+    "ETBDATE": "2026/11/19 03:00",
+    "VSL": "",
+    "VSLCAPACITY": "",
+    "TB_YN": "N",
+    "BITTNO": "09",
+    "LOADVAN": "600",
+    "DISVAN": "600",
+    "TD_YN": "N"
+   }
+  }
+ ]
+}

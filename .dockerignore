@@ -12,4 +12,5 @@ scripts/
 .ruff_cache/
 Dockerfile
 docker-compose.yml
+docker-compose.saas.yml
 .dockerignore

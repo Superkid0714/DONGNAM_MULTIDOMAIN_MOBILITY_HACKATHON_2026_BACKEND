@@ -34,6 +34,10 @@ def sea_option(
         return None, "목적지 불일치"
     if lot.pallets > container.capacity_pallets:
         return None, "로트가 컨테이너 용량보다 큼"
+    if (container.temp_min_c is not None and product.temp_max_c < container.temp_min_c) or (
+        container.temp_max_c is not None and product.temp_min_c > container.temp_max_c
+    ):
+        return None, "컨테이너 보관 온도 범위 불일치"
     if is_ca_product(product) and "CA" not in container.kind.upper():
         return None, "CA 미지원 컨테이너"
     late_days = (lot.ready_date - model.cutoff_date(voyage)).days

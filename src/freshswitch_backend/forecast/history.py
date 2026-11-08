@@ -14,6 +14,7 @@ from freshswitch_backend.integrations.mof_vessel import (
     KST,
     MofVesselClient,
     VesselMovement,
+    normalize_call_sign,
     normalize_vessel_name,
 )
 
@@ -83,7 +84,10 @@ class DepartureRecord(BaseModel):
 
     @property
     def key(self) -> tuple[str, str]:
-        return self.call_sign, self.planned_departure_at.isoformat()
+        return (
+            normalize_call_sign(self.call_sign),
+            self.planned_departure_at.astimezone(UTC).isoformat(),
+        )
 
 
 class DepartureHistory(BaseModel):

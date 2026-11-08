@@ -75,11 +75,19 @@ def test_default_plan_costs_add_up(default_plan: Plan) -> None:
     assert jinju.baseline.total == 8 * 969_000
 
 
-def test_every_shipper_saves_and_fee_is_quarter(default_plan: Plan) -> None:
+def test_every_shipper_saves_and_fee_follows_billing_rule(default_plan: Plan) -> None:
+    rules = {s.billing_rule for s in default_plan.settlements}
+    assert rules == {"performance", "usage_fee"}
     for s in default_plan.settlements:
         assert s.savings == s.baseline_cost - s.shared_cost
         assert s.savings > 0
-        assert s.fee == round(s.savings * 0.25)
+        if s.billing_rule == "performance":
+            assert s.fee == s.performance_fee == round(s.savings * 0.25)
+            assert s.usage_fee == 0
+        else:
+            assert s.fee == s.usage_fee > 0
+            assert s.performance_fee == 0
+            assert s.baseline_kind == "sea_solo"
         assert s.fee + s.shipper_gain == s.savings
     assert default_plan.total_fee == sum(s.fee for s in default_plan.settlements)
 

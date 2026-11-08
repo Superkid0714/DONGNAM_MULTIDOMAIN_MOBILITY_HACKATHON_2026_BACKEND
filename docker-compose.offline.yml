@@ -1,0 +1,64 @@
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  api:
+    pull_policy: never
+    environment:
+      OFFLINE_MODE: "true"
+      EXPLAIN_USE_LLM: "false"
+      SESSION_COOKIE_SECURE: "false"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/test/api/health', timeout=3)
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+      start_interval: 1s
+
+  db:
+    pull_policy: never
+
+  gateway:
+    image: nginx:1.29-alpine
+    profiles: [web]
+    pull_policy: never
+    restart: unless-stopped
+    depends_on:
+      - api
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:18100:80"
+    configs:
+      - source: gateway
+        target: /etc/nginx/conf.d/default.conf
+    logging: *logging
+
+configs:
+  gateway:
+    content: |
+      server {
+        listen 80;
+        client_max_body_size 5m;
+        location /test/api/ {
+          proxy_pass http://api:8000;
+          proxy_http_version 1.1;
+          proxy_set_header Host $$host;
+          proxy_set_header X-Forwarded-For $$remote_addr;
+          proxy_buffering off;
+          proxy_read_timeout 1h;
+        }
+        location / {
+          proxy_pass http://host.docker.internal:18105;
+          proxy_http_version 1.1;
+          proxy_set_header Host $$host;
+        }
+      }

@@ -2,10 +2,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from freshswitch_backend.data.loader import get_scenario
-from freshswitch_backend.domain.models import Scenario
+from freshswitch_backend.domain.models import Assignment, Scenario
 from freshswitch_backend.optimize import AIR, solve_plan
 from freshswitch_backend.optimize.costs import CostModel
-from freshswitch_backend.optimize.settlement import tariff_sheet
+from freshswitch_backend.optimize.settlement import shipper_costs_and_settlements, tariff_sheet
 from freshswitch_backend.replan import AirSwitchEvent, locations, replan
 
 CA01_TABLE = {
@@ -99,3 +99,29 @@ def test_air_switch_event_marks_short_window_and_engine_picks_air(scenario: Scen
     assert "lot-sancheong-sb-1" in result.free_lot_ids
     for alt in result.alternatives:
         assert locations(alt.plan)["lot-sancheong-sb-1"] == AIR
+
+
+def test_container_row_basis_uses_only_lots_in_that_container(scenario: Scenario) -> None:
+    lots = {
+        lot.id: lot.model_copy(update={"shipper_id": "sh-jinju"})
+        for lot in scenario.lots
+        if lot.id in ("lot-jinju-sb-1", "lot-pohang-gr-1")
+    }
+    placed = {"lot-jinju-sb-1": "CA-01", "lot-pohang-gr-1": "CA-02"}
+    assignments = [
+        Assignment(
+            lot_id=lot.id,
+            shipper_id=lot.shipper_id,
+            product_id=lot.product_id,
+            pallets=lot.pallets,
+            mode="sea",
+            container_id=placed[lot.id],
+            voyage_id="V-2611A",
+        )
+        for lot in lots.values()
+    ]
+    shared = scenario.model_copy(update={"lots": list(lots.values())})
+    result = shipper_costs_and_settlements(CostModel(shared), lots, assignments)
+    rows = {c.container_id: c.shippers[0].basis for c in result.containers}
+    assert rows == {"CA-01": "tariff", "CA-02": "operational"}
+    assert [s.basis for s in result.settlements] == ["mixed"]

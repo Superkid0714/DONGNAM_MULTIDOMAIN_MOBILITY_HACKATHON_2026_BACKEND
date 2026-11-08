@@ -1,5 +1,8 @@
 docs/
 .env
+.env.*
+!.env.example
+!.env.saas.example
 .venv/
 __pycache__/
 .pytest_cache/

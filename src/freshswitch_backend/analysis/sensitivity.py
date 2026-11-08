@@ -3,10 +3,9 @@ from collections.abc import Callable
 from typing import Literal
 
 from freshswitch_backend.analysis.common import (
-    PROPOSAL_EVENT,
     REPLAN_LIMIT_S,
     container_fill,
-    proposal_event_applies,
+    proposal_event,
     routes,
     shipper_savings,
     solve,
@@ -51,7 +50,10 @@ class _Counter:
     def replan(self, scenario: Scenario) -> tuple[Plan, ReplanResult]:
         plan = self.solve(scenario)
         self.count += 1
-        return plan, replan(scenario, plan, PROPOSAL_EVENT, time_limit_s=REPLAN_LIMIT_S)
+        event = proposal_event(scenario)
+        if event is None:
+            raise ValueError("재계획 대상 로트가 없습니다")
+        return plan, replan(scenario, plan, event, time_limit_s=REPLAN_LIMIT_S)
 
 
 def bisect_factor(
@@ -225,7 +227,8 @@ def _alternatives(result: ReplanResult) -> list[AlternativeSummary]:
 
 
 def _replan_sensitivity(scenario: Scenario, counter: _Counter) -> ReplanSensitivity | None:
-    if not proposal_event_applies(scenario):
+    event = proposal_event(scenario)
+    if event is None:
         return None
     _, base_result = counter.replan(scenario)
     base_outcome = replan_outcome(base_result)
@@ -260,7 +263,7 @@ def _replan_sensitivity(scenario: Scenario, counter: _Counter) -> ReplanSensitiv
             )
         )
     return ReplanSensitivity(
-        event=PROPOSAL_EVENT.model_dump(),
+        event=event.model_dump(),
         base_outcome=base_outcome,
         alternatives=_alternatives(base_result),
         thresholds=thresholds,

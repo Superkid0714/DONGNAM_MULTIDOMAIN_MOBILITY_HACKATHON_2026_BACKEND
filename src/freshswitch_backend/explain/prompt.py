@@ -76,11 +76,19 @@ def build_payload(ctx: ExplainContext) -> dict:
             {
                 "shipper_id": shipper.shipper_id,
                 "shipper_name": shipper.shipper_name,
-                "required_facts": templates[shipper.shipper_id].split("조정되었습니다.", 1)[-1].strip(),
+                "required_facts": templates[shipper.shipper_id]
+                .split("조정되었습니다.", 1)[-1]
+                .strip(),
                 "cost_before": format_krw(shipper.cost_before_krw),
                 "cost_after": format_krw(shipper.cost_after_krw),
                 "change": format_amount_krw(shipper.delta_krw),
                 "direction": change_direction(shipper.delta_krw),
+                "cancellation_fee": format_krw(shipper.cancellation_adjustment_krw)
+                if shipper.cancellation_adjustment_krw > 0
+                else None,
+                "cancellation_compensation": format_krw(-shipper.cancellation_adjustment_krw)
+                if shipper.cancellation_adjustment_krw < 0
+                else None,
                 "moved": shipper.moved,
                 "pull_forward": f"{shipper.pull_forward_days}일"
                 if shipper.pull_forward_days
