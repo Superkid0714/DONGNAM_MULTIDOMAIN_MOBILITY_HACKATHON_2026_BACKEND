@@ -16,7 +16,12 @@ services:
         GIT_COMMIT: ${API_TAG:-}
     env_file: .env
     environment:
-      POSTGRES_HOST: db
+      DATABASE_URL: ${DATABASE_URL:-}
+      POSTGRES_HOST: ${POSTGRES_HOST:-db}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_USER: ${POSTGRES_USER:-freshswitch}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-freshswitch}
+      POSTGRES_DB: ${POSTGRES_DB:-freshswitch}
       SAAS_MODE: "true"
       API_PREFIX: /test/api
       SESSION_COOKIE_PATH: /

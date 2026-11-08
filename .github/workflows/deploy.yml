@@ -50,62 +50,35 @@ jobs:
           docker compose logs --tail 100 api
           exit 1
 
-      - name: verify SaaS database settings before redeploy
-        if: github.ref == 'refs/heads/feat/saas'
-        run: |
-          python3 - <<'PY'
-          import json
-          import subprocess
-          from pathlib import Path
-
-          values = {}
-          for line in Path(".env").read_text().splitlines():
-              line = line.strip()
-              if not line or line.startswith("#") or "=" not in line:
-                  continue
-              key, value = line.split("=", 1)
-              value = value.strip()
-              if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-                  value = value[1:-1]
-              values[key.strip()] = value
-
-          def container_env(name):
-              raw = subprocess.check_output(
-                  ["docker", "inspect", "--format", "{{json .Config.Env}}", name],
-                  text=True,
-              )
-              return dict(item.split("=", 1) for item in json.loads(raw) if "=" in item)
-
-          try:
-              current_db = container_env("freshswitch-saas-db-1")
-              current_api = container_env("freshswitch-saas-api-1")
-          except subprocess.CalledProcessError as exc:
-              raise SystemExit(
-                  "Refusing SaaS redeploy: existing SaaS API/DB container was not found."
-              ) from exc
-
-          mismatches = []
-          for key in ("POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"):
-              candidate = values.get(key, "freshswitch")
-              if current_db.get(key) != candidate or current_api.get(key, candidate) != candidate:
-                  mismatches.append(key)
-          candidate_url = values.get("DATABASE_URL", "")
-          if current_api.get("DATABASE_URL", "") != candidate_url:
-              mismatches.append("DATABASE_URL")
-          if mismatches:
-              raise SystemExit(
-                  "Refusing SaaS redeploy: existing database settings differ from .env for "
-                  + ", ".join(mismatches)
-                  + ". No credential values were printed."
-              )
-          print("saas_database_settings_match=true")
-          PY
-
       - name: build and deploy SaaS
         if: github.ref == 'refs/heads/feat/saas'
         env:
           API_TAG: ${{ github.sha }}
-        run: docker compose --env-file .env -f docker-compose.saas.yml up -d --build --remove-orphans
+        run: |
+          set -euo pipefail
+          db_id=$(docker ps -q --filter label=com.docker.compose.project=freshswitch-saas --filter label=com.docker.compose.service=db | head -n 1)
+          api_id=$(docker ps -q --filter label=com.docker.compose.project=freshswitch-saas --filter label=com.docker.compose.service=api | head -n 1)
+          if [ -z "$db_id" ] || [ -z "$api_id" ]; then
+            echo "Existing SaaS containers were not found; refusing to replace the live database configuration."
+            exit 1
+          fi
+          read_container_env() {
+            docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$1" \
+              | sed -n "s/^$2=//p" | tail -n 1
+          }
+          export POSTGRES_USER="$(read_container_env "$db_id" POSTGRES_USER)"
+          export POSTGRES_PASSWORD="$(read_container_env "$db_id" POSTGRES_PASSWORD)"
+          export POSTGRES_DB="$(read_container_env "$db_id" POSTGRES_DB)"
+          export POSTGRES_HOST="$(read_container_env "$api_id" POSTGRES_HOST)"
+          export POSTGRES_PORT="$(read_container_env "$api_id" POSTGRES_PORT)"
+          export DATABASE_URL="$(read_container_env "$api_id" DATABASE_URL)"
+          : "${POSTGRES_HOST:=db}"
+          : "${POSTGRES_PORT:=5432}"
+          if [ -z "$POSTGRES_USER" ] || [ -z "$POSTGRES_PASSWORD" ] || [ -z "$POSTGRES_DB" ]; then
+            echo "Existing SaaS database settings could not be read; refusing redeploy."
+            exit 1
+          fi
+          docker compose --env-file .env -f docker-compose.saas.yml up -d --build --remove-orphans
 
       - name: health check SaaS
         if: github.ref == 'refs/heads/feat/saas'
