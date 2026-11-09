@@ -51,6 +51,7 @@ from freshswitch_backend.notifications import notify_order_confirmation
 from freshswitch_backend.persistence import database
 from freshswitch_backend.persistence.orgs import same_sandbox
 from freshswitch_backend.persistence.tables import DEMO_ORG, LotRow, OrganizationRow
+from freshswitch_backend.planning.robust.display import display_replan, display_session
 from freshswitch_backend.planning.store import (
     ContainerBooked,
     HistoryEntry,
@@ -375,11 +376,11 @@ def create_plan(
     if principal is not None:
         if principal.org_type != "forwarder":
             raise HTTPException(status_code=403, detail="계획은 포워더 조직만 만들 수 있습니다")
-        return create_tenant_plan(body, principal.org_id)
+        return display_session(create_tenant_plan(body, principal.org_id))
     scenario, registered_ids = _with_lots(scenario, body)
     if body.use_learned_loss:
         scenario = with_learned_loss(scenario)
-    return store.create(scenario, registered_ids)
+    return display_session(store.create(scenario, registered_ids))
 
 
 @router.get("")
@@ -394,8 +395,8 @@ def list_plans(
 @router.get("/{plan_id}")
 def read_plan(plan_id: str, org_id: OrgId, principal: OptionalPrincipal) -> PlanSession:
     if principal is not None and principal.org_type == "platform":
-        return plan_for(plan_id, principal).session
-    return _session(plan_id, org_id)
+        return display_session(plan_for(plan_id, principal).session)
+    return display_session(_session(plan_id, org_id))
 
 
 @router.delete("/{plan_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -444,7 +445,7 @@ async def replan_event(
         _replayed, plan_id, body.idempotency_key, "events", body, ReplanResponse, org_id
     )
     if replayed is not None:
-        return replayed
+        return display_replan(session.scenario, session.plan, replayed)
     inputs = await run_in_threadpool(replan_inputs, session, org_id)
     result = await compute_replan(
         replan,
@@ -474,9 +475,10 @@ async def replan_event(
         replan_id=pending.replan_id,
         base_version=pending.base_version,
     )
-    return await run_in_threadpool(
+    stored_response = await run_in_threadpool(
         _remember, plan_id, body.idempotency_key, "events", body, response, org_id
     )
+    return display_replan(session.scenario, session.plan, stored_response)
 
 
 def apply_alternative(plan_id: str, body: ApplyRequest, org_id: str) -> PlanSession:
@@ -507,7 +509,7 @@ def apply_and_notify(plan_id: str, body: ApplyRequest, org_id: OrgId) -> PlanSes
     if org_id != DEMO_ORG and session.active_order_id is not None:
         order = store.order(plan_id, session.active_order_id, org_id=org_id)
         notify_order_confirmation(session, order, org_id, store.clock())
-    return session
+    return display_session(session)
 
 
 def _order_view(

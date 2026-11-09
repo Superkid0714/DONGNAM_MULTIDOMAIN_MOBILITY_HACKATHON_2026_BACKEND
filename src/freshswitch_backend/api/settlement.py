@@ -15,6 +15,9 @@ from freshswitch_backend.execution.quality import (
     adjusted_settlements,
     current_inspections,
 )
+from freshswitch_backend.optimize.solo import quote_amounts
+from freshswitch_backend.planning.robust.display import display_plan
+from freshswitch_backend.planning.service import operational_quote_plan
 from freshswitch_backend.planning.store import SessionConflict, store
 from freshswitch_backend.quality import quality_history
 
@@ -43,6 +46,13 @@ class SettlementView(BaseModel):
     containers: list[ContainerSettlement]
     tariffs: list[TariffSheet]
     assumed_items: list[str]
+    air_cost: int = 0
+    sea_solo_cost: int | None = None
+    shared_cost: int = 0
+    fee: int = 0
+    shipper_net_saving: int = 0
+    savings_vs_air_pct: float | None = None
+    savings_vs_solo_pct: float | None = None
 
 
 @router.get("/{plan_id}/settlement")
@@ -52,27 +62,34 @@ def read_settlement(plan_id: str, org_id: OrgId, principal: OptionalPrincipal) -
     session = store.get(plan_id, org_id=org_id)
     if session is None:
         raise HTTPException(status_code=404, detail="계획을 찾을 수 없습니다")
-    settlements = adjusted_settlements(session.plan, session.arrival_inspections)
+    plan = display_plan(session.scenario, operational_quote_plan(session.scenario, session.plan))
+    settlements = adjusted_settlements(plan, session.arrival_inspections)
+    air = sum(s.air_cost if s.air_cost is not None else s.baseline_cost for s in settlements)
+    solo = (
+        sum(s.sea_solo_cost for s in settlements)
+        if settlements and all(s.sea_solo_cost is not None for s in settlements)
+        else None
+    )
+    shared, fee = sum(s.shared_cost for s in settlements), sum(s.fee for s in settlements)
     return SettlementView(
         plan_id=plan_id,
         version=session.version,
         settlements=settlements,
-        inspections=current_inspections(session.plan, session.arrival_inspections),
+        inspections=current_inspections(plan, session.arrival_inspections),
         total_fee_before_refund=sum(s.fee_before_refund for s in settlements),
         total_refund=sum(s.quality_refund for s in settlements),
         total_fee=sum(s.fee for s in settlements),
         total_savings=sum(s.savings for s in settlements),
         total_performance_fee=sum(s.performance_fee for s in settlements),
         total_usage_fee=sum(s.usage_fee for s in settlements),
-        containers=session.plan.container_settlements,
-        tariffs=session.plan.settlement_tariffs,
+        containers=plan.container_settlements,
+        tariffs=plan.settlement_tariffs,
         assumed_items=sorted(
-            {
-                f"{t.product_id}.{item}"
-                for t in session.plan.settlement_tariffs
-                for item in t.assumed_items
-            }
+            {f"{t.product_id}.{item}" for t in plan.settlement_tariffs for item in t.assumed_items}
         ),
+        shared_cost=shared,
+        fee=fee,
+        **quote_amounts(air, solo, shared, fee),
     )
 
 

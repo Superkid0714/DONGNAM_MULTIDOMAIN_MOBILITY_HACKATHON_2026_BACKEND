@@ -333,3 +333,17 @@ def build_plan(scenario: Scenario, **options) -> PlanWithRoutes:
             lot_count=len(scenario.lots),
             elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
         )
+
+
+def operational_quote_plan(scenario: Scenario, plan: Plan) -> Plan:
+    """Read-only reprice of legacy tariff snapshots, using their saved parameters.
+
+    Do not mutate stored plans, confirmations, orders, or historical inspections.
+    Adopting newly published scenario rates requires an explicit new/recomputed plan.
+    """
+    if not plan.settlement_tariffs and all(
+        row.basis == "operational" and row.air_cost is not None for row in plan.settlements
+    ):
+        return plan
+    route_costs = {row.lot_id: row.route for row in plan.lot_collections}
+    return resettle_plan(scenario, plan, route_costs)

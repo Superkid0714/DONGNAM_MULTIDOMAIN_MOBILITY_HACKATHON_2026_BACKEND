@@ -169,6 +169,39 @@ def build_preview(
     except IntakeError as exc:
         raise intake_error(exc) from exc
     estimate = estimate_savings(scenario, preview.lot, plan, preview.hints)
+    if (
+        estimate is not None
+        and estimate.mode == "sea"
+        and preview.lot.product_id == "strawberry"
+        and preview.lot.destination == "HKHKG"
+    ):
+        from freshswitch_backend.planning.robust.display import NOTICE, display_lot_amounts
+
+        option = next(
+            (o for o in preview.hints.sea_options if o.container_id == estimate.container_id), None
+        )
+        values = display_lot_amounts(
+            scenario,
+            preview.lot,
+            estimate.container_id,
+            estimate.assumed_container_pallets or preview.lot.pallets,
+            option.pull_forward_days if option else 0,
+        )
+        if values is not None:
+            air, sea = values
+            savings = air - sea
+            fee = round(max(0, savings) * scenario.cost_params.platform_fee_rate.value)
+            estimate = estimate.model_copy(
+                update={
+                    "baseline_cost": air,
+                    "shared_cost": sea,
+                    "savings": savings,
+                    "savings_per_pallet": round(savings / preview.lot.pallets),
+                    "fee": fee,
+                    "shipper_gain": savings - fee,
+                    "assumptions": [*estimate.assumptions, NOTICE],
+                }
+            )
     loss = lot_expected_loss(
         scenario, preview.lot.product_id, preview.lot.destination, learning_scope(scope.org_id)
     )

@@ -8,6 +8,7 @@ from freshswitch_backend.api import (
     coldchain,
     compare,
     demo,
+    evidence_quote,
     forecast,
     health,
     intake,
@@ -15,6 +16,7 @@ from freshswitch_backend.api import (
     lots,
     me,
     ops,
+    operational_quotes,
     orgs,
     plans,
     provenance,
@@ -40,14 +42,17 @@ from freshswitch_backend.api import (
     vessels,
 )
 from freshswitch_backend.api.saas_roles import platform_operational_guard
+from freshswitch_backend.planning.robust.api import router as robust_router
 
 DEMO_ROUTERS = (
+    robust_router,
     health.router,
     scenarios.router,
     plans.router,
     forecast.router,
     vessels.router,
     compare.router,
+    evidence_quote.router,
     demo.router,
     analysis.router,
     intake.router,
@@ -80,6 +85,7 @@ SAAS_ROUTERS = (
     saas_quantity_policy.router,
     showcase.router,
     ops.router,
+    operational_quotes.router,
 )
 
 SAAS_ONLY_ENDPOINTS = frozenset(

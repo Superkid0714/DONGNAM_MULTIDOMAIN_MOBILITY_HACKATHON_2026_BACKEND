@@ -1122,7 +1122,9 @@ class SessionStore:
         auto_accept: bool = False,
         quantity_policy_v1: bool = False,
     ) -> PlanSession:
-        working = scenario.model_copy(deep=True)
+        from freshswitch_backend.forecast.quote import prepare_quote_scenario
+
+        working = prepare_quote_scenario(scenario.model_copy(deep=True))
         built = build_plan(working)
         now = self.clock()
         session = PlanSession(

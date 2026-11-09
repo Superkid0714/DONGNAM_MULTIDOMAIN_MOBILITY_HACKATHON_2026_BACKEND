@@ -39,6 +39,7 @@ from freshswitch_backend.persistence.tables import (
     PlanForwarderRow,
     QuantityPolicyRow,
 )
+from freshswitch_backend.planning.robust.display import display_session
 from freshswitch_backend.planning.store import PlanConfirmationState, PlanSession
 from freshswitch_backend.replan.models import (
     AddLotEvent,
@@ -226,6 +227,13 @@ class PlatformShipperShare(BaseModel):
     shipper_org_name: str | None
     saving_krw: int
     fee_krw: int
+    air_cost: int | None = None
+    sea_solo_cost: int | None = None
+    shared_cost: int | None = None
+    fee: int = 0
+    shipper_net_saving: int | None = None
+    savings_vs_air_pct: float | None = None
+    savings_vs_solo_pct: float | None = None
     billing_rule: SettlementBillingRule = "performance"
     performance_fee_krw: int = Field(
         default=0,
@@ -471,6 +479,7 @@ def replan_pending(state: PlanConfirmationState | None, own_shipper_ids: Iterabl
 def shipper_settlements(
     session: PlanSession, shipper_ids: Iterable[str]
 ) -> list[ShipperSettlementRow]:
+    session = display_session(session)
     own = set(shipper_ids)
     vessel, departure = _own_voyage(
         session, (a for a in session.plan.assignments if a.shipper_id in own)
@@ -483,14 +492,15 @@ def shipper_settlements(
             vessel=vessel,
             departure=departure,
         )
-        for row in adjusted_settlements(session.plan, session.arrival_inspections)
+        for row in adjusted_settlements(session.plan, session.arrival_inspections, session.scenario)
         if row.shipper_id in own
     ]
 
 
 def platform_settlement(session: PlanSession, org_names: dict[str, str]) -> PlatformSettlement:
+    session = display_session(session)
     vessel, departure = _first_voyage(session)
-    rows = adjusted_settlements(session.plan, session.arrival_inspections)
+    rows = adjusted_settlements(session.plan, session.arrival_inspections, session.scenario)
     return PlatformSettlement(
         plan_id=session.plan_id,
         vessel=vessel,
@@ -508,6 +518,13 @@ def platform_settlement(session: PlanSession, org_names: dict[str, str]) -> Plat
                 shipper_org_name=org_names.get(r.shipper_id),
                 saving_krw=r.savings,
                 fee_krw=r.fee,
+                air_cost=r.air_cost,
+                sea_solo_cost=r.sea_solo_cost,
+                shared_cost=r.shared_cost,
+                fee=r.fee,
+                shipper_net_saving=r.shipper_net_saving,
+                savings_vs_air_pct=r.savings_vs_air_pct,
+                savings_vs_solo_pct=r.savings_vs_solo_pct,
                 billing_rule=r.billing_rule,
                 performance_fee_krw=r.performance_fee,
                 usage_fee_krw=r.usage_fee,

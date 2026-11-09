@@ -202,7 +202,9 @@ def _regions(sessions: list[PlanSession]) -> list[RegionMetrics]:
         regions = _shipper_regions(session.scenario)
         savings = {
             r.shipper_id: r.savings
-            for r in adjusted_settlements(session.plan, session.arrival_inspections)
+            for r in adjusted_settlements(
+                session.plan, session.arrival_inspections, session.scenario
+            )
         }
         for shipper_id in _participants(session.plan):
             row = acc.setdefault(
@@ -299,7 +301,9 @@ def platform_metrics(principal: PlatformPrincipal, month: MonthQuery = None) -> 
     target = _month(month)
     every = org_sessions(principal)
     sessions = [s for s in every if plan_month(s) == target]
-    rows = [r for s in sessions for r in adjusted_settlements(s.plan, s.arrival_inspections)]
+    rows = [
+        r for s in sessions for r in adjusted_settlements(s.plan, s.arrival_inspections, s.scenario)
+    ]
     assignments = [a for s in sessions for a in s.plan.assignments]
     emissions = avoided_emissions((s.scenario, s.plan) for s in sessions)
     statuses = _order_statuses([s.plan_id for s in sessions])
@@ -354,7 +358,8 @@ def _empty_slot_definition(total: int, tariff: int) -> str:
 
 def _refunded(session: PlanSession) -> Plan:
     fees = {
-        r.shipper_id: r.fee for r in adjusted_settlements(session.plan, session.arrival_inspections)
+        r.shipper_id: r.fee
+        for r in adjusted_settlements(session.plan, session.arrival_inspections, session.scenario)
     }
     return session.plan.model_copy(
         update={
