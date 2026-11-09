@@ -68,13 +68,14 @@ def solve_plan(
     time_limit_s: float = 5.0,
     num_workers: int = 1,
     random_seed: int = 0,
+    compute_solo: bool = True,
 ) -> Plan:
     started = time.perf_counter()
     fixed = dict(fixed or {})
     forbidden_set = set(forbidden or ())
     forbidden_reasons = dict(forbidden_reasons or {})
     excluded = set(exclude_lot_ids or ())
-    model = CostModel(scenario)
+    model = CostModel(scenario, compute_solo=compute_solo)
     lots = [lot for lot in scenario.lots if lot.id not in excluded]
     lot_by_id = {lot.id: lot for lot in lots}
     containers = scenario.containers
@@ -132,7 +133,6 @@ def solve_plan(
         objective.append(fixed_cost[container.id] * z[container.id])
 
     variable_cost: dict[tuple[str, str], int] = {}
-    tariff_margin: dict[tuple[str, str], int] = {}
     air_cost: dict[str, int] = {}
     n = len(lots)
     container_index = {c.id: i for i, c in enumerate(containers)}
@@ -145,9 +145,6 @@ def solve_plan(
             voyage = model.voyage_of(model.containers[cid])
             cost = round(model.sea_lot_cost(lot, voyage, option.pull_forward_days).total)
             variable_cost[lot.id, cid] = cost
-            if model.tariff(lot) is not None:
-                sea = model.tariff_sea_cost(lot, voyage, option.pull_forward_days).total
-                tariff_margin[lot.id, cid] = round(model.tariff_air_cost(lot).total - sea)
             objective.append(cost * var)
             tie_break.append(container_index[cid] * (n - l_idx) * var)
             cp.add_implication(var, z[cid])
@@ -168,6 +165,15 @@ def solve_plan(
                 raise ValueError(f"{lot.id}를 {target}에 고정할 수 없음")
             cp.add(x[lot.id, target] == 1)
 
+    # Charge a shipper once if any of its lots uses sea, including multi-container plans.
+    if model.sea_shipper_fixed_cost:
+        for sid in sorted({lot.shipper_id for lot in lots}):
+            variables = [var for (lid, _), var in x.items() if lot_by_id[lid].shipper_id == sid]
+            if variables:
+                active = cp.new_bool_var(f"sea_shipper[{sid}]")
+                cp.add_max_equality(active, variables)
+                objective.append(round(model.sea_shipper_fixed_cost) * active)
+
     for container in containers:
         cid = container.id
         members = [(lot, x[lot.id, cid]) for lot in lots if (lot.id, cid) in x]
@@ -187,12 +193,9 @@ def solve_plan(
             for b in product_ids[i + 1 :]:
                 if not products_compatible(model.products[a], model.products[b]):
                     cp.add(has[a] + has[b] <= 1)
-        for lot, var in members:
-            if lot.id not in fixed and tariff_margin.get((lot.id, cid), 1) <= 0:
-                cp.add(var == 0)
         if require_savings:
             for lot, var in members:
-                if lot.id in fixed or (lot.id, cid) in tariff_margin:
+                if lot.id in fixed:
                     continue
                 margin = air_cost[lot.id] - variable_cost[lot.id, cid]
                 if margin <= 0:

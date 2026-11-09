@@ -14,7 +14,7 @@ from freshswitch_backend.quality.params import QualityParams
 MODES = ("sea", "air")
 METHOD = (
     "칸(품목·목적항·운송수단)마다 사후 손실률 = (사전 가중 w × 사전 손실률 + Σ 파렛트 × 보정 실측) "
-    "÷ (w + Σ 파렛트). 보정 실측 = 실측 손실률 − 대기·당김 효과(같은 조건의 사전 모델 손실률 − 사전 "
+    "÷ (w + Σ 파렛트). 보정 실측 = 실측 손실률 − 무전원 시간·조기출하 효과(같은 조건의 사전 모델 손실률 − 사전 "
     "기본 손실률). 범위는 사후값 ± z × 표준오차, 표준오차는 사전(상대 표준편차 가정)과 관측의 파렛트 가중 분산을 (건수 + 1)로 나눈 근사. 단전 구간·혼적 구분은 분포로만 보여주고 "
     "추천에는 칸 전체 평균을 쓴다"
 )
@@ -48,23 +48,34 @@ def prior_rate(scenario: Scenario, product_id: str, mode: str) -> tuple[float, s
 
 
 def prior_model_rate(
-    scenario: Scenario, product_id: str, mode: str, wait_days: int, pull_forward_days: int = 0
+    scenario: Scenario,
+    product_id: str,
+    mode: str,
+    wait_days: int,
+    pull_forward_days: int = 0,
+    outage_hours: float = 0,
 ) -> float:
     pc = scenario.cost_params.for_product(product_id)
     if mode == "air":
         return pc.air_loss_rate.value
-    rate = min(
-        pc.max_sea_loss_rate.value,
-        pc.sea_base_loss_rate.value + pc.loss_rate_per_wait_day.value * wait_days,
-    )
-    return rate + pc.early_harvest_loss_rate_per_day.value * pull_forward_days
+    base, maximum = pc.sea_base_loss_rate.value, pc.max_sea_loss_rate.value
+    rate = base + min(max(outage_hours, 0) / 5.5, 1) * (maximum - base)
+    return min(maximum, max(0, rate + pc.early_harvest_loss_rate_per_day.value * pull_forward_days))
 
 
 def condition_uplift(
-    scenario: Scenario, product_id: str, mode: str, wait_days: int, pull_forward_days: int = 0
+    scenario: Scenario,
+    product_id: str,
+    mode: str,
+    wait_days: int,
+    pull_forward_days: int = 0,
+    outage_hours: float = 0,
 ) -> float:
     base, _ = prior_rate(scenario, product_id, mode)
-    return prior_model_rate(scenario, product_id, mode, wait_days, pull_forward_days) - base
+    return (
+        prior_model_rate(scenario, product_id, mode, wait_days, pull_forward_days, outage_hours)
+        - base
+    )
 
 
 def _weighted(observations: list[Observation], value: Callable[[Observation], float]) -> float:

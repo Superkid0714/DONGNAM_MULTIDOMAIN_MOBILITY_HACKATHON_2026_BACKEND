@@ -42,6 +42,9 @@ class VoyageDelay(BaseModel):
     voyage_id: str
     new_etd: KstDatetime
     new_cy_cutoff: KstDatetime | None = None
+    delay_p90_h: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    delay_forecast_source: Literal["model", "stat", "provided"] | None = None
+    truck_departure_adjustment_h: float | None = Field(default=None, ge=0, allow_inf_nan=False)
 
 
 class DelayEvent(BaseModel):
@@ -49,6 +52,9 @@ class DelayEvent(BaseModel):
     voyage_id: str
     new_etd: KstDatetime
     new_cy_cutoff: KstDatetime | None = None
+    delay_p90_h: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    delay_forecast_source: Literal["model", "stat", "provided"] | None = None
+    truck_departure_adjustment_h: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     additional_voyages: list[VoyageDelay] = Field(default_factory=list, exclude_if=_empty)
     source: Literal["manual", "해수부", "예측"] = "manual"
     occurred_at: KstDatetime | None = Field(default=None, exclude_if=_unset)
@@ -66,7 +72,12 @@ class DelayEvent(BaseModel):
 
     def delays(self) -> list[VoyageDelay]:
         first = VoyageDelay(
-            voyage_id=self.voyage_id, new_etd=self.new_etd, new_cy_cutoff=self.new_cy_cutoff
+            voyage_id=self.voyage_id,
+            new_etd=self.new_etd,
+            new_cy_cutoff=self.new_cy_cutoff,
+            delay_p90_h=self.delay_p90_h,
+            delay_forecast_source=self.delay_forecast_source,
+            truck_departure_adjustment_h=self.truck_departure_adjustment_h,
         )
         return [first, *self.additional_voyages]
 

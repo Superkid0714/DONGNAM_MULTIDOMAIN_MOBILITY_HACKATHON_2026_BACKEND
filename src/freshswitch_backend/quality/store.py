@@ -193,11 +193,16 @@ class QualityHistory:
     ) -> Observation:
         if body.product_id not in {p.id for p in scenario.products}:
             raise QualityInputError(f"시나리오에 없는 품목입니다: {body.product_id}")
-        uplift = condition_uplift(scenario, body.product_id, body.mode, body.wait_days)
+        hours = (body.outage_minutes or 0) / 60
+        uplift = condition_uplift(
+            scenario, body.product_id, body.mode, body.wait_days, outage_hours=hours
+        )
         planned = (
             body.planned_loss_pct / 100
             if body.planned_loss_pct is not None
-            else prior_model_rate(scenario, body.product_id, body.mode, body.wait_days)
+            else prior_model_rate(
+                scenario, body.product_id, body.mode, body.wait_days, outage_hours=hours
+            )
         )
         actual = body.actual_loss_pct / 100
         return Observation(

@@ -47,7 +47,11 @@ class LotCost:
 
 
 class CostModel:
-    def __init__(self, scenario: Scenario) -> None:
+    def __init__(self, scenario: Scenario, *, compute_solo: bool = True) -> None:
+        from freshswitch_backend.forecast.quote import prepare_quote_scenario
+
+        scenario = prepare_quote_scenario(scenario)
+        self.compute_solo = compute_solo
         self.scenario = scenario
         self.params = scenario.cost_params
         self.products: dict[str, Product] = {p.id: p for p in scenario.products}
@@ -77,7 +81,10 @@ class CostModel:
 
     def container_plug_cost(self, container: Container) -> float:
         per_day = self.params.terminal_reefer_plug_per_container_day.value
-        return per_day * self.terminal_extra_days(self.voyage_of(container))
+        voyage = self.voyage_of(container)
+        if voyage.etd.month in (3, 4, 5):
+            per_day *= 1.2
+        return per_day * self.terminal_extra_days(voyage)
 
     def container_total_fixed_cost(self, container: Container) -> float:
         return self.container_fixed_cost + self.container_plug_cost(container)
@@ -108,6 +115,21 @@ class CostModel:
         p = self.params
         return p.air_freight_per_kg_krw.value + p.air_fuel_surcharge_per_kg_krw.value
 
+    def air_rate_for(self, lot: Lot) -> float:
+        monthly = self.params.air_fuel_surcharge_by_month.get(lot.ready_date.strftime("%Y-%m"))
+        surcharge = monthly or self.params.air_fuel_surcharge_per_kg_krw
+        return self.params.air_freight_per_kg_krw.value + surcharge.value
+
+    def terminal_unpowered_hours(self, voyage: Voyage) -> float:
+        resolved = self.voyages[voyage.id]
+        return max(0.0, (resolved.delay_p90_h or 0.0) - resolved.truck_departure_adjustment_h)
+
+    def remaining_sell_days(self, lot: Lot, voyage: Voyage) -> int:
+        resolved = self.voyages[voyage.id]
+        base = resolved.original_etd or resolved.etd
+        predicted = max(resolved.etd, base + timedelta(hours=resolved.delay_p90_h or 0.0))
+        return (lot.sell_by_date - (predicted + timedelta(days=resolved.transit_days)).date()).days
+
     def air_lead_days(self) -> int:
         return math.ceil(self.params.air_storage_days.value + self.params.air_transit_days.value)
 
@@ -135,16 +157,13 @@ class CostModel:
 
     def sea_loss_rate(self, lot: Lot, voyage: Voyage, pull_forward_days: int = 0) -> float:
         pc = self.params.for_product(lot.product_id)
-        wait = self.sea_wait_days(lot, voyage, pull_forward_days)
-        rate = min(
-            pc.max_sea_loss_rate.value,
-            pc.sea_base_loss_rate.value + pc.loss_rate_per_wait_day.value * wait,
-        )
+        h = self.terminal_unpowered_hours(voyage)
+        base = pc.sea_base_loss_rate.value
+        maximum = pc.max_sea_loss_rate.value
+        rate = base + min(h / 5.5, 1.0) * (maximum - base)
         rate += pc.early_harvest_loss_rate_per_day.value * pull_forward_days
         delta = self.params.loss_delta(lot.product_id, lot.destination, "sea")
-        if delta:
-            rate = min(1.0, max(0.0, rate + delta))
-        return rate
+        return min(maximum, max(0.0, rate + delta))
 
     def air_loss_rate(self, lot: Lot) -> float:
         rate = self.params.for_product(lot.product_id).air_loss_rate.value
@@ -157,15 +176,24 @@ class CostModel:
         wait = self.sea_wait_days(lot, voyage, pull_forward_days)
         rate = self.sea_loss_rate(lot, voyage, pull_forward_days)
         return LotCost(
-            collection=lot.pallets * self._trucking_per_pallet(self.collection_km(lot, voyage)),
+            handling=lot.pallets * self.params.sea_cfs_per_pallet_krw.value,
+            collection=0
+            if self.params.sea_fixed_pickup
+            else lot.pallets * self._trucking_per_pallet(self.collection_km(lot, voyage)),
             storage=lot.pallets * wait * self.params.storage_per_pallet_day_krw.value,
             loss_risk=self.lot_value(lot) * rate,
+        )
+
+    @property
+    def sea_shipper_fixed_cost(self) -> float:
+        return self.params.sea_shipper_document_krw.value + (
+            self.params.sea_shipper_pickup_krw.value if self.params.sea_fixed_pickup else 0
         )
 
     def air_lot_cost(self, lot: Lot) -> LotCost:
         p = self.params
         return LotCost(
-            freight=self.lot_kg(lot) * self.air_rate_per_kg,
+            freight=self.lot_kg(lot) * self.air_rate_for(lot),
             collection=lot.pallets * self._trucking_per_pallet(p.air_trucking_km.value),
             storage=lot.pallets * p.air_storage_days.value * p.storage_per_pallet_day_krw.value,
             loss_risk=self.lot_value(lot) * self.air_loss_rate(lot),
@@ -175,7 +203,8 @@ class CostModel:
         return lot.pallets * self.params.unassigned_penalty_per_pallet_krw.value
 
     def tariff(self, lot: Lot) -> PalletTariff | None:
-        return self.params.pallet_tariffs.get(lot.product_id)
+        # Retained JSON tariff sheets are historical comparison data only.
+        return None
 
     def value_per_pallet(self, lot: Lot) -> float:
         rate = self.params.for_product(lot.product_id).value_per_kg_krw.value
@@ -188,35 +217,5 @@ class CostModel:
         now = self.sea_wait_days(lot, voyage, pull_forward_days)
         return max(0, now - self.sea_wait_days(lot, planned, pull_forward_days))
 
-    def tariff_air_cost(self, lot: Lot) -> LotCost:
-        t = self.tariff(lot)
-        n = lot.pallets
-        kg = self.product(lot).net_pallet_kg
-        freight = t.air_freight.value + (self.air_rate_per_kg - t.air_rate_basis_per_kg.value) * kg
-        delta = self.params.loss_delta(lot.product_id, lot.destination, "air")
-        loss = n * t.air_loss_risk.value + self.lot_value(lot) * delta
-        return LotCost(freight=n * freight, inland=n * t.air_inland.value, loss_risk=max(0.0, loss))
-
-    def tariff_sea_cost(
-        self, lot: Lot, voyage: Voyage, pull_forward_days: int = 0, plug_share: float = 0.0
-    ) -> LotCost:
-        t = self.tariff(lot)
-        n = lot.pallets
-        pc = self.params.for_product(lot.product_id)
-        extra_wait = self.delay_wait_days(lot, voyage, pull_forward_days)
-        base = t.sea_loss_risk_short_window if lot.sell_window == "short" else t.sea_loss_risk
-        extra_rate = (
-            pc.loss_rate_per_wait_day.value * extra_wait
-            + pc.early_harvest_loss_rate_per_day.value * pull_forward_days
-            + self.params.loss_delta(lot.product_id, lot.destination, "sea")
-        )
-        loss = n * base.value + self.lot_value(lot) * extra_rate
-        storage = n * extra_wait * self.params.storage_per_pallet_day_krw.value
-        return LotCost(
-            freight=n * t.sea_freight.value,
-            inland=n * t.sea_inland.value + storage + plug_share,
-            loss_risk=max(0.0, loss),
-        )
-
     def settle_air_cost(self, lot: Lot) -> LotCost:
-        return self.tariff_air_cost(lot) if self.tariff(lot) else self.air_lot_cost(lot)
+        return self.air_lot_cost(lot)

@@ -235,6 +235,13 @@ def _delay_voyage(scenario: Scenario, delay: VoyageDelay) -> Scenario:
             "cy_cutoff": cutoff,
             "original_etd": base_etd,
             "original_cy_cutoff": original_cutoff,
+            "delay_p90_h": delay.delay_p90_h
+            if delay.delay_p90_h is not None
+            else max(0, (new_etd - base_etd).total_seconds() / 3600),
+            "delay_forecast_source": delay.delay_forecast_source or "provided",
+            "truck_departure_adjustment_h": delay.truck_departure_adjustment_h
+            if delay.truck_departure_adjustment_h is not None
+            else voyage.truck_departure_adjustment_h,
         }
     )
     return scenario.model_copy(
@@ -274,16 +281,7 @@ def apply_event(scenario: Scenario, event: Event) -> Scenario:
             reason = air_rejection(model, lots[lot_id])
             if reason:
                 raise ReplanError(f"항공 전환 불가: {lot_id} {reason}")
-            if model.tariff(lots[lot_id]) is None:
-                return scenario
-            return scenario.model_copy(
-                update={
-                    "lots": [
-                        lot.model_copy(update={"sell_window": "short"}) if lot.id == lot_id else lot
-                        for lot in scenario.lots
-                    ]
-                }
-            )
+            return scenario
         case DelayEvent():
             for delay in event.delays():
                 scenario = _delay_voyage(scenario, delay)
@@ -314,7 +312,7 @@ def locks_air(scenario: Scenario, event: Event) -> bool:
     if not isinstance(event, AirSwitchEvent):
         return False
     lot = next((x for x in scenario.lots if x.id == event.lot_id), None)
-    return lot is not None and CostModel(scenario).tariff(lot) is None
+    return lot is not None
 
 
 def plan_score(plan: Plan) -> int:

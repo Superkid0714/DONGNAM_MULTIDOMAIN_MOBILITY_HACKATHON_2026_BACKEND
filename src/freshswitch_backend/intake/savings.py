@@ -37,11 +37,10 @@ def _load(model: CostModel, option: SeaHint, lot: Lot, plan: Plan | None) -> tup
             f"{option.container_id}에 이미 실린 {loaded}파렛트와 함께 적재"
             f"({load}/{capacity}파렛트)한다고 계산"
         )
-    load = max(lot.pallets, round(capacity * TARGET_UTILIZATION))
+    load = lot.pallets
     return load, (
-        f"공동적재로 {option.container_id}가 목표 적재율 {TARGET_UTILIZATION:.0%}"
-        f"({load}/{capacity}파렛트)까지 찬다고 가정. 실제 계획에서 그만큼 차지 않으면 "
-        "이 출하가 항공으로 배정될 수 있습니다(plan_id를 주면 실제 적재로 계산)"
+        f"합승 실적재량 미확정: 요청 물량 {load}/{capacity}파렛트만으로 계산. "
+        "계획이 확정되면 실제 적재량과 집하 경로로 재견적"
     )
 
 

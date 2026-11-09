@@ -103,6 +103,9 @@ class Voyage(Sourced):
     original_etd: KstDatetime | None = None
     original_cy_cutoff: KstDatetime | None = Field(default=None, exclude_if=lambda v: v is None)
     call_sign: str | None = None
+    delay_p90_h: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    delay_forecast_source: Literal["model", "stat", "provided"] | None = None
+    truck_departure_adjustment_h: float = Field(default=0, ge=0, allow_inf_nan=False)
 
 
 class Container(Sourced):
@@ -147,7 +150,9 @@ def _default_product_cost() -> ProductCostParams:
         value_per_kg_krw=_q(18000, "원/kg"),
         sea_base_loss_rate=_q(0.015, "비율"),
         loss_rate_per_wait_day=_q(0.009, "비율/일"),
-        max_sea_loss_rate=_q(0.08, "비율"),
+        max_sea_loss_rate=_q(
+            0.07, "비율", "JLST 2025 단전 손실6~8%의 중앙값7%; 시간 보간·상한 가정"
+        ),
         early_harvest_loss_rate_per_day=_q(0.02, "비율/일"),
         air_loss_rate=_q(0.01, "비율"),
     )
@@ -168,7 +173,7 @@ class PalletTariff(BaseModel):
     sea_freight: Quantity
     sea_inland: Quantity
     sea_loss_risk: Quantity
-    sea_loss_risk_short_window: Quantity
+    sea_loss_risk_short_window: Quantity | None = None
     air_rate_basis_per_kg: Quantity
 
 
@@ -195,10 +200,23 @@ class BillingParams(BaseModel):
 
 
 class CostParams(BaseModel):
-    sea_freight_per_container_krw: Quantity = _q(4_560_000, "원/컨테이너")
-    sea_ancillary_per_container_krw: Quantity = _q(4_500_000, "원/컨테이너")
+    sea_shipper_document_krw: Quantity = Field(default_factory=lambda: _q(0, "원/화주"))
+    sea_shipper_pickup_krw: Quantity = Field(default_factory=lambda: _q(0, "원/화주"))
+    sea_cfs_per_pallet_krw: Quantity = Field(default_factory=lambda: _q(0, "원/파렛트"))
+    sea_fixed_pickup: bool = False
+    sea_freight_per_container_krw: Quantity = _q(
+        3_320_000,
+        "원/컨테이너",
+        "원예원 CA 해상 400,000원/t × 0.415t × 20P (이데일리 2024.5 보도 참고)",
+    )
+    sea_ancillary_per_container_krw: Quantity = _q(
+        8_422_256,
+        "원/컨테이너",
+        "보정 가정: 20 × 0.7 × (1681+470) × 415 - 3320000 - 기준 집하비 755054 = 8422256원. 기준 경로 진주8P·산청6P·밀양6P, 손실·보관 제외. 70%는 요청된 보정 목표이며 실견적 아님",
+    )
     air_freight_per_kg_krw: Quantity = _q(1681, "원/kg")
     air_fuel_surcharge_per_kg_krw: Quantity = _q(470, "원/kg")
+    air_fuel_surcharge_by_month: dict[str, Quantity] = Field(default_factory=dict)
     reefer_truck_cost_per_km_krw: Quantity = _q(2000, "원/km")
     reefer_truck_fixed_per_route_krw: Quantity = _q(0, "원/대")
     truck_capacity_pallets: Quantity = _q(16, "파렛트")
@@ -344,7 +362,26 @@ def backfill_fee_split[T: "Settlement | ContainerShipperSettlement"](row: T) -> 
     return row
 
 
-class Settlement(BaseModel):
+class QuoteDelayInput(BaseModel):
+    voyage_id: str
+    delay_p90_h: float
+    truck_departure_adjustment_h: float
+    unpowered_h: float
+    source: str
+
+
+class QuoteAmounts(BaseModel):
+    air_cost: int | None = None
+    sea_solo_cost: int | None = None
+    shipper_net_saving: int | None = None
+    savings_vs_air_pct: float | None = None
+    savings_vs_solo_pct: float | None = None
+    air_switch_candidate: bool = False
+    quote_assumptions: list[str] = Field(default_factory=list)
+    delay_inputs: list[QuoteDelayInput] = Field(default_factory=list)
+
+
+class Settlement(QuoteAmounts):
     shipper_id: str
     baseline_cost: int
     shared_cost: int
@@ -365,7 +402,7 @@ class Settlement(BaseModel):
     _legacy_fee_split = model_validator(mode="after")(backfill_fee_split)
 
 
-class ContainerShipperSettlement(BaseModel):
+class ContainerShipperSettlement(QuoteAmounts):
     shipper_id: str
     pallets: int
     baseline_cost: int

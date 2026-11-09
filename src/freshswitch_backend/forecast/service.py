@@ -58,7 +58,7 @@ class ForecastOptions(BaseModel):
     weather: WeatherOption = "normal"
     congestion: CongestionOption = "auto"
     quantile: Quantile = "p90"
-    min_sell_days: int = Field(default=0, ge=0, le=14)
+    min_sell_days: int = Field(default=1, ge=0, le=14)
     preset: Preset | None = None
 
     def resolved(self) -> "ForecastOptions":
@@ -468,8 +468,16 @@ def delay_event(forecasts: list[VoyageForecast], skip: Collection[str] = ()) -> 
     return DelayEvent(
         voyage_id=worst.voyage_id,
         new_etd=worst.predicted_etd,
+        delay_p90_h=max(0, worst.delay_p90_h),
+        delay_forecast_source=worst.source,
         additional_voyages=[
-            VoyageDelay(voyage_id=f.voyage_id, new_etd=f.predicted_etd) for f in others
+            VoyageDelay(
+                voyage_id=f.voyage_id,
+                new_etd=f.predicted_etd,
+                delay_p90_h=max(0, f.delay_p90_h),
+                delay_forecast_source=f.source,
+            )
+            for f in others
         ],
         source="예측",
     )

@@ -8,13 +8,10 @@ from freshswitch_backend.optimize.costs import CostModel
 from freshswitch_backend.optimize.settlement import lot_settle_cost
 
 RULE = (
-    "실제 손실률이 계획 손실 가정을 넘으면 넘은 손실액만큼 그 화주의 성과보수에서 뺀다(하한 0). "
-    "환급 한도는 그 화주가 낸 성과보수 전액, 넘는 손실은 적하보험 영역"
+    "실제 손실률이 계획 손실 가정을 넘으면 초과 손실액을 그 화주의 총수수료에서 뺀다(하한 0). "
+    "환급 한도는 성과보수와 이용료를 합친 총수수료 전액이며, 초과 손실의 보상은 별도 보험 조건에 따른다"
 )
-SOURCE = (
-    "제안서 라(정산): 실제 손실이 예측을 넘으면 넘은 만큼만 성과보수에서 빼고(하한 0), "
-    "큰 손실은 적하보험이 맡는다"
-)
+SOURCE = "운영 정산 규칙: 초과 손실액을 성과보수·이용료를 합친 총수수료 한도에서 차감한다"
 
 
 class ArrivalRequest(BaseModel):
@@ -96,17 +93,43 @@ def _refund(fee: int, inspections: list[ArrivalInspection], shipper_id: str) -> 
 
 def adjusted(settlement: Settlement, refund: int) -> QualitySettlement:
     return QualitySettlement(
-        **settlement.model_dump(exclude={"fee", "shipper_gain"}),
+        **settlement.model_dump(
+            exclude={
+                "fee",
+                "shipper_gain",
+                "shipper_net_saving",
+                "savings_vs_air_pct",
+                "savings_vs_solo_pct",
+            }
+        ),
         fee=settlement.fee - refund,
         shipper_gain=settlement.shipper_gain + refund,
+        shipper_net_saving=settlement.shipper_gain + refund,
+        savings_vs_air_pct=round(
+            (settlement.shipper_gain + refund) / settlement.baseline_cost * 100, 2
+        )
+        if settlement.baseline_cost
+        else None,
+        savings_vs_solo_pct=round(
+            (settlement.sea_solo_cost - settlement.shared_cost - settlement.fee + refund)
+            / settlement.sea_solo_cost
+            * 100,
+            2,
+        )
+        if settlement.sea_solo_cost
+        else None,
         fee_before_refund=settlement.fee,
         quality_refund=refund,
     )
 
 
 def adjusted_settlements(
-    plan: Plan, inspections: list[ArrivalInspection]
+    plan: Plan, inspections: list[ArrivalInspection], scenario: Scenario | None = None
 ) -> list[QualitySettlement]:
+    if scenario is not None:
+        from freshswitch_backend.planning.service import operational_quote_plan
+
+        plan = operational_quote_plan(scenario, plan)
     inspections = current_inspections(plan, inspections)
     return [adjusted(s, _refund(s.fee, inspections, s.shipper_id)[0]) for s in plan.settlements]
 
@@ -119,6 +142,9 @@ def arrival_settlement(
     body: ArrivalRequest,
     now: datetime,
 ) -> tuple[ArrivalSettlementResult, list[ArrivalInspection]]:
+    from freshswitch_backend.planning.service import operational_quote_plan
+
+    plan = operational_quote_plan(scenario, plan)
     rate, value, mode, pallets = planned_loss_rate(scenario, plan, body.lot_id)
     lot = next(x for x in scenario.lots if x.id == body.lot_id)
     settlement = next((s for s in plan.settlements if s.shipper_id == lot.shipper_id), None)

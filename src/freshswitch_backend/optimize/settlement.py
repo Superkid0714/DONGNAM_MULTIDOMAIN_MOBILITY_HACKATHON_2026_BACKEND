@@ -22,6 +22,7 @@ from freshswitch_backend.domain.models import (
     TariffSheet,
 )
 from freshswitch_backend.optimize.costs import CostModel, LotCost
+from freshswitch_backend.optimize.solo import quote_amounts, sea_solo_cost
 
 
 def settle(savings: int, fee_rate: float) -> tuple[int, int]:
@@ -33,8 +34,8 @@ def settle(savings: int, fee_rate: float) -> tuple[int, int]:
 
 BASELINE_KINDS: dict[SettlementBillingRule, SettlementBaselineKind] = {
     "performance": "air_solo",
-    "usage_fee": "sea_solo",
-    "mixed": "mixed",
+    "usage_fee": "air_solo",
+    "mixed": "air_solo",
 }
 BASELINE_LABELS: dict[SettlementBaselineKind, str] = {
     "air_solo": "단독 항공 대비",
@@ -109,6 +110,8 @@ def charge(
 ) -> Charge:
     performance_fee, _ = settle(performance_savings, params.platform_fee_rate.value)
     usage = usage_fee(params, usage_pallets)
+    if performance_fee + usage > max(0, savings):
+        performance_fee = usage = 0
     pilot = params.billing.pilot
     fee = 0 if pilot else performance_fee + usage
     kind = BASELINE_KINDS[rule]
@@ -187,10 +190,20 @@ def lot_plan_cost(
     voyage = model.voyage_of(container)
     variable = model.sea_lot_cost(lot, voyage, assignment.pull_forward_days)
     share = lot.pallets / container_pallets[container.id]
+    shipper_load = container_pallets.get(f"shipper:{lot.shipper_id}", lot.pallets)
+    shipper_share = lot.pallets / shipper_load
     return LotCost(
         freight=model.container_freight * share,
-        handling=model.container_handling * share,
-        collection=variable.collection if collection is None else collection,
+        handling=model.container_handling * share
+        + variable.handling
+        + model.params.sea_shipper_document_krw.value * shipper_share,
+        collection=(
+            model.params.sea_shipper_pickup_krw.value * shipper_share
+            if model.params.sea_fixed_pickup
+            else variable.collection
+            if collection is None
+            else collection
+        ),
         storage=variable.storage + model.container_plug_cost(container) * share,
         loss_risk=variable.loss_risk,
     )
@@ -203,18 +216,7 @@ def lot_settle_cost(
     container_pallets: dict[str, int],
     collection: float | None = None,
 ) -> LotCost:
-    if model.tariff(lot) is None:
-        return lot_plan_cost(model, lot, assignment, container_pallets, collection)
-    if assignment.mode == "air":
-        return model.tariff_air_cost(lot)
-    container = model.containers[assignment.container_id]
-    share = lot.pallets / container_pallets[container.id]
-    return model.tariff_sea_cost(
-        lot,
-        model.voyage_of(container),
-        assignment.pull_forward_days,
-        model.container_plug_cost(container) * share,
-    )
+    return lot_plan_cost(model, lot, assignment, container_pallets, collection)
 
 
 def _basis(kinds: set[bool]) -> SettlementBasis:
@@ -223,6 +225,19 @@ def _basis(kinds: set[bool]) -> SettlementBasis:
     if kinds == {False}:
         return "operational"
     return "mixed"
+
+
+def _fee_parts(total: int, rows: list[ContainerShipperSettlement], field: str) -> list[int]:
+    weights = [getattr(row, field) for row in rows]
+    if not sum(weights):
+        weights = [row.pallets for row in rows]
+    raw = [total * weight / sum(weights) for weight in weights]
+    values = [int(value) for value in raw]
+    for index in sorted(range(len(raw)), key=lambda i: (-(raw[i] - values[i]), i))[
+        : total - sum(values)
+    ]:
+        values[index] += 1
+    return values
 
 
 @dataclass
@@ -270,11 +285,11 @@ def tariff_sheet(model: CostModel, product_id: str, tariff: PalletTariff) -> Tar
     usage = rule == "usage_fee"
     bill = charge(model.params, rule, savings, 0 if usage else savings, 1 if usage else 0)
     fee_rate = 0.0 if usage else model.params.platform_fee_rate.value
-    short = round(tariff.sea_loss_risk_short_window.value)
+    short = round((tariff.sea_loss_risk_short_window or tariff.sea_loss_risk).value)
     short_total = sea_total - lines[2].sea + short
     assumed = [f"air.{line.key}" for line in lines if line.air_assumed]
     assumed += [f"sea.{line.key}" for line in lines if line.sea_assumed]
-    if _assumed(tariff.sea_loss_risk_short_window.source):
+    if tariff.sea_loss_risk_short_window and _assumed(tariff.sea_loss_risk_short_window.source):
         assumed.append("sea.loss_risk_short_window")
     return TariffSheet(
         product_id=product_id,
@@ -312,6 +327,7 @@ def shipper_costs_and_settlements(
     for a in assignments:
         if a.mode == "sea" and a.container_id:
             container_pallets[a.container_id] += a.pallets
+            container_pallets[f"shipper:{a.shipper_id}"] += a.pallets
     plan_acc: dict[str, dict[str, float]] = {}
     base_acc: dict[str, dict[str, float]] = {}
     op_acc: dict[str, dict[str, float]] = {}
@@ -341,7 +357,7 @@ def shipper_costs_and_settlements(
         baseline = model.settle_air_cost(lot)
         _add(plan_acc[sid], settled)
         _add(base_acc[sid], baseline)
-        kinds[sid].add(model.tariff(lot) is not None)
+        kinds[sid].add(False)
         pallets[sid][0 if a.mode == "sea" else 1] += lot.pallets
         rule = billing_rule(params, lot.product_id)
         sea = a.mode == "sea"
@@ -351,7 +367,7 @@ def shipper_costs_and_settlements(
             row[0] += lot.pallets
             row[1] += baseline.total
             row[2] += settled.total
-            row_kinds[(a.container_id, sid)].add(model.tariff(lot) is not None)
+            row_kinds[(a.container_id, sid)].add(False)
             row_billing[(a.container_id, sid)].add(
                 rule, lot.pallets, sea, baseline.total, settled.total
             )
@@ -384,6 +400,14 @@ def shipper_costs_and_settlements(
             )
         )
         savings = baseline.total - plan.total
+        included = [a.lot_id for a in assignments if a.shipper_id == sid]
+        solo = sea_solo_cost(model.scenario, included) if model.compute_solo else None
+        charge_fields = billing[sid].charge(params, savings).fields()
+        risk = any(
+            model.remaining_sell_days(lots[a.lot_id], model.voyages[a.voyage_id]) < 1
+            for a in assignments
+            if a.shipper_id == sid and a.mode == "sea"
+        )
         settlements.append(
             Settlement(
                 shipper_id=sid,
@@ -393,7 +417,33 @@ def shipper_costs_and_settlements(
                 sea_pallets=sea,
                 air_pallets=air,
                 basis=_basis(kinds[sid]),
-                **billing[sid].charge(params, savings).fields(),
+                **charge_fields,
+                **quote_amounts(baseline.total, solo, plan.total, charge_fields["fee"]),
+                air_switch_candidate=risk
+                or (sea > 0 and plan.total + charge_fields["fee"] > baseline.total),
+                delay_inputs=[
+                    {
+                        "voyage_id": voyage.id,
+                        "delay_p90_h": voyage.delay_p90_h or 0,
+                        "truck_departure_adjustment_h": voyage.truck_departure_adjustment_h,
+                        "unpowered_h": model.terminal_unpowered_hours(voyage),
+                        "source": voyage.delay_forecast_source or "provided",
+                    }
+                    for voyage in model.scenario.voyages
+                    if any(
+                        a.shipper_id == sid and a.mode == "sea" and a.voyage_id == voyage.id
+                        for a in assignments
+                    )
+                ],
+                quote_assumptions=[
+                    "운영 원가 기준; 단독 해상은 항공 선택 없이 전용 컨테이너·집하를 재계산",
+                    "무전원 시간은 p90 지연에서 명시된 트럭 출발 조정 시간을 뺀 추정 노출시간이며 실측 단전이 아님",
+                    *(
+                        ["단독 해상은 일정·용량·집하 제약 또는 계산 제한으로 견적 불가"]
+                        if model.compute_solo and solo is None
+                        else []
+                    ),
+                ],
             )
         )
     containers = []
@@ -409,6 +459,12 @@ def shipper_costs_and_settlements(
         for sid, (count, base_total, plan_total) in entries:
             base_cost, shared = round(base_total), round(plan_total)
             bill = row_billing[(container.id, sid)].charge(params, base_cost - shared)
+            included = [
+                a.lot_id
+                for a in assignments
+                if a.container_id == container.id and a.shipper_id == sid
+            ]
+            solo = sea_solo_cost(model.scenario, included) if model.compute_solo else None
             shippers.append(
                 ContainerShipperSettlement(
                     shipper_id=sid,
@@ -418,6 +474,7 @@ def shipper_costs_and_settlements(
                     savings=base_cost - shared,
                     basis=_basis(row_kinds[(container.id, sid)]),
                     **bill.fields(),
+                    **quote_amounts(base_cost, solo, shared, bill.fee),
                 )
             )
         containers.append(
@@ -432,6 +489,31 @@ def shipper_costs_and_settlements(
                 total_shipper_gain=sum(x.shipper_gain for x in shippers),
             )
         )
+    # A shipper may span several containers. Apply the fee cap once per shipper,
+    # then distribute that exact fee so container totals cannot contradict it.
+    for settlement in settlements:
+        rows = [
+            row
+            for container in containers
+            for row in container.shippers
+            if row.shipper_id == settlement.shipper_id
+        ]
+        if not rows:
+            continue
+        performance = _fee_parts(settlement.performance_fee, rows, "performance_fee")
+        usage = _fee_parts(settlement.usage_fee, rows, "usage_fee")
+        for row, perf, use in zip(rows, performance, usage, strict=True):
+            row.performance_fee, row.usage_fee = perf, use
+            row.fee = 0 if settlement.pilot else perf + use
+            row.shipper_gain = row.savings - row.fee
+            row.air_switch_candidate = row.shared_cost + row.fee > row.baseline_cost
+            for key, value in quote_amounts(
+                row.baseline_cost, row.sea_solo_cost, row.shared_cost, row.fee
+            ).items():
+                setattr(row, key, value)
+    for container in containers:
+        container.total_fee = sum(row.fee for row in container.shippers)
+        container.total_shipper_gain = sum(row.shipper_gain for row in container.shippers)
     return SettlementResult(
         costs=costs,
         settlements=settlements,
@@ -440,5 +522,5 @@ def shipper_costs_and_settlements(
         operational_cost=sum(c.operational.total for c in costs),
         collection_estimate=sum(c.operational.collection_estimate or 0 for c in costs),
         collection_route=sum(c.operational.collection for c in costs) if routed else None,
-        tariffs=tariff_sheets(model, model.scenario),
+        tariffs=[],
     )

@@ -44,6 +44,7 @@ class _Solver:
 def with_surcharge(scenario: Scenario, surcharge: float) -> Scenario:
     copy = scenario.model_copy(deep=True)
     copy.cost_params.air_fuel_surcharge_per_kg_krw.value = surcharge
+    copy.cost_params.air_fuel_surcharge_by_month = {}
     return copy
 
 

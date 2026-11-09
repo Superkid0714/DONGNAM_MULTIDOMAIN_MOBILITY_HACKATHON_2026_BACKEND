@@ -156,5 +156,7 @@ def scaled(scenario: Scenario, spec: ParamSpec, factor: float) -> Scenario:
         quantity.value = quantity.value * factor
     for tariff in copy.cost_params.pallet_tariffs.values():
         for name in spec.tariff_fields:
-            getattr(tariff, name).value *= factor
+            quantity = getattr(tariff, name, None)
+            if quantity is not None:
+                quantity.value *= factor
     return copy
