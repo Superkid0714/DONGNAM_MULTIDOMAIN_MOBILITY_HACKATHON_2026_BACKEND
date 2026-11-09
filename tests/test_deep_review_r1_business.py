@@ -31,11 +31,11 @@ def test_settlement3_voyage_breakeven_uses_operational_savings_and_billing_rule(
     assert strawberry.margin_per_pallet == 762_440
     assert strawberry.breakeven_savings_pallets == 11.88
     ops_per_container = DEFAULT_OPS_COST_PER_VOYAGE / 2
-    assert strawberry.breakeven_platform_pallets == round(ops_per_container / 62_250, 2)
+    assert strawberry.breakeven_platform_pallets == round(ops_per_container / 49_800, 2)
     assert strawberry.breakeven_platform_fill > 1
     shared = business(scenario, forwarder_share=0.4)
     assert _containers(shared)["CA-01"].breakeven_platform_pallets == round(
-        ops_per_container / (62_250 * 0.6), 2
+        ops_per_container / (49_800 * 0.6), 2
     )
     grape = _containers(result)["CA-02"]
     assert grape.platform_basis == "usage_fee"
@@ -68,7 +68,7 @@ def test_settlement5_variable_cost_matches_matrix(scenario, variable: int) -> No
     row = next(
         r
         for r in matrix.rows
-        if r.fee_rate == 0.25
+        if r.fee_rate == 0.20
         and r.base_fee_per_pallet == 0
         and r.forwarder_share == 0.4
         and r.fixed_level == "full"
@@ -95,7 +95,7 @@ def test_settlement5_variable_cost_matches_matrix(scenario, variable: int) -> No
 
 def test_settlement5_default_numbers_unchanged(scenario) -> None:
     result = business(scenario)
-    assert result.voyages[0].breakeven_containers == 4.07
+    assert result.voyages[0].breakeven_containers == 4.78
     assert result.season is not None
-    assert result.season.breakeven_pallets == 4788
-    assert [b.breakeven_pallets for b in result.basis] == [2536, 4788]
+    assert result.season.breakeven_pallets == 5359
+    assert [b.breakeven_pallets for b in result.basis] == [2986, 5359]

@@ -187,7 +187,7 @@ _STEPS: list[dict[str, Any]] = [
         "id": "settlement_ca01",
         "title": "CA-01 화주별 정산표",
         "description": "딸기 1파렛트 정산표(항공 96.9만 / 해상 72.0만 원, 절감 24.9만 원)로 CA-01 화주별 "
-        "절감·성과보수 25%·화주 몫 75%를 낸다. 해상 내륙·장비·보관과 품질손실 위험은 가정 표시",
+        "절감·성과보수 20%·화주 몫 80%를 낸다. 해상 내륙·장비·보관과 품질손실 위험은 가정 표시",
         "method": "GET",
         "path": "/api/plans/{plan_id}/settlement",
         "checks": [
@@ -195,14 +195,14 @@ _STEPS: list[dict[str, Any]] = [
             {"path": ".tariffs[0].sea_total", "value": 720000},
             {"path": ".tariffs[0].savings_per_pallet", "value": 249000},
             {"path": ".containers[0].shippers[0].savings", "value": 1992000},
-            {"path": ".containers[0].shippers[1].fee", "value": 311250},
-            {"path": ".containers[0].shippers[2].shipper_gain", "value": 747000},
-            {"path": ".containers[0].total_fee", "value": 1058250},
-            {"path": ".containers[0].total_shipper_gain", "value": 3174750},
+            {"path": ".containers[0].shippers[1].fee", "value": 249000},
+            {"path": ".containers[0].shippers[2].shipper_gain", "value": 796800},
+            {"path": ".containers[0].total_fee", "value": 846600},
+            {"path": ".containers[0].total_shipper_gain", "value": 3386400},
             {"path": ".assumed_items", "op": "contains", "value": "strawberry.sea.inland"},
         ],
         "expect": "진주 8·산청 5·밀양 4 = 17파렛트, 절감 199.2·124.5·99.6만 원(계 423.3만), "
-        "성과보수 49.8·31.1·24.9만 원(계 105.8만), 화주 몫 계 317.5만 원",
+        "성과보수 39.8·24.9·19.9만 원(계 84.7만), 화주 몫 계 338.6만 원",
     },
     {
         "id": "air_switch_short_window",
@@ -562,11 +562,11 @@ _STEPS: list[dict[str, Any]] = [
             {"path": ".planned_loss_rate", "value": 0.02493},
             {"path": ".refund_after", "op": "gt", "value": 0},
             {"path": ".capped", "value": True},
-            {"path": ".refund_after", "value": 132974},
-            {"path": ".uncovered_loss", "value": 316795},
+            {"path": ".refund_after", "value": 106380},
+            {"path": ".uncovered_loss", "value": 343389},
         ],
         "expect": "계획 2.49% 대비 2.01%p 초과 손실 449,769원 중 산청 성과보수 전액 "
-        "132,974원 환급(한도), 나머지 316,795원은 적하보험 영역",
+        "106,380원 환급(한도), 나머지 343,389원은 적하보험 영역",
     },
     {
         "id": "arrival_poor_jinju",

@@ -82,7 +82,7 @@ def test_every_shipper_saves_and_fee_follows_billing_rule(default_plan: Plan) ->
         assert s.savings == s.baseline_cost - s.shared_cost
         assert s.savings > 0
         if s.billing_rule == "performance":
-            assert s.fee == s.performance_fee == round(s.savings * 0.25)
+            assert s.fee == s.performance_fee == round(s.savings * 0.20)
             assert s.usage_fee == 0
         else:
             assert s.fee == s.usage_fee > 0

@@ -64,7 +64,7 @@ FIXED_LEVELS = (
     ),
 )
 BASELINE = {
-    "fee_rate": 0.25,
+    "fee_rate": 0.20,
     "base_fee_per_pallet": 0,
     "forwarder_share": DEFAULT_FORWARDER_SHARE,
     "fixed_level": "full",

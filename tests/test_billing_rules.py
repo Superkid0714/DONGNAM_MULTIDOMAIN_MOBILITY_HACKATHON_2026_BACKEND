@@ -63,7 +63,7 @@ def test_grape_pays_pallet_usage_fee_and_strawberry_keeps_performance_fee() -> N
         assert row.baseline_kind == "air_solo"
         assert row.baseline_label == "단독 항공 대비"
         assert row.usage_fee == 0
-        assert row.performance_fee == round(row.savings * 0.25)
+        assert row.performance_fee == round(row.savings * 0.20)
         assert row.fee == row.performance_fee
     assert all(not s.pilot for s in plan.settlements)
 
@@ -71,7 +71,7 @@ def test_grape_pays_pallet_usage_fee_and_strawberry_keeps_performance_fee() -> N
 def test_expected_container_and_voyage_fees() -> None:
     plan = build_plan(_scenario()).plan
     containers = {c.container_id: c for c in plan.container_settlements}
-    assert containers["CA-01"].total_fee == 1_058_250
+    assert containers["CA-01"].total_fee == 846_600
     assert containers["CA-02"].total_fee == 360_000
     assert [(s.shipper_id, s.fee) for s in containers["CA-02"].shippers] == [
         ("sh-sangju", 260_000),
@@ -79,7 +79,7 @@ def test_expected_container_and_voyage_fees() -> None:
     ]
     assert all(s.billing_rule == "usage_fee" for s in containers["CA-02"].shippers)
     assert all(s.baseline_label == "단독 해상 대비" for s in containers["CA-02"].shippers)
-    assert plan.total_fee == 1_418_250
+    assert plan.total_fee == 1_206_600
     assert plan.total_savings == 10_318_577
 
 
@@ -89,7 +89,7 @@ def test_business_uses_the_same_billing_rule_as_settlement() -> None:
     result = business(scenario)
     assert result.total_fee_revenue == plan.total_fee
     voyage = result.voyages[0]
-    assert voyage.fee_revenue == voyage.usage_fee_rule_revenue == 1_418_250
+    assert voyage.fee_revenue == voyage.usage_fee_rule_revenue == 1_206_600
     assert result.season is not None
     lines = {line.product_id: line for line in result.season.lines}
     assert lines["grape_so2"].revenue == 20_000 * lines["grape_so2"].pallets
@@ -100,7 +100,7 @@ def test_pilot_voyage_charges_nothing_but_keeps_original_amounts() -> None:
     assert plan.total_fee == 0
     rows = {s.shipper_id: s for s in plan.settlements}
     assert rows["sh-sangju"].usage_fee == 260_000
-    assert rows["sh-jinju"].performance_fee == 498_000
+    assert rows["sh-jinju"].performance_fee == 398_400
     for row in plan.settlements:
         assert row.pilot is True
         assert row.fee == 0
@@ -159,7 +159,7 @@ def test_forwarder_share_defaults_to_zero() -> None:
     base = next(
         r
         for r in matrix.rows
-        if r.fee_rate == 0.25
+        if r.fee_rate == 0.20
         and r.base_fee_per_pallet == 0
         and r.forwarder_share == 0.0
         and r.fixed_level == "full"
@@ -177,15 +177,15 @@ def test_business_api_defaults_to_zero_forwarder_share(client: TestClient) -> No
     assert response.status_code == 200
     voyage = response.json()["voyages"][0]
     assert voyage["forwarder_share"] == 0
-    assert voyage["fee_revenue"] == 1_418_250
+    assert voyage["fee_revenue"] == 1_206_600
 
 
 def test_demo_settlement_view_carries_billing_fields(client: TestClient) -> None:
     plan_id = client.post("/api/plans", json={}).json()["plan_id"]
     body = client.get(f"/api/plans/{plan_id}/settlement").json()
-    assert body["total_fee"] == 1_418_250
+    assert body["total_fee"] == 1_206_600
     assert body["total_usage_fee"] == 360_000
-    assert body["total_performance_fee"] == 1_058_250
+    assert body["total_performance_fee"] == 846_600
     rows = {r["shipper_id"]: r for r in body["settlements"]}
     assert rows["sh-pohang"]["billing_rule"] == "usage_fee"
     assert rows["sh-pohang"]["baseline_label"] == "단독 해상 대비"
@@ -224,9 +224,9 @@ def test_saas_settlements_carry_billing_rule(
     summary = platform_client.get("/api/saas/platform/settlements").json()
     assert len(summary) == 1
     row = summary[0]
-    assert row["platform_fee_krw"] == 1_418_250
+    assert row["platform_fee_krw"] == 1_206_600
     assert row["usage_fee_krw"] == 360_000
-    assert row["performance_fee_krw"] == 1_058_250
+    assert row["performance_fee_krw"] == 846_600
     assert row["pilot"] is False
     shares = {s["shipper_id"]: s for s in row["shippers"]}
     assert shares["sh-sangju"]["billing_rule"] == "usage_fee"
@@ -264,8 +264,8 @@ def test_tariff_sheet_follows_billing_rule_and_pilot() -> None:
     tariff = scenario.cost_params.pallet_tariffs["strawberry"]
     sheet = tariff_sheet(CostModel(scenario), "strawberry", tariff)
     assert sheet.billing_rule == "performance"
-    assert sheet.fee_rate == 0.25
-    assert sheet.fee_per_pallet == round(sheet.savings_per_pallet * 0.25)
+    assert sheet.fee_rate == 0.20
+    assert sheet.fee_per_pallet == round(sheet.savings_per_pallet * 0.20)
     assert sheet.pilot is False
 
     pilot = _with_billing(scenario, pilot=True)
@@ -337,7 +337,7 @@ def test_quality_refund_keeps_fee_parts_reconcilable(client: TestClient) -> None
     body = client.get(f"/api/plans/{plan_id}/settlement").json()
     assert body["total_refund"] > 0
     parts = body["total_performance_fee"] + body["total_usage_fee"]
-    assert body["total_fee_before_refund"] == parts == 1_418_250
+    assert body["total_fee_before_refund"] == parts == 1_206_600
     assert body["total_fee"] == body["total_fee_before_refund"] - body["total_refund"]
 
 

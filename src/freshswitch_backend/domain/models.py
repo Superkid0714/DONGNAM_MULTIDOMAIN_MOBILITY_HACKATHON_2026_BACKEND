@@ -209,7 +209,7 @@ class CostParams(BaseModel):
     air_storage_days: Quantity = _q(1.5, "일")
     air_transit_days: Quantity = _q(0.5, "일")
     unassigned_penalty_per_pallet_krw: Quantity = _q(10_000_000, "원/파렛트")
-    platform_fee_rate: Quantity = _q(0.25, "비율")
+    platform_fee_rate: Quantity = _q(0.20, "비율")
     product_costs: dict[str, ProductCostParams] = Field(default_factory=dict)
     default_product_cost: ProductCostParams = Field(default_factory=_default_product_cost)
     loss_adjustments: list[LossAdjustment] = Field(default_factory=list)

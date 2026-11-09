@@ -52,7 +52,7 @@ def test_strawberry_estimate_matches_plan_settlement(client: TestClient, scenari
     assert estimate["fee"] == settled.fee
     assert estimate["shipper_gain"] == settled.shipper_gain
     assert estimate["savings_per_pallet"] == round(settled.savings / 8)
-    assert estimate["assumptions"] and "25%" in estimate["rule"]
+    assert estimate["assumptions"] and "20%" in estimate["rule"]
 
 
 PULL_FORWARD_NOTE = "출하를 1일 앞당긴다고 가정(조기 수확 손실 포함)"

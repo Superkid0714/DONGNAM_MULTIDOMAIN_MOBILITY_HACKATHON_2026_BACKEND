@@ -123,9 +123,9 @@ SPECS: tuple[ParamSpec, ...] = (
         unit="비율",
         field="platform_fee_rate",
         per_product=False,
-        low_factor=0.2 / 0.25,
-        high_factor=0.4 / 0.25,
-        source="기획서 8-1: 절감액의 20~40%(기본 25%)",
+        low_factor=1.0,
+        high_factor=0.4 / 0.2,
+        source="기획서 8-1: 절감액의 20~40%(기본 20%)",
         affects_plan=False,
     ),
 )
