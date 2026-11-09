@@ -34,6 +34,8 @@ class Settings(BaseSettings):
     session_cookie_secure: bool = True
     saas_mode: bool = False
     sandbox_purge_interval_seconds: int = Field(default=600, ge=0)
+    robust_quote_min_count: int = Field(default=3, ge=1)
+    robust_quote_lookback_days: int = Field(default=90, ge=1, le=36500)
 
     @field_validator("api_prefix", "session_cookie_path")
     @classmethod

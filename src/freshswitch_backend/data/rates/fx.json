@@ -1,0 +1,9 @@
+[
+  {
+    "currency": "HKD",
+    "krw_per_unit": 180,
+    "grade": "assumption",
+    "confirmed": false,
+    "source": "User editable assumption; not observed FX rate"
+  }
+]

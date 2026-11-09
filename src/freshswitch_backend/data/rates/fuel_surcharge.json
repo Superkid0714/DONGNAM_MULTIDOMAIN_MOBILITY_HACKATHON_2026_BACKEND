@@ -1,0 +1,46 @@
+[
+  {
+    "id": "ke-2026-07-medium",
+    "supplier": "KE",
+    "segment": "medium",
+    "amount": 980,
+    "currency": "KRW",
+    "basis": "chargeable_kg",
+    "effective_from": "2026-07-16",
+    "effective_to": "2026-08-15",
+    "status": "reference",
+    "applicability": "unconfirmed",
+    "source_url": "https://cargo.koreanair.com/ko/cargo-news/2026nyeon-7wol-hangugbal-gugjeseon-hwamul-yulyuhaljeunglyo-gongji",
+    "checked_at": "2026-11-09",
+    "verification_note": "사용자 수동 확인; 홍콩 중거리 분류 확인. 개별 출하 적용은 별도",
+    "verified_at": "2026-11-09",
+    "source_page": "KE 7월 공지: 중거리 요율 및 적용기간",
+    "source_excerpt": "중거리 980원/kg, 7/16~8/15",
+    "candidate_amount": 980,
+    "verified_by": "안성준(수동 확인)",
+    "destination_segments": {
+      "HKG": "medium"
+    },
+    "segment_verified_by": "안성준(수동 확인)",
+    "note": "기존 후보값과 동일"
+  },
+  {
+    "id": "ke-2026-04-medium",
+    "supplier": "KE",
+    "segment": "medium",
+    "amount": null,
+    "currency": "KRW",
+    "basis": "chargeable_kg",
+    "effective_from": "2026-04-16",
+    "effective_to": "2026-05-15",
+    "status": "unknown",
+    "applicability": "unconfirmed",
+    "source_url": "https://cargo.koreanair.com/ko/cargo-news/2026nyeon-4wol-hangugbal-gugjeseon-hwamul-yulyuhaljeunglyo-gongji",
+    "checked_at": "2026-11-09",
+    "verification_note": "Direct official page revalidation not completed; April page fetch timed out; disabled pending verification",
+    "verified_at": null,
+    "source_page": "HTML sections 2 and 3",
+    "source_excerpt": "2,060 원 / ㎏",
+    "candidate_amount": 2060
+  }
+]
