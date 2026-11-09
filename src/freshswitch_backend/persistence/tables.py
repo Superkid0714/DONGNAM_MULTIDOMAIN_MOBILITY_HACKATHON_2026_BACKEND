@@ -65,6 +65,16 @@ class MetaRow(Base):
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
 
+class OperationalQuoteRow(Base):
+    __tablename__ = "operational_quote_records"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    org_id: Mapped[str] = mapped_column(String(64), _org_fk(), index=True)
+    actor_id: Mapped[str] = mapped_column(String(64))
+    payload: Mapped[Json]
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
 class QuantityPolicyRow(Base):
     __tablename__ = "quantity_policies"
 
