@@ -9,9 +9,9 @@ from freshswitch_backend.optimize.settlement import shipper_costs_and_settlement
 from freshswitch_backend.replan import AirSwitchEvent, locations, replan
 
 CA01_TABLE = {
-    "sh-jinju": (8, 1_992_000, 498_000, 1_494_000),
-    "sh-sancheong": (5, 1_245_000, 311_250, 933_750),
-    "sh-miryang": (4, 996_000, 249_000, 747_000),
+    "sh-jinju": (8, 1_992_000, 398_400, 1_593_600),
+    "sh-sancheong": (5, 1_245_000, 249_000, 996_000),
+    "sh-miryang": (4, 996_000, 199_200, 796_800),
 }
 
 
@@ -37,7 +37,7 @@ def test_strawberry_tariff_sheet_matches_spec(scenario: Scenario) -> None:
     }
     assert (sheet.air_total, sheet.sea_total) == (969_000, 720_000)
     assert sheet.savings_per_pallet == 249_000
-    assert (sheet.fee_per_pallet, sheet.shipper_share_per_pallet) == (62_250, 186_750)
+    assert (sheet.fee_per_pallet, sheet.shipper_share_per_pallet) == (49_800, 199_200)
     assert (sheet.sea_loss_risk_short_window, sheet.sea_total_short_window) == (
         1_191_000,
         1_792_000,
@@ -62,12 +62,12 @@ def test_default_plan_ca01_settlement_matches_table(client: TestClient) -> None:
     assert [r["shipper_id"] for r in ca01["shippers"]] == list(CA01_TABLE)
     assert all(r["basis"] == "tariff" for r in ca01["shippers"])
     assert (ca01["pallets"], ca01["total_savings"]) == (17, 4_233_000)
-    assert (ca01["total_fee"], ca01["total_shipper_gain"]) == (1_058_250, 3_174_750)
-    assert [_man(v) for v in (4_233_000, 1_058_250, 3_174_750)] == [423.3, 105.8, 317.5]
+    assert (ca01["total_fee"], ca01["total_shipper_gain"]) == (846_600, 3_386_400)
+    assert [_man(v) for v in (4_233_000, 846_600, 3_386_400)] == [423.3, 84.7, 338.6]
     assert [(_man(s), _man(f), _man(g)) for _, s, f, g in CA01_TABLE.values()] == [
-        (199.2, 49.8, 149.4),
-        (124.5, 31.1, 93.4),
-        (99.6, 24.9, 74.7),
+        (199.2, 39.8, 159.4),
+        (124.5, 24.9, 99.6),
+        (99.6, 19.9, 79.7),
     ]
     assert "strawberry.sea.inland" in view["assumed_items"]
     assert "strawberry.sea.loss_risk" in view["assumed_items"]

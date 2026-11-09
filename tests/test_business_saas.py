@@ -40,7 +40,7 @@ def test_years_first_year_matches_matrix(platform_client: TestClient) -> None:
             row = next(
                 r
                 for r in matrix.rows
-                if r.fee_rate == 0.25
+                if r.fee_rate == 0.20
                 and r.base_fee_per_pallet == 0
                 and r.air_regime == "normal"
                 and r.forwarder_share == share

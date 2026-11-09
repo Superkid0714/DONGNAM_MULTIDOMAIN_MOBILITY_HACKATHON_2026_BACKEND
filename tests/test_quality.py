@@ -27,9 +27,9 @@ def test_no_refund_within_planned_loss(client: TestClient) -> None:
 
 def test_partial_refund_below_cap(client: TestClient) -> None:
     plan_id = _plan(client)
-    result = _arrival(client, plan_id, 2.4)
+    result = _arrival(client, plan_id, 2.2)
     assert result["planned_loss_rate"] == 0.01593
-    excess = round(result["lot_value"] * (0.024 - result["planned_loss_rate"]))
+    excess = round(result["lot_value"] * (0.022 - result["planned_loss_rate"]))
     assert abs(result["excess_loss_value"] - excess) <= 1
     assert result["refund_after"] == result["excess_loss_value"] < result["refund_cap"]
     assert result["capped"] is False

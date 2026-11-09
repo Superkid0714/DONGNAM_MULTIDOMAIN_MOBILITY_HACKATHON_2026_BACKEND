@@ -258,7 +258,8 @@ async def delay_forecast(
             ml_movements = match_voyage_movements(sailing, ml_data.movements)
             wsd_by_voyage = _forecast_wsd(weather_feed, {v.id: v.etd for v in sailing})
     effective = options.model_copy(update={"weather": weather.level})
-    voyages = forecast_voyages(
+    voyages = await run_in_threadpool(
+        forecast_voyages,
         predictor,
         session.scenario,
         session.plan,
