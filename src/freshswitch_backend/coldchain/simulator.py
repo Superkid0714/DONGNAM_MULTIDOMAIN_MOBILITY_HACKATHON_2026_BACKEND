@@ -32,6 +32,7 @@ class Preset:
     description: str
     phases: tuple[Phase, ...]
     step_minutes: int = 5
+    cooling_tau_minutes: float = COOLING_TAU_MIN
 
     @property
     def outage_minutes(self) -> int:
@@ -78,6 +79,7 @@ PRESETS: dict[SimulationPreset, Preset] = {
     ),
     "sea_to_land": Preset(
         id="sea_to_land",
+        cooling_tau_minutes=15.0,
         title="해상→육상 전환 (계획 단전 45분)",
         description="선상 운항 → 양하 계획 단전 → 야드 대기 → 혼잡으로 연결 지연 → 우선 연결로 복전 "
         "→ 트럭 → 창고 입고. 허용 시간을 넘긴 단전분만 손실에 반영한다",
@@ -149,7 +151,7 @@ def preset_readings(
     for i, (power_on, handover_step) in enumerate(schedule):
         if i > 0:
             if schedule[i - 1][0]:
-                temp = setpoint + (temp - setpoint) * math.exp(-step / COOLING_TAU_MIN)
+                temp = setpoint + (temp - setpoint) * math.exp(-step / preset.cooling_tau_minutes)
             else:
                 temp = AMBIENT_C + (temp - AMBIENT_C) * math.exp(-step / WARMING_TAU_MIN)
         wiggle = 0.1 * math.sin(i / 3)
