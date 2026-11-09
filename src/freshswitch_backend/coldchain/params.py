@@ -80,6 +80,12 @@ class ColdchainParams(BaseModel):
         "Institute Frozen Food Clauses는 연속 24시간이라 부산→홍콩 해상 적용 시간은 증권 확인 필요. "
         "https://svv.ch/sites/default/files/media/documents/2026-07/GCMI_Clauses_2025.pdf",
     )
+    planned_outage_warning_minutes: Quantity = _q(
+        20, "분", "가정: 해상→육상 전환 계획 단전이 이 시간에 이르면 주의 알림(팀 가정)"
+    )
+    planned_outage_allowance_minutes: Quantity = _q(
+        30, "분", "가정: 해상→육상 전환 계획 단전 허용 시간. 넘으면 이상 단전으로 본다(팀 가정)"
+    )
     max_gap_minutes: Quantity = _q(
         60,
         "분",

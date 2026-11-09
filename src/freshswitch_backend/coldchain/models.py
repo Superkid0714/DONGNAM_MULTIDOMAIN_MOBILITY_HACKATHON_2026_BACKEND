@@ -25,6 +25,7 @@ HandlerRole = Literal["platform", "forwarder"]
 ResidualRiskKind = Literal["heat_accumulation", "temperature_swing", "door_open", "sensor_gap"]
 RiskLevel = Literal["info", "warning"]
 PowerStage = Literal["trucking", "gate", "plug"]
+HandoverOutageKind = Literal["none", "planned", "planned_warning", "abnormal"]
 READING_MAX_AGE = timedelta(days=30)
 READING_MAX_AHEAD = timedelta(minutes=10)
 SANDBOX_READING_MAX_AHEAD = timedelta(days=60)
@@ -64,6 +65,10 @@ class ReadingIn(BaseModel):
     stage: Stage | None = None
 
 
+class HandoverReadingIn(ReadingIn):
+    handover_step: int
+
+
 class Reading(BaseModel):
     device_id: str
     container_id: str
@@ -72,6 +77,7 @@ class Reading(BaseModel):
     power_on: bool
     humidity_pct: float | None = None
     door_open: bool | None = None
+    handover_step: int | None = None
 
 
 class BindingRequest(BaseModel):
@@ -235,6 +241,28 @@ class TimelinePoint(BaseModel):
     degree_minutes: float
     sensor_loss_rate: float
     predicted_loss_rate: float | None = None
+    handover_step: int | None = None
+    handover_kind: HandoverOutageKind | None = None
+    handover_excess_minutes: float | None = None
+
+
+class HandoverStep(BaseModel):
+    step: int
+    title: str
+    power: str
+    system: str
+
+
+class HandoverState(BaseModel):
+    current_step: int
+    outage_kind: HandoverOutageKind
+    continuous_off_minutes: float
+    cumulative_off_minutes: float
+    excess_minutes: float
+    warning: Quantity
+    allowance: Quantity
+    steps: list[HandoverStep]
+    rule: str
 
 
 class TwinSummary(BaseModel):
@@ -272,6 +300,7 @@ class TwinState(BaseModel):
     params: dict[str, Quantity]
     has_data: bool = True
     residual_risks: list[ResidualRisk] = Field(default_factory=list)
+    handover: HandoverState | None = None
 
 
 class IngestRejected(BaseModel):
@@ -293,7 +322,7 @@ class AlertFeed(BaseModel):
     next_since: int
 
 
-SimulationPreset = Literal["power_cut_restore", "short_outage", "normal"]
+SimulationPreset = Literal["power_cut_restore", "short_outage", "normal", "sea_to_land"]
 
 
 class SimulationRequest(BaseModel):

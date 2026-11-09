@@ -232,7 +232,12 @@ def test_simulator_preset_is_deterministic() -> None:
 def test_simulate_instant_with_plan(client: TestClient) -> None:
     plan_id = _plan(client)
     presets = client.get("/api/coldchain/simulate/presets").json()
-    assert {p["id"] for p in presets} == {"power_cut_restore", "short_outage", "normal"}
+    assert {p["id"] for p in presets} == {
+        "power_cut_restore",
+        "short_outage",
+        "normal",
+        "sea_to_land",
+    }
     run = client.post(
         "/api/coldchain/simulate", json={"preset": "power_cut_restore", "plan_id": plan_id}
     ).json()

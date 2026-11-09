@@ -8,6 +8,8 @@ from freshswitch_backend.coldchain.models import (
     Alert,
     CurrentReading,
     ExcursionSummary,
+    HandoverOutageKind,
+    HandoverState,
     LossSummary,
     LotLoss,
     OutageSummary,
@@ -19,6 +21,7 @@ from freshswitch_backend.coldchain.models import (
     TwinStatus,
 )
 from freshswitch_backend.coldchain.params import ColdchainParams
+from freshswitch_backend.coldchain.simulator import handover_steps
 from freshswitch_backend.domain.models import Plan, Scenario, Voyage
 from freshswitch_backend.execution.orders import fmt
 from freshswitch_backend.optimize.costs import CostModel
@@ -161,8 +164,13 @@ def sensor_rate(base: float, cap: float, exposure: float, params: ColdchainParam
     return base + max(0.0, cap - base) * min(1.0, exposure * params.reference_fraction)
 
 
-def _lot_rates(lot: LotContext, exposure: float, params: ColdchainParams) -> tuple[float, float]:
+def _lot_rates(
+    lot: LotContext, exposure: float, params: ColdchainParams, additive: bool = False
+) -> tuple[float, float]:
     sensor = sensor_rate(lot.base_rate, lot.max_rate, exposure, params)
+    if additive:
+        extra = sensor - lot.base_rate
+        return sensor, min(lot.max_rate, lot.storage_rate + extra) + lot.early_rate
     predicted = min(lot.max_rate, max(lot.storage_rate, sensor)) + lot.early_rate
     return sensor, predicted
 
@@ -175,7 +183,7 @@ def _weighted(pairs: list[tuple[float, float]]) -> float:
 
 
 def container_rates(
-    ctx: TwinContext, exposure: float, params: ColdchainParams
+    ctx: TwinContext, exposure: float, params: ColdchainParams, additive: bool = False
 ) -> tuple[float, float | None]:
     if not ctx.lots:
         reference = sensor_rate(
@@ -185,7 +193,7 @@ def container_rates(
             params,
         )
         return reference, None
-    rates = [(lot.value, _lot_rates(lot, exposure, params)) for lot in ctx.lots]
+    rates = [(lot.value, _lot_rates(lot, exposure, params, additive)) for lot in ctx.lots]
     sensor = _weighted([(v, r[0]) for v, r in rates])
     predicted = _weighted([(v, r[1]) for v, r in rates])
     return sensor, predicted
@@ -197,8 +205,10 @@ def no_outage_rate(ctx: TwinContext, params: ColdchainParams) -> float:
     return _weighted([(lot.value, lot.base_rate) for lot in ctx.lots])
 
 
-def loss_summary(ctx: TwinContext, exposure: float, params: ColdchainParams) -> LossSummary:
-    sensor, predicted = container_rates(ctx, exposure, params)
+def loss_summary(
+    ctx: TwinContext, exposure: float, params: ColdchainParams, additive: bool = False
+) -> LossSummary:
+    sensor, predicted = container_rates(ctx, exposure, params, additive)
     summary = LossSummary(
         exposure_index=round(exposure, 4),
         sensor_loss_rate=round(sensor, 6),
@@ -210,7 +220,7 @@ def loss_summary(ctx: TwinContext, exposure: float, params: ColdchainParams) -> 
         return summary
     lots: list[LotLoss] = []
     for lot in ctx.lots:
-        lot_sensor, lot_predicted = _lot_rates(lot, exposure, params)
+        lot_sensor, lot_predicted = _lot_rates(lot, exposure, params, additive)
         planned_krw = round(lot.value * lot.planned_rate)
         predicted_krw = round(lot.value * lot_predicted)
         lots.append(
@@ -283,6 +293,39 @@ def _status(
     return "normal"
 
 
+def _handover_kind(
+    power_on: bool, continuous: float, params: ColdchainParams
+) -> HandoverOutageKind:
+    if power_on:
+        return "none"
+    if continuous > params.planned_outage_allowance_minutes.value:
+        return "abnormal"
+    if continuous >= params.planned_outage_warning_minutes.value:
+        return "planned_warning"
+    return "planned"
+
+
+def _handover_status(
+    excursion: float, power_on: bool, continuous: float, params: ColdchainParams
+) -> TwinStatus:
+    base = _status(excursion, True, 0.0, params)
+    kind = _handover_kind(power_on, continuous, params)
+    if kind == "abnormal":
+        return "critical"
+    if kind == "planned_warning" and base == "normal":
+        return "warning"
+    return base
+
+
+def _handover_rule(params: ColdchainParams) -> str:
+    allowance = f"{params.planned_outage_allowance_minutes.value:g}"
+    return (
+        f"계획 단전 허용 {allowance}분(가정) 안의 단전과 그 구간 온도 이탈은 손실에 넣지 않는다. "
+        f"연속 단전이 {allowance}분을 넘은 시간과 그 시간의 온도 이탈만 노출 지수에 반영하고, "
+        "그만큼 오른 손실률을 계획 손실률에 더한다"
+    )
+
+
 STATUS_LEVEL = {"normal": "info", "warning": "warning", "critical": "critical"}
 STATUS_TEXT = {"normal": "경고 해제", "warning": "온도·전원 경고", "critical": "온도·전원 위험"}
 
@@ -301,6 +344,8 @@ class Carry:
     max_temp: float | None = None
     status: TwinStatus | None = None
     cold_storage_done: bool = False
+    excess_minutes: float = 0.0
+    excess_degree_minutes: float = 0.0
 
 
 @dataclass
@@ -314,6 +359,7 @@ class Evaluation:
     alerts: list[Alert]
     carry: Carry = field(default_factory=Carry)
     anchors: list[datetime] = field(default_factory=list)
+    handover: HandoverState | None = None
 
 
 def _pct(rate: float) -> str:
@@ -342,6 +388,9 @@ def evaluate(
     max_temp = base.max_temp
     status = base.status
     cold_storage_done = base.cold_storage_done
+    excess_minutes = base.excess_minutes
+    excess_degree_minutes = base.excess_degree_minutes
+    allowance = params.planned_outage_allowance_minutes.value
     prev = base.prev
     cid = ctx.container_id
     known = sorted(set(anchors))
@@ -391,40 +440,52 @@ def evaluate(
     for r in readings:
         if prev is not None:
             dt = min(max(0.0, (r.ts - prev.ts).total_seconds() / 60), max_gap)
-            if not prev.power_on:
-                cumulative += dt
-                episode_minutes += dt
             e0 = max(0.0, prev.temp_c - ctx.band_max_c)
             e1 = max(0.0, r.temp_c - ctx.band_max_c)
+            if not prev.power_on:
+                if prev.handover_step is not None:
+                    overrun = max(0.0, episode_minutes + dt - allowance) - max(
+                        0.0, episode_minutes - allowance
+                    )
+                    excess_minutes += overrun
+                    excess_degree_minutes += (e0 + e1) / 2 * overrun
+                cumulative += dt
+                episode_minutes += dt
             degree_minutes += (e0 + e1) / 2 * dt
             if e0 > 0 and e1 > 0:
                 above += dt
             elif e0 > 0 or e1 > 0:
                 above += dt / 2
         max_temp = r.temp_c if max_temp is None else max(max_temp, r.temp_c)
-        exposure = exposure_index(cumulative, degree_minutes, params)
-        sensor, predicted = container_rates(ctx, exposure, params)
+        handover = r.handover_step is not None
+        exposure = (
+            exposure_index(excess_minutes, excess_degree_minutes, params)
+            if handover
+            else exposure_index(cumulative, degree_minutes, params)
+        )
+        sensor, predicted = container_rates(ctx, exposure, params, handover)
         shown = predicted if predicted is not None else sensor
         if not r.power_on and episode_start is None:
             episode_start = r.ts
             episodes += 1
             episode_minutes = 0.0
-            track(
-                Alert(
-                    key=f"power_cut:{r.ts.isoformat()}",
-                    container_id=cid,
-                    level="warning",
-                    kind="power_cut",
-                    title=f"{cid} 리퍼 전원 차단",
-                    message=(
-                        f"{fmt(r.ts)} 전원 차단 감지. 품온 {r.temp_c:.1f}°C "
-                        f"(적정 {ctx.band_min_c:g}~{ctx.band_max_c:g}°C)"
-                        + (f", 이전 누적 단전 {cumulative:.0f}분" if round(cumulative) else "")
+            if not handover:
+                track(
+                    Alert(
+                        key=f"power_cut:{r.ts.isoformat()}",
+                        container_id=cid,
+                        level="warning",
+                        kind="power_cut",
+                        title=f"{cid} 리퍼 전원 차단",
+                        message=(
+                            f"{fmt(r.ts)} 전원 차단 감지. 품온 {r.temp_c:.1f}°C "
+                            f"(적정 {ctx.band_min_c:g}~{ctx.band_max_c:g}°C)"
+                            + (f", 이전 누적 단전 {cumulative:.0f}분" if round(cumulative) else "")
+                        ),
+                        at=r.ts,
                     ),
-                    at=r.ts,
-                ),
-                "power_cut",
-            )
+                    "power_cut",
+                )
         elif r.power_on and episode_start is not None:
             longest = max(longest, episode_minutes)
             anchor = anchor_episode(r.ts)
@@ -434,9 +495,14 @@ def evaluate(
                     container_id=cid,
                     level="info",
                     kind="power_restored",
-                    title=f"{cid} 전원 복구",
+                    title=f"{cid} 복전 확인" if handover else f"{cid} 전원 복구",
                     message=(
-                        f"단전 {episode_minutes:.0f}분 만에 복구. 누적 단전 {cumulative:.0f}분, "
+                        f"단전 {episode_minutes:.0f}분 만에 복전. 허용 {allowance:g}분(가정) 초과 "
+                        f"{excess_minutes:.0f}분만 손실에 반영, 품온 {r.temp_c:.1f}°C, "
+                        f"예상 손실률 {_pct(shown)}"
+                        if handover
+                        else f"단전 {episode_minutes:.0f}분 만에 복구. "
+                        f"누적 단전 {cumulative:.0f}분, "
                         f"품온 {r.temp_c:.1f}°C, 예상 손실률 {_pct(shown)}"
                     ),
                     at=r.ts,
@@ -447,17 +513,39 @@ def evaluate(
         continuous = episode_minutes if episode_start is not None else 0.0
         longest = max(longest, continuous)
         excursion = excursion_of(r.temp_c, ctx)
-        current_status = _status(excursion, r.power_on, continuous, params)
+        current_status = (
+            _handover_status(excursion, r.power_on, continuous, params)
+            if handover
+            else _status(excursion, r.power_on, continuous, params)
+        )
         if current_status != status and not (status is None and current_status == "normal"):
+            handover_text = (
+                {
+                    "warning": (
+                        "계획 단전 주의",
+                        (
+                            f"계획 단전 {continuous:.0f}분 경과, 허용 {allowance:g}분(가정)까지 "
+                            f"{allowance - continuous:.0f}분 남음. "
+                        ),
+                    ),
+                    "critical": (
+                        "이상 단전 전환",
+                        f"연속 단전 {continuous:.0f}분으로 허용 {allowance:g}분(가정) 초과. ",
+                    ),
+                }.get(current_status)
+                if handover and not r.power_on
+                else None
+            )
             alerts.append(
                 Alert(
                     key=f"status:{current_status}:{r.ts.isoformat()}",
                     container_id=cid,
                     level=STATUS_LEVEL[current_status],
                     kind="status_change",
-                    title=f"{cid} {STATUS_TEXT[current_status]}",
+                    title=f"{cid} {handover_text[0] if handover_text else STATUS_TEXT[current_status]}",
                     message=(
-                        f"품온 {r.temp_c:.1f}°C(적정 {ctx.band_min_c:g}~{ctx.band_max_c:g}°C, "
+                        (handover_text[1] if handover_text else "")
+                        + f"품온 {r.temp_c:.1f}°C(적정 {ctx.band_min_c:g}~{ctx.band_max_c:g}°C, "
                         f"이탈 {excursion:+.1f}°C), 전원 {'켜짐' if r.power_on else '꺼짐'}, "
                         + (f"누적 단전 {cumulative:.0f}분, " if round(cumulative) else "")
                         + f"예상 손실률 {_pct(shown)}"
@@ -473,7 +561,12 @@ def evaluate(
             "rate": shown,
             "readings": base.count + len(timeline) + 1,
         }
-        if episode_start is not None and ctx.stage != "vessel":
+        if handover:
+            if episode_start is not None and continuous > allowance:
+                kind = "terminal_priority_plug"
+                key = f"{kind}:{episode_start.isoformat()}"
+                emit_action(kind, key, r.ts, metrics, kind)
+        elif episode_start is not None and ctx.stage != "vessel":
             episode_key = episode_start.isoformat()
             for kind, reached in (
                 ("terminal_priority_plug", continuous >= params.plug_request_after_minutes.value),
@@ -482,13 +575,21 @@ def evaluate(
             ):
                 if reached:
                     emit_action(kind, f"{kind}:{episode_key}", r.ts, metrics, kind)
-        if not cold_storage_done and (
-            cumulative >= params.cold_storage_cumulative_minutes.value
-            or sensor >= params.cold_storage_loss_rate.value
+        if (
+            not handover
+            and not cold_storage_done
+            and (
+                cumulative >= params.cold_storage_cumulative_minutes.value
+                or sensor >= params.cold_storage_loss_rate.value
+            )
         ):
             cold_storage_done = True
             emit_action("cold_storage_booking", "cold_storage_booking", r.ts, metrics)
-        if episode_start is not None and continuous >= params.insurance_continuous_minutes.value:
+        if (
+            not handover
+            and episode_start is not None
+            and continuous >= params.insurance_continuous_minutes.value
+        ):
             emit_action(
                 "insurance_evidence",
                 f"insurance_evidence:{episode_start.isoformat()}",
@@ -508,6 +609,9 @@ def evaluate(
                 degree_minutes=round(degree_minutes, 2),
                 sensor_loss_rate=round(sensor, 6),
                 predicted_loss_rate=None if predicted is None else round(predicted, 6),
+                handover_step=r.handover_step,
+                handover_kind=_handover_kind(r.power_on, continuous, params) if handover else None,
+                handover_excess_minutes=round(excess_minutes, 2) if handover else None,
             )
         )
         prev = r
@@ -533,6 +637,22 @@ def evaluate(
             excursion_c=round(excursion_of(last.temp_c, ctx), 2),
         )
     insurance = params.insurance_continuous_minutes.value
+    last_step = last.handover_step if last is not None else None
+    handover_state = (
+        None
+        if last is None or last_step is None
+        else HandoverState(
+            current_step=last_step,
+            outage_kind=_handover_kind(last.power_on, continuous, params),
+            continuous_off_minutes=round(continuous, 2),
+            cumulative_off_minutes=round(cumulative, 2),
+            excess_minutes=round(excess_minutes, 2),
+            warning=params.planned_outage_warning_minutes,
+            allowance=params.planned_outage_allowance_minutes,
+            steps=handover_steps(params),
+            rule=_handover_rule(params),
+        )
+    )
     return Evaluation(
         status=status or "no_data",
         current=current,
@@ -552,7 +672,11 @@ def evaluate(
             minutes_above_band=round(above, 2),
             max_temp_c=max_temp,
         ),
-        exposure=exposure_index(cumulative, degree_minutes, params),
+        exposure=(
+            exposure_index(excess_minutes, excess_degree_minutes, params)
+            if last_step is not None
+            else exposure_index(cumulative, degree_minutes, params)
+        ),
         timeline=timeline,
         alerts=unique,
         carry=replace(
@@ -569,8 +693,11 @@ def evaluate(
             max_temp=max_temp,
             status=status,
             cold_storage_done=cold_storage_done,
+            excess_minutes=excess_minutes,
+            excess_degree_minutes=excess_degree_minutes,
         ),
         anchors=used,
+        handover=handover_state,
     )
 
 

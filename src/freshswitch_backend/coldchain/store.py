@@ -20,6 +20,7 @@ from freshswitch_backend.coldchain.models import (
     Binding,
     BindingRequest,
     ColdchainAction,
+    HandoverReadingIn,
     IngestRejected,
     IngestResult,
     Reading,
@@ -700,7 +701,7 @@ class ColdchainStore:
         return new
 
     def _summary(self, record: ContainerRecord, ctx: TwinContext, ev: Evaluation) -> TwinSummary:
-        loss = loss_summary(ctx, ev.exposure, self.params)
+        loss = loss_summary(ctx, ev.exposure, self.params, ev.handover is not None)
         current = ev.current
         return TwinSummary(
             container_id=record.container_id,
@@ -815,6 +816,7 @@ class ColdchainStore:
                 power_on=item.power_on,
                 humidity_pct=item.humidity_pct,
                 door_open=item.door_open,
+                handover_step=item.handover_step if isinstance(item, HandoverReadingIn) else None,
             )
             key = (reading.device_id, reading.ts)
             if key in record.readings:
@@ -891,7 +893,7 @@ class ColdchainStore:
                 current=ev.current,
                 outage=ev.outage,
                 excursion=ev.excursion,
-                loss=loss_summary(ctx, ev.exposure, self.params),
+                loss=loss_summary(ctx, ev.exposure, self.params, ev.handover is not None),
                 reading_count=len(record.readings),
                 timeline=downsample([*record.history, *ev.timeline], points),
                 actions=[a.action for a in alerts if a.action is not None],
@@ -899,6 +901,7 @@ class ColdchainStore:
                 params=dict(self.params),
                 has_data=has_data,
                 residual_risks=residual_risks(trail, ctx.band_min_c, ctx.band_max_c, self.params),
+                handover=ev.handover,
             )
 
     def update_action(
@@ -1038,7 +1041,7 @@ class ColdchainStore:
             if session is None or plan_id is None:
                 raise ColdchainError("계획과 연결되지 않은 컨테이너입니다. plan_id를 지정하세요")
             ctx, ev = self._evaluate(record, plan_id)
-            loss = loss_summary(ctx, ev.exposure, self.params)
+            loss = loss_summary(ctx, ev.exposure, self.params, ev.handover is not None)
         inspections = list(session.arrival_inspections)
         lots: list[SettlementPreviewLot] = []
         for item in loss.lots:
